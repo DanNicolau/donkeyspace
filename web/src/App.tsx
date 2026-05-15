@@ -27,7 +27,10 @@ type OutboundAction = {
   provider: string;
   action_type: string;
   status: string;
+  last_error: string | null;
   payload: {
+    owner?: string;
+    repo?: string;
     issue_number?: number;
     label?: string;
     labels?: string[];
@@ -208,6 +211,10 @@ export function App() {
 }
 
 function describeAction(action: OutboundAction): string {
+  if (action.last_error) {
+    return action.last_error;
+  }
+
   if (action.action_type === "issue.add_label" && action.payload.label) {
     return `Add ${action.payload.label}`;
   }

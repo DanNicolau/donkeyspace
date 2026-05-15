@@ -1,4 +1,5 @@
 use hmac::{Hmac, Mac};
+use octocrab::Octocrab;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
@@ -39,6 +40,103 @@ pub fn verify_signature(
 pub struct WebhookEnvelope {
     pub delivery_id: String,
     pub event_name: String,
+}
+
+#[derive(Debug, Error)]
+pub enum GitHubClientError {
+    #[error("github client error: {0}")]
+    Octocrab(#[from] octocrab::Error),
+}
+
+#[derive(Debug, Clone)]
+pub struct GitHubClient {
+    client: Octocrab,
+}
+
+impl GitHubClient {
+    pub fn new(token: impl Into<String>) -> Result<Self, GitHubClientError> {
+        Ok(Self {
+            client: Octocrab::builder().personal_token(token.into()).build()?,
+        })
+    }
+
+    pub async fn add_issue_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+        label: &str,
+    ) -> Result<(), GitHubClientError> {
+        self.ensure_label(owner, repo, label).await?;
+        self.client
+            .issues(owner, repo)
+            .add_labels(issue_number as u64, &[label.to_string()])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn remove_issue_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+        label: &str,
+    ) -> Result<(), GitHubClientError> {
+        self.client
+            .issues(owner, repo)
+            .remove_label(issue_number as u64, label)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+        body: &str,
+    ) -> Result<(), GitHubClientError> {
+        self.client
+            .issues(owner, repo)
+            .create_comment(issue_number as u64, body)
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<(), GitHubClientError> {
+        if self
+            .client
+            .issues(owner, repo)
+            .get_label(label)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        self.client
+            .issues(owner, repo)
+            .create_label(label, workflow_label_color(label), "Managed by donkeyspace")
+            .await?;
+        Ok(())
+    }
+}
+
+fn workflow_label_color(label: &str) -> &'static str {
+    match label {
+        "ai:needs-info" => "d4a72c",
+        "ai:ready" => "2da44e",
+        "ai:in-progress" => "0969da",
+        "ai:pr-open" => "8250df",
+        "ai:needs-human" => "bf8700",
+        "ai:blocked" => "cf222e",
+        _ => "6e7781",
+    }
 }
 
 #[cfg(test)]

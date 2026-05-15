@@ -48,7 +48,7 @@ Expected issue transitions:
 
 When applying a new workflow label, donkeyspace should remove any existing `ai:*` workflow label from the same issue.
 
-The current implementation records intended GitHub label and comment writes as pending outbound actions before any live GitHub API executor is enabled. This keeps triage side effects auditable and testable while the project is still running fake-agent workflows.
+The current implementation records intended GitHub label and comment writes as pending outbound actions before executing them. When `DONKEYSPACE_GITHUB_TOKEN` is configured, the worker applies those actions through GitHub and marks them completed or failed.
 
 ## Human Control
 

@@ -77,8 +77,8 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] Handle label events.
 - [ ] Handle pull request events.
 - [ ] Handle check-suite or check-run events if needed.
-- [ ] Create issue comments.
-- [ ] Apply and remove labels.
+- [x] Create issue comments.
+- [x] Apply and remove labels.
 - [ ] Create branches.
 - [ ] Push commits.
 - [ ] Open pull requests.

@@ -17,6 +17,15 @@ pub fn triage_github_issue_actions(
     let Some(issue_number) = input.pointer("/issue/number").and_then(Value::as_i64) else {
         return Vec::new();
     };
+    let Some(owner) = input
+        .pointer("/repository/owner/login")
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let Some(repo) = input.pointer("/repository/name").and_then(Value::as_str) else {
+        return Vec::new();
+    };
 
     let current_labels = issue_labels(input);
     let mut actions = Vec::new();
@@ -35,6 +44,8 @@ pub fn triage_github_issue_actions(
             actions.push(GitHubIssueAction {
                 action_type: "issue.remove_labels".to_string(),
                 payload: serde_json::json!({
+                    "owner": owner,
+                    "repo": repo,
                     "issue_number": issue_number,
                     "labels": stale_labels,
                 }),
@@ -45,6 +56,8 @@ pub fn triage_github_issue_actions(
             actions.push(GitHubIssueAction {
                 action_type: "issue.add_label".to_string(),
                 payload: serde_json::json!({
+                    "owner": owner,
+                    "repo": repo,
                     "issue_number": issue_number,
                     "label": target_label,
                     "state": target_state.as_str(),
@@ -57,6 +70,8 @@ pub fn triage_github_issue_actions(
         actions.push(GitHubIssueAction {
             action_type: "issue.create_comment".to_string(),
             payload: serde_json::json!({
+                "owner": owner,
+                "repo": repo,
                 "issue_number": issue_number,
                 "body": body,
             }),
@@ -138,6 +153,10 @@ mod tests {
         let actions = triage_github_issue_actions(
             &policy(),
             &json!({
+                "repository": {
+                    "name": "repo",
+                    "owner": {"login": "owner"}
+                },
                 "issue": {
                     "number": 42,
                     "labels": [{"name": "bug"}]
@@ -149,6 +168,8 @@ mod tests {
 
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[0].action_type, "issue.add_label");
+        assert_eq!(actions[0].payload["owner"], "owner");
+        assert_eq!(actions[0].payload["repo"], "repo");
         assert_eq!(actions[0].payload["label"], "ai:ready");
         assert_eq!(actions[1].action_type, "issue.create_comment");
     }
@@ -169,6 +190,10 @@ mod tests {
         let actions = triage_github_issue_actions(
             &policy(),
             &json!({
+                "repository": {
+                    "name": "repo",
+                    "owner": {"login": "owner"}
+                },
                 "issue": {
                     "number": 42,
                     "labels": [{"name": "ai:ready"}]
