@@ -1,0 +1,55 @@
+version: 1
+
+workflow:
+  state_labels:
+    needs_info: "ai:needs-info"
+    ready: "ai:ready"
+    in_progress: "ai:in-progress"
+    pr_open: "ai:pr-open"
+    needs_human: "ai:needs-human"
+    blocked: "ai:blocked"
+  block_labels:
+    - "ai:disabled"
+  allow_labels:
+    - "ai"
+
+agents:
+  triage:
+    enabled: true
+    command: ["donkeyspace-agent-triage", "--input", ".donkeyspace/run-input.json"]
+  developer:
+    enabled: true
+    command: ["codex", "exec", "--input", ".donkeyspace/run-input.json"]
+  reviewer:
+    enabled: true
+    command: ["donkeyspace-agent-review", "--input", ".donkeyspace/run-input.json"]
+
+checks:
+  required_commands:
+    - name: "rust tests"
+      command: ["cargo", "test", "--workspace"]
+    - name: "dashboard build"
+      command: ["npm", "run", "build"]
+  require_github_checks: true
+
+risk:
+  default: "unknown"
+  agent_classification: true
+  route_unknown_to_human: true
+  route_high_to_human: true
+  human_review_paths:
+    - ".github/**"
+    - "migrations/**"
+    - "schemas/**"
+    - "crates/donkeyspace-github/**"
+    - "crates/donkeyspace-runner/**"
+
+automation:
+  max_concurrent_jobs: 2
+  retry_failed_jobs: false
+  auto_merge: false
+
+dashboard:
+  expose_policy: true
+  allow_retry: true
+  allow_cancel: true

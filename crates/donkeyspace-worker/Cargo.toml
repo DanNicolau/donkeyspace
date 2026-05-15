@@ -1,0 +1,13 @@
+[package]
+name = "donkeyspace-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+donkeyspace-db = { path = "../donkeyspace-db" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

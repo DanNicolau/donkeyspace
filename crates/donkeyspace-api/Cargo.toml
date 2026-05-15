@@ -1,0 +1,20 @@
+[package]
+name = "donkeyspace-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+donkeyspace-core = { path = "../donkeyspace-core" }
+donkeyspace-db = { path = "../donkeyspace-db" }
+donkeyspace-github = { path = "../donkeyspace-github" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

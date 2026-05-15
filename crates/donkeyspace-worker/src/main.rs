@@ -1,0 +1,80 @@
+use clap::Parser;
+use donkeyspace_db::{DbConfig, acquire_next_queued_job, apply_migrations, connect};
+use std::time::Duration;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Debug, Parser)]
+#[command(name = "donkeyspace-worker")]
+struct Args {
+    #[arg(long, env = "DONKEYSPACE_DATABASE_URL")]
+    database_url: Option<String>,
+    #[arg(long, env = "DONKEYSPACE_WORKER_ID", default_value = "worker-local")]
+    worker_id: String,
+    #[arg(long, env = "DONKEYSPACE_LEASE_SECONDS", default_value_t = 300)]
+    lease_seconds: i32,
+    #[arg(long, default_value_t = false)]
+    once: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let args = Args::parse();
+
+    let pool = if let Some(database_url) = args.database_url {
+        let pool = connect(&DbConfig::from_database_url(database_url)).await?;
+        apply_migrations(&pool).await?;
+        tracing::info!("database connection verified");
+        Some(pool)
+    } else {
+        tracing::warn!("DONKEYSPACE_DATABASE_URL is unset; starting without database check");
+        None
+    };
+
+    tracing::info!("donkeyspace worker started");
+
+    if args.once {
+        if let Some(pool) = &pool {
+            poll_once(pool, &args.worker_id, args.lease_seconds).await?;
+        }
+        tracing::info!("worker once mode completed");
+        return Ok(());
+    }
+
+    loop {
+        if let Some(pool) = &pool {
+            poll_once(pool, &args.worker_id, args.lease_seconds).await?;
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tracing::debug!("worker heartbeat");
+    }
+}
+
+async fn poll_once(
+    pool: &donkeyspace_db::PgPool,
+    worker_id: &str,
+    lease_seconds: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match acquire_next_queued_job(pool, worker_id, lease_seconds).await? {
+        Some(job) => {
+            tracing::info!(
+                job_id = %job.id,
+                role = job.role,
+                "leased queued job; execution adapter is not wired yet"
+            );
+        }
+        None => tracing::debug!("no queued jobs available"),
+    }
+
+    Ok(())
+}
+
+fn init_tracing() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "donkeyspace=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+}

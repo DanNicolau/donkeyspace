@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: donkeyspace
+      POSTGRES_USER: donkeyspace
+      POSTGRES_PASSWORD: donkeyspace
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U donkeyspace -d donkeyspace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+    command: ["donkeyspace-api"]
+    environment:
+      DONKEYSPACE_BIND_ADDR: 0.0.0.0:8080
+      DONKEYSPACE_DATABASE_URL: postgres://donkeyspace:donkeyspace@postgres:5432/donkeyspace
+      DONKEYSPACE_WEBHOOK_SECRET: change-me
+      RUST_LOG: donkeyspace=info,tower_http=info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+    command: ["donkeyspace-worker"]
+    environment:
+      DONKEYSPACE_DATABASE_URL: postgres://donkeyspace:donkeyspace@postgres:5432/donkeyspace
+      RUST_LOG: donkeyspace=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    image: node:25-bookworm
+    working_dir: /app/web
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    profiles: ["dev"]
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app
+
+volumes:
+  postgres-data:
