@@ -93,6 +93,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Define command result records.
 - [x] Define agent decision summary records.
 - [ ] Link audit records to GitHub issues, PRs, comments, commits, and branches.
+- [x] Persist pending outbound GitHub actions for audit before live writes.
 - [ ] Decide log retention defaults.
 - [ ] Decide what data must be redacted.
 
@@ -101,6 +102,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Define the minimum dashboard routes.
 - [x] Show active jobs.
 - [x] Show run history.
+- [x] Show pending outbound GitHub actions.
 - [ ] Show issue and PR links.
 - [x] Show state transitions.
 - [ ] Show policy decisions.

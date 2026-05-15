@@ -1,11 +1,14 @@
 use clap::Parser;
-use donkeyspace_core::{fake_triage_issue, workflow_state_for_outcome};
+use donkeyspace_core::{
+    Policy, fake_triage_issue, triage_github_issue_actions, workflow_state_for_outcome,
+};
 use donkeyspace_db::{
-    DbConfig, JobRecord, acquire_next_queued_job, apply_migrations, complete_job, connect,
-    fail_job, mark_job_running, record_state_transition, update_workflow_item_state,
+    DbConfig, JobRecord, OutboundActionInput, acquire_next_queued_job, apply_migrations,
+    complete_job, connect, create_outbound_action, fail_job, mark_job_running,
+    record_state_transition, update_workflow_item_state,
 };
 use serde_json::json;
-use std::time::Duration;
+use std::{env, fs, time::Duration};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
@@ -25,6 +28,7 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let args = Args::parse();
+    let policy = load_policy()?;
 
     let pool = if let Some(database_url) = args.database_url {
         let pool = connect(&DbConfig::from_database_url(database_url)).await?;
@@ -40,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.once {
         if let Some(pool) = &pool {
-            poll_once(pool, &args.worker_id, args.lease_seconds).await?;
+            poll_once(pool, &policy, &args.worker_id, args.lease_seconds).await?;
         }
         tracing::info!("worker once mode completed");
         return Ok(());
@@ -48,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         if let Some(pool) = &pool {
-            poll_once(pool, &args.worker_id, args.lease_seconds).await?;
+            poll_once(pool, &policy, &args.worker_id, args.lease_seconds).await?;
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
         tracing::debug!("worker heartbeat");
@@ -57,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn poll_once(
     pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
     worker_id: &str,
     lease_seconds: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -67,7 +72,7 @@ async fn poll_once(
                 role = job.role,
                 "leased queued job"
             );
-            execute_job(pool, job).await?;
+            execute_job(pool, policy, job).await?;
         }
         None => tracing::debug!("no queued jobs available"),
     }
@@ -77,6 +82,7 @@ async fn poll_once(
 
 async fn execute_job(
     pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
     job: JobRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(running_job) = mark_job_running(pool, job.id).await? else {
@@ -103,6 +109,22 @@ async fn execute_job(
                     "fake triage agent completed",
                 )
                 .await?;
+
+                for action in
+                    triage_github_issue_actions(policy, &running_job.input, &result, workflow_state)
+                {
+                    create_outbound_action(
+                        pool,
+                        &OutboundActionInput {
+                            workflow_item_id,
+                            job_id: Some(running_job.id),
+                            provider: "github".to_string(),
+                            action_type: action.action_type,
+                            payload: action.payload,
+                        },
+                    )
+                    .await?;
+                }
             }
 
             tracing::info!(
@@ -154,4 +176,11 @@ fn init_tracing() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
+    let path =
+        env::var("DONKEYSPACE_POLICY_PATH").unwrap_or_else(|_| ".donkeyspace/policy.yml".into());
+    let raw = fs::read_to_string(&path)?;
+    Ok(Policy::from_yaml(&raw)?)
 }

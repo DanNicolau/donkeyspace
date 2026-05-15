@@ -48,6 +48,8 @@ Expected issue transitions:
 
 When applying a new workflow label, donkeyspace should remove any existing `ai:*` workflow label from the same issue.
 
+The current implementation records intended GitHub label and comment writes as pending outbound actions before any live GitHub API executor is enabled. This keeps triage side effects auditable and testable while the project is still running fake-agent workflows.
+
 ## Human Control
 
 V1 uses labels and normal comments rather than slash commands.

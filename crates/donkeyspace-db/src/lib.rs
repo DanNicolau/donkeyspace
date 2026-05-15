@@ -43,9 +43,17 @@ pub async fn connect(config: &DbConfig) -> Result<PgPool, DbError> {
 }
 
 pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
-    sqlx::raw_sql(include_str!("../../../migrations/0001_init.sql"))
-        .execute(pool)
+    const MIGRATION_LOCK_ID: i64 = 0x0D05_0001;
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(MIGRATION_LOCK_ID)
+        .execute(&mut *transaction)
         .await?;
+    sqlx::raw_sql(include_str!("../../../migrations/0001_init.sql"))
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -89,6 +97,28 @@ pub struct StateTransitionRecord {
     pub to_state: String,
     pub reason: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundActionInput {
+    pub workflow_item_id: i64,
+    pub job_id: Option<Uuid>,
+    pub provider: String,
+    pub action_type: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct OutboundActionRecord {
+    pub id: i64,
+    pub workflow_item_id: i64,
+    pub job_id: Option<Uuid>,
+    pub provider: String,
+    pub action_type: String,
+    pub status: String,
+    pub payload: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 pub async fn upsert_repository(pool: &PgPool, input: &RepositoryInput) -> Result<i64, DbError> {
@@ -218,6 +248,72 @@ pub async fn record_state_transition(
     .await?;
 
     Ok(())
+}
+
+pub async fn create_outbound_action(
+    pool: &PgPool,
+    input: &OutboundActionInput,
+) -> Result<OutboundActionRecord, DbError> {
+    let action = sqlx::query_as::<_, OutboundActionRecord>(
+        r#"
+        INSERT INTO outbound_actions (
+            workflow_item_id,
+            job_id,
+            provider,
+            action_type,
+            payload
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+        "#,
+    )
+    .bind(input.workflow_item_id)
+    .bind(input.job_id)
+    .bind(&input.provider)
+    .bind(&input.action_type)
+    .bind(&input.payload)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(action)
+}
+
+pub async fn list_recent_outbound_actions(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<OutboundActionRecord>, DbError> {
+    let actions = sqlx::query_as::<_, OutboundActionRecord>(
+        r#"
+        SELECT *
+        FROM outbound_actions
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(actions)
+}
+
+pub async fn list_job_outbound_actions(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<Vec<OutboundActionRecord>, DbError> {
+    let actions = sqlx::query_as::<_, OutboundActionRecord>(
+        r#"
+        SELECT *
+        FROM outbound_actions
+        WHERE job_id = $1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(actions)
 }
 
 pub async fn list_jobs(pool: &PgPool, limit: i64) -> Result<Vec<JobRecord>, DbError> {

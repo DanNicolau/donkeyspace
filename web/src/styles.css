@@ -38,6 +38,8 @@ a {
 .topbar p,
 .run-panel h2,
 .run-row h3,
+.action-row h3,
+.action-row p,
 .run-row p {
   margin: 0;
 }
@@ -55,7 +57,7 @@ a {
 .summary-grid {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-bottom: 20px;
 }
 
@@ -74,7 +76,8 @@ a {
 
 .summary-grid span,
 .panel-header span,
-.run-row dt {
+.run-row dt,
+.action-row dt {
   color: #68736a;
   font-size: 13px;
 }
@@ -85,6 +88,10 @@ a {
 
 .run-panel {
   overflow: hidden;
+}
+
+.run-panel + .run-panel {
+  margin-top: 20px;
 }
 
 .panel-header {
@@ -99,22 +106,26 @@ a {
   display: grid;
 }
 
-.run-row {
+.run-row,
+.action-row {
   display: grid;
   gap: 16px;
   grid-template-columns: 1fr auto;
   padding: 18px;
 }
 
-.run-row + .run-row {
+.run-row + .run-row,
+.action-row + .action-row {
   border-top: 1px solid #edf0e8;
 }
 
-.run-row h3 {
+.run-row h3,
+.action-row h3 {
   font-size: 16px;
 }
 
-.run-row p {
+.run-row p,
+.action-row p {
   color: #59655d;
   margin-top: 6px;
 }
@@ -129,21 +140,33 @@ a {
   margin-top: 6px;
 }
 
-.run-row dl {
+.run-row dl,
+.action-row dl {
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(4, minmax(72px, auto));
   margin: 0;
 }
 
-.run-row dd {
+.run-row dd,
+.action-row dd {
   font-weight: 700;
   margin: 3px 0 0;
 }
 
+.action-list {
+  display: grid;
+}
+
+.empty-state {
+  color: #59655d;
+  padding: 18px;
+}
+
 @media (max-width: 760px) {
   .topbar,
-  .run-row {
+  .run-row,
+  .action-row {
     align-items: stretch;
     grid-template-columns: 1fr;
   }
@@ -153,7 +176,8 @@ a {
   }
 
   .summary-grid,
-  .run-row dl {
+  .run-row dl,
+  .action-row dl {
     grid-template-columns: 1fr;
   }
 }
