@@ -20,6 +20,23 @@ type RunResult = {
   blocked_reason: string | null;
 };
 
+type OutboundAction = {
+  id: number;
+  workflow_item_id: number;
+  job_id: string | null;
+  provider: string;
+  action_type: string;
+  status: string;
+  payload: {
+    issue_number?: number;
+    label?: string;
+    labels?: string[];
+    body?: string;
+    state?: string;
+  };
+  created_at: string;
+};
+
 const placeholderRuns: Run[] = [
   {
     id: "run_queued",
@@ -43,6 +60,16 @@ async function fetchRuns(): Promise<Run[]> {
   return response.json();
 }
 
+async function fetchOutboundActions(): Promise<OutboundAction[]> {
+  const response = await fetch("/api/outbound-actions");
+
+  if (!response.ok) {
+    throw new Error(`Failed to load outbound actions: ${response.status}`);
+  }
+
+  return response.json();
+}
+
 export function App() {
   const runsQuery = useQuery({
     queryKey: ["runs"],
@@ -50,11 +77,21 @@ export function App() {
     refetchInterval: 10_000,
     retry: 1
   });
+  const actionsQuery = useQuery({
+    queryKey: ["outbound-actions"],
+    queryFn: fetchOutboundActions,
+    refetchInterval: 10_000,
+    retry: 1
+  });
   const runs = runsQuery.data ?? placeholderRuns;
+  const outboundActions = actionsQuery.data ?? [];
   const activeRuns = runs.filter((run) =>
     ["leased", "running"].includes(run.status)
   ).length;
   const queuedRuns = runs.filter((run) => run.status === "queued").length;
+  const pendingActions = outboundActions.filter(
+    (action) => action.status === "pending"
+  ).length;
 
   return (
     <main className="app-shell">
@@ -78,6 +115,10 @@ export function App() {
         <div>
           <span>Total runs</span>
           <strong>{runs.length}</strong>
+        </div>
+        <div>
+          <span>Pending GitHub actions</span>
+          <strong>{pendingActions}</strong>
         </div>
       </section>
 
@@ -127,6 +168,57 @@ export function App() {
           ))}
         </div>
       </section>
+
+      <section className="run-panel">
+        <div className="panel-header">
+          <h2>GitHub action outbox</h2>
+          <span>{actionsQuery.isError ? "API unavailable" : "Pending writes"}</span>
+        </div>
+        <div className="action-list">
+          {outboundActions.length ? (
+            outboundActions.map((action) => (
+              <article className="action-row" key={action.id}>
+                <div>
+                  <h3>{action.action_type}</h3>
+                  <p>{describeAction(action)}</p>
+                </div>
+                <dl>
+                  <div>
+                    <dt>Status</dt>
+                    <dd>{action.status}</dd>
+                  </div>
+                  <div>
+                    <dt>Issue</dt>
+                    <dd>
+                      {action.payload.issue_number
+                        ? `#${action.payload.issue_number}`
+                        : "unknown"}
+                    </dd>
+                  </div>
+                </dl>
+              </article>
+            ))
+          ) : (
+            <div className="empty-state">No outbound GitHub actions yet.</div>
+          )}
+        </div>
+      </section>
     </main>
   );
+}
+
+function describeAction(action: OutboundAction): string {
+  if (action.action_type === "issue.add_label" && action.payload.label) {
+    return `Add ${action.payload.label}`;
+  }
+
+  if (action.action_type === "issue.remove_labels" && action.payload.labels) {
+    return `Remove ${action.payload.labels.join(", ")}`;
+  }
+
+  if (action.action_type === "issue.create_comment" && action.payload.body) {
+    return action.payload.body.split("\n")[0];
+  }
+
+  return action.provider;
 }

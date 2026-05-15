@@ -9,8 +9,9 @@ use axum::{
 use donkeyspace_core::{AgentRole, LabelState, Policy, WorkflowState, normalize_workflow_labels};
 use donkeyspace_db::{
     DbConfig, JobRecord, PgPool, RepositoryInput, WorkflowItemInput, acquire_job_lease,
-    apply_migrations, connect, create_job, get_job, list_job_transitions, list_jobs,
-    record_state_transition, record_webhook_delivery, upsert_repository, upsert_workflow_item,
+    apply_migrations, connect, create_job, get_job, list_job_outbound_actions,
+    list_job_transitions, list_jobs, list_recent_outbound_actions, record_state_transition,
+    record_webhook_delivery, upsert_repository, upsert_workflow_item,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/runs", get(api_runs))
+        .route("/api/outbound-actions", get(api_outbound_actions))
         .route("/api/runs/{id}", get(api_run))
         .route("/api/runs/{id}/transitions", get(api_run_transitions))
         .route("/api/runs/{id}/lease", post(api_lease_run))
@@ -126,7 +128,24 @@ async fn api_run(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> im
                 }
             };
 
-            Json(RunDetail { job, transitions }).into_response()
+            let outbound_actions = match list_job_outbound_actions(pool, id).await {
+                Ok(actions) => actions,
+                Err(error) => {
+                    tracing::error!(%error, %id, "failed to fetch outbound actions");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError::new("failed to fetch run outbound actions")),
+                    )
+                        .into_response();
+                }
+            };
+
+            Json(RunDetail {
+                job,
+                transitions,
+                outbound_actions,
+            })
+            .into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json(ApiError::new("run not found"))).into_response(),
         Err(error) => {
@@ -134,6 +153,28 @@ async fn api_run(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> im
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError::new("failed to fetch run")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_outbound_actions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+
+    match list_recent_outbound_actions(pool, 50).await {
+        Ok(actions) => Json(actions).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list outbound actions");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to list outbound actions")),
             )
                 .into_response()
         }
@@ -421,6 +462,7 @@ struct LeaseRequest {
 struct RunDetail {
     job: JobRecord,
     transitions: Vec<donkeyspace_db::StateTransitionRecord>,
+    outbound_actions: Vec<donkeyspace_db::OutboundActionRecord>,
 }
 
 #[derive(Debug, Serialize)]

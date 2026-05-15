@@ -83,3 +83,18 @@ CREATE TABLE IF NOT EXISTS command_results (
     summary TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS outbound_actions (
+    id BIGSERIAL PRIMARY KEY,
+    workflow_item_id BIGINT NOT NULL REFERENCES workflow_items(id),
+    job_id UUID REFERENCES jobs(id),
+    provider TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS outbound_actions_status_idx ON outbound_actions(status);
+CREATE INDEX IF NOT EXISTS outbound_actions_job_id_idx ON outbound_actions(job_id);
