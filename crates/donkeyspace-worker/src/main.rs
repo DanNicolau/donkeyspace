@@ -1,5 +1,10 @@
 use clap::Parser;
-use donkeyspace_db::{DbConfig, acquire_next_queued_job, apply_migrations, connect};
+use donkeyspace_core::{fake_triage_issue, workflow_state_for_outcome};
+use donkeyspace_db::{
+    DbConfig, JobRecord, acquire_next_queued_job, apply_migrations, complete_job, connect,
+    fail_job, mark_job_running, record_state_transition, update_workflow_item_state,
+};
+use serde_json::json;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -60,10 +65,82 @@ async fn poll_once(
             tracing::info!(
                 job_id = %job.id,
                 role = job.role,
-                "leased queued job; execution adapter is not wired yet"
+                "leased queued job"
             );
+            execute_job(pool, job).await?;
         }
         None => tracing::debug!("no queued jobs available"),
+    }
+
+    Ok(())
+}
+
+async fn execute_job(
+    pool: &donkeyspace_db::PgPool,
+    job: JobRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(running_job) = mark_job_running(pool, job.id).await? else {
+        tracing::warn!(job_id = %job.id, "leased job was not available to mark running");
+        return Ok(());
+    };
+
+    match running_job.role.as_str() {
+        "triage" => {
+            let result = fake_triage_issue(&running_job.input);
+            result.validate_for_orchestration()?;
+            let result_value = serde_json::to_value(&result)?;
+            let workflow_state = workflow_state_for_outcome(result.outcome);
+            complete_job(pool, running_job.id, &result_value).await?;
+
+            if let Some(workflow_item_id) = running_job.workflow_item_id {
+                update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+                record_state_transition(
+                    pool,
+                    workflow_item_id,
+                    Some(running_job.id),
+                    None,
+                    workflow_state.as_str(),
+                    "fake triage agent completed",
+                )
+                .await?;
+            }
+
+            tracing::info!(
+                job_id = %running_job.id,
+                outcome = ?result.outcome,
+                workflow_state = workflow_state.as_str(),
+                "job completed"
+            );
+        }
+        unsupported => {
+            let result_value = json!({
+                "outcome": "failed",
+                "summary": "Job execution failed.",
+                "confidence": "low",
+                "risk": "unknown",
+                "questions": [],
+                "tests": [],
+                "changed_files": [],
+                "human_review_reason": null,
+                "blocked_reason": format!("unsupported agent role: {unsupported}"),
+            });
+            fail_job(pool, running_job.id, &result_value).await?;
+
+            if let Some(workflow_item_id) = running_job.workflow_item_id {
+                update_workflow_item_state(pool, workflow_item_id, "blocked").await?;
+                record_state_transition(
+                    pool,
+                    workflow_item_id,
+                    Some(running_job.id),
+                    None,
+                    "blocked",
+                    "job execution failed",
+                )
+                .await?;
+            }
+
+            tracing::warn!(job_id = %running_job.id, "job failed");
+        }
     }
 
     Ok(())

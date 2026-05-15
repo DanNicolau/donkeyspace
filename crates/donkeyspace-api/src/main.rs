@@ -9,8 +9,8 @@ use axum::{
 use donkeyspace_core::{AgentRole, LabelState, Policy, WorkflowState, normalize_workflow_labels};
 use donkeyspace_db::{
     DbConfig, JobRecord, PgPool, RepositoryInput, WorkflowItemInput, acquire_job_lease,
-    apply_migrations, connect, create_job, get_job, list_jobs, record_state_transition,
-    record_webhook_delivery, upsert_repository, upsert_workflow_item,
+    apply_migrations, connect, create_job, get_job, list_job_transitions, list_jobs,
+    record_state_transition, record_webhook_delivery, upsert_repository, upsert_workflow_item,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/api/runs", get(api_runs))
         .route("/api/runs/{id}", get(api_run))
+        .route("/api/runs/{id}/transitions", get(api_run_transitions))
         .route("/api/runs/{id}/lease", post(api_lease_run))
         .route("/webhooks/github", post(github_webhook))
         .layer(TraceLayer::new_for_http())
@@ -112,13 +113,52 @@ async fn api_run(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> im
     };
 
     match get_job(pool, id).await {
-        Ok(Some(job)) => Json(job).into_response(),
+        Ok(Some(job)) => {
+            let transitions = match list_job_transitions(pool, id).await {
+                Ok(transitions) => transitions,
+                Err(error) => {
+                    tracing::error!(%error, %id, "failed to fetch job transitions");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError::new("failed to fetch run transitions")),
+                    )
+                        .into_response();
+                }
+            };
+
+            Json(RunDetail { job, transitions }).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, Json(ApiError::new("run not found"))).into_response(),
         Err(error) => {
             tracing::error!(%error, %id, "failed to fetch job");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError::new("failed to fetch run")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_run_transitions(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+
+    match list_job_transitions(pool, id).await {
+        Ok(transitions) => Json(transitions).into_response(),
+        Err(error) => {
+            tracing::error!(%error, %id, "failed to fetch run transitions");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to fetch run transitions")),
             )
                 .into_response()
         }
@@ -375,6 +415,12 @@ struct GitHubLabel {
 struct LeaseRequest {
     lease_owner: String,
     lease_seconds: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunDetail {
+    job: JobRecord,
+    transitions: Vec<donkeyspace_db::StateTransitionRecord>,
 }
 
 #[derive(Debug, Serialize)]

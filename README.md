@@ -66,5 +66,8 @@ Useful local endpoints:
 - `GET /healthz`
 - `GET /api/runs`
 - `GET /api/runs/{id}`
+- `GET /api/runs/{id}/transitions`
 - `POST /api/runs/{id}/lease`
 - `POST /webhooks/github`
+
+The current workflow supports a fake triage agent. A signed `issues.opened` webhook creates a triage run, the worker leases it, marks it running, writes a deterministic result, completes the run, and records a workflow transition.

@@ -80,6 +80,17 @@ pub struct JobRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct StateTransitionRecord {
+    pub id: i64,
+    pub workflow_item_id: i64,
+    pub job_id: Option<Uuid>,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
 pub async fn upsert_repository(pool: &PgPool, input: &RepositoryInput) -> Result<i64, DbError> {
     let id = sqlx::query_scalar::<_, i64>(
         r#"
@@ -232,6 +243,119 @@ pub async fn get_job(pool: &PgPool, id: Uuid) -> Result<Option<JobRecord>, DbErr
         .await?;
 
     Ok(job)
+}
+
+pub async fn mark_job_running(pool: &PgPool, id: Uuid) -> Result<Option<JobRecord>, DbError> {
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET
+            status = 'running',
+            updated_at = now()
+        WHERE id = $1
+          AND status = 'leased'
+          AND lease_expires_at > now()
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(job)
+}
+
+pub async fn complete_job(
+    pool: &PgPool,
+    id: Uuid,
+    result: &Value,
+) -> Result<Option<JobRecord>, DbError> {
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET
+            status = 'completed',
+            result = $2,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            updated_at = now()
+        WHERE id = $1
+          AND status = 'running'
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .bind(result)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(job)
+}
+
+pub async fn fail_job(
+    pool: &PgPool,
+    id: Uuid,
+    result: &Value,
+) -> Result<Option<JobRecord>, DbError> {
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET
+            status = 'failed',
+            result = $2,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .bind(result)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(job)
+}
+
+pub async fn update_workflow_item_state(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    state: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        UPDATE workflow_items
+        SET current_state = $2,
+            updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(state)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_job_transitions(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<Vec<StateTransitionRecord>, DbError> {
+    let transitions = sqlx::query_as::<_, StateTransitionRecord>(
+        r#"
+        SELECT *
+        FROM state_transitions
+        WHERE job_id = $1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(transitions)
 }
 
 pub async fn acquire_job_lease(
