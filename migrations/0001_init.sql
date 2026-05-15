@@ -92,9 +92,12 @@ CREATE TABLE IF NOT EXISTS outbound_actions (
     action_type TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     payload JSONB NOT NULL,
+    last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE outbound_actions ADD COLUMN IF NOT EXISTS last_error TEXT;
 
 CREATE INDEX IF NOT EXISTS outbound_actions_status_idx ON outbound_actions(status);
 CREATE INDEX IF NOT EXISTS outbound_actions_job_id_idx ON outbound_actions(job_id);

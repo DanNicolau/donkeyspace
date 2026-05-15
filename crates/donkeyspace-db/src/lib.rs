@@ -117,6 +117,7 @@ pub struct OutboundActionRecord {
     pub action_type: String,
     pub status: String,
     pub payload: Value,
+    pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -295,6 +296,65 @@ pub async fn list_recent_outbound_actions(
     .await?;
 
     Ok(actions)
+}
+
+pub async fn list_pending_outbound_actions(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<OutboundActionRecord>, DbError> {
+    let actions = sqlx::query_as::<_, OutboundActionRecord>(
+        r#"
+        SELECT *
+        FROM outbound_actions
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(actions)
+}
+
+pub async fn mark_outbound_action_completed(pool: &PgPool, id: i64) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        UPDATE outbound_actions
+        SET status = 'completed',
+            last_error = NULL,
+            updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn mark_outbound_action_failed(
+    pool: &PgPool,
+    id: i64,
+    error: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        UPDATE outbound_actions
+        SET status = 'failed',
+            last_error = $2,
+            updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 pub async fn list_job_outbound_actions(

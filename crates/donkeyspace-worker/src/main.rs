@@ -3,10 +3,13 @@ use donkeyspace_core::{
     Policy, fake_triage_issue, triage_github_issue_actions, workflow_state_for_outcome,
 };
 use donkeyspace_db::{
-    DbConfig, JobRecord, OutboundActionInput, acquire_next_queued_job, apply_migrations,
-    complete_job, connect, create_outbound_action, fail_job, mark_job_running,
-    record_state_transition, update_workflow_item_state,
+    DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord, acquire_next_queued_job,
+    apply_migrations, complete_job, connect, create_outbound_action, fail_job,
+    list_pending_outbound_actions, mark_job_running, mark_outbound_action_completed,
+    mark_outbound_action_failed, record_state_transition, update_workflow_item_state,
 };
+use donkeyspace_github::GitHubClient;
+use serde::Deserialize;
 use serde_json::json;
 use std::{env, fs, time::Duration};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -22,6 +25,8 @@ struct Args {
     lease_seconds: i32,
     #[arg(long, default_value_t = false)]
     once: bool,
+    #[arg(long, env = "DONKEYSPACE_GITHUB_TOKEN")]
+    github_token: Option<String>,
 }
 
 #[tokio::main]
@@ -44,7 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.once {
         if let Some(pool) = &pool {
-            poll_once(pool, &policy, &args.worker_id, args.lease_seconds).await?;
+            poll_once(
+                pool,
+                &policy,
+                args.github_token.as_deref(),
+                &args.worker_id,
+                args.lease_seconds,
+            )
+            .await?;
         }
         tracing::info!("worker once mode completed");
         return Ok(());
@@ -52,7 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         if let Some(pool) = &pool {
-            poll_once(pool, &policy, &args.worker_id, args.lease_seconds).await?;
+            poll_once(
+                pool,
+                &policy,
+                args.github_token.as_deref(),
+                &args.worker_id,
+                args.lease_seconds,
+            )
+            .await?;
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
         tracing::debug!("worker heartbeat");
@@ -62,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn poll_once(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
+    github_token: Option<&str>,
     worker_id: &str,
     lease_seconds: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -75,6 +95,13 @@ async fn poll_once(
             execute_job(pool, policy, job).await?;
         }
         None => tracing::debug!("no queued jobs available"),
+    }
+
+    if let Some(github_token) = github_token.filter(|token| !token.trim().is_empty()) {
+        let client = GitHubClient::new(github_token)?;
+        process_outbound_actions(pool, &client).await?;
+    } else {
+        tracing::debug!("DONKEYSPACE_GITHUB_TOKEN is unset; outbound actions remain pending");
     }
 
     Ok(())
@@ -166,6 +193,103 @@ async fn execute_job(
     }
 
     Ok(())
+}
+
+async fn process_outbound_actions(
+    pool: &donkeyspace_db::PgPool,
+    client: &GitHubClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for action in list_pending_outbound_actions(pool, 20).await? {
+        match execute_outbound_action(client, &action).await {
+            Ok(()) => {
+                mark_outbound_action_completed(pool, action.id).await?;
+                tracing::info!(
+                    action_id = action.id,
+                    action_type = action.action_type,
+                    "outbound github action completed"
+                );
+            }
+            Err(error) => {
+                let error = error.to_string();
+                mark_outbound_action_failed(pool, action.id, &error).await?;
+                tracing::warn!(
+                    action_id = action.id,
+                    action_type = action.action_type,
+                    %error,
+                    "outbound github action failed"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_outbound_action(
+    client: &GitHubClient,
+    action: &OutboundActionRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action.action_type.as_str() {
+        "issue.add_label" => {
+            let payload: AddLabelPayload = serde_json::from_value(action.payload.clone())?;
+            client
+                .add_issue_label(
+                    &payload.owner,
+                    &payload.repo,
+                    payload.issue_number,
+                    &payload.label,
+                )
+                .await?;
+        }
+        "issue.remove_labels" => {
+            let payload: RemoveLabelsPayload = serde_json::from_value(action.payload.clone())?;
+            for label in payload.labels {
+                client
+                    .remove_issue_label(&payload.owner, &payload.repo, payload.issue_number, &label)
+                    .await?;
+            }
+        }
+        "issue.create_comment" => {
+            let payload: CreateCommentPayload = serde_json::from_value(action.payload.clone())?;
+            client
+                .create_issue_comment(
+                    &payload.owner,
+                    &payload.repo,
+                    payload.issue_number,
+                    &payload.body,
+                )
+                .await?;
+        }
+        unsupported => {
+            return Err(format!("unsupported outbound action type: {unsupported}").into());
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AddLabelPayload {
+    owner: String,
+    repo: String,
+    issue_number: i64,
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveLabelsPayload {
+    owner: String,
+    repo: String,
+    issue_number: i64,
+    labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCommentPayload {
+    owner: String,
+    repo: String,
+    issue_number: i64,
+    body: String,
 }
 
 fn init_tracing() {

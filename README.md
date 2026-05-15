@@ -55,6 +55,8 @@ Start the local API, worker, and PostgreSQL services:
 docker compose up --build
 ```
 
+To let the worker apply pending GitHub labels and comments, set `DONKEYSPACE_GITHUB_TOKEN` in your environment before starting Compose. Without it, outbound actions remain pending and visible in the dashboard.
+
 Start the Vite dashboard dev server:
 
 ```sh
