@@ -1,0 +1,298 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+pub use sqlx::PgPool;
+use sqlx::{FromRow, postgres::PgPoolOptions};
+use std::time::Duration;
+use thiserror::Error;
+use uuid::Uuid;
+
+#[derive(Debug, Error)]
+pub enum DbError {
+    #[error("database url is empty")]
+    EmptyDatabaseUrl,
+    #[error("database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+#[derive(Debug, Clone)]
+pub struct DbConfig {
+    pub database_url: String,
+    pub max_connections: u32,
+}
+
+impl DbConfig {
+    pub fn from_database_url(database_url: impl Into<String>) -> Self {
+        Self {
+            database_url: database_url.into(),
+            max_connections: 5,
+        }
+    }
+}
+
+pub async fn connect(config: &DbConfig) -> Result<PgPool, DbError> {
+    if config.database_url.trim().is_empty() {
+        return Err(DbError::EmptyDatabaseUrl);
+    }
+
+    Ok(PgPoolOptions::new()
+        .max_connections(config.max_connections)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&config.database_url)
+        .await?)
+}
+
+pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
+    sqlx::raw_sql(include_str!("../../../migrations/0001_init.sql"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryInput {
+    pub provider: String,
+    pub owner: String,
+    pub name: String,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowItemInput {
+    pub repository_id: i64,
+    pub provider_issue_id: String,
+    pub issue_number: i64,
+    pub current_state: Option<String>,
+    pub current_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub id: Uuid,
+    pub workflow_item_id: Option<i64>,
+    pub role: String,
+    pub status: String,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub input: Value,
+    pub result: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub async fn upsert_repository(pool: &PgPool, input: &RepositoryInput) -> Result<i64, DbError> {
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO repositories (provider, owner, name, default_branch)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (provider, owner, name)
+        DO UPDATE SET default_branch = EXCLUDED.default_branch
+        RETURNING id
+        "#,
+    )
+    .bind(&input.provider)
+    .bind(&input.owner)
+    .bind(&input.name)
+    .bind(&input.default_branch)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(id)
+}
+
+pub async fn upsert_workflow_item(
+    pool: &PgPool,
+    input: &WorkflowItemInput,
+) -> Result<i64, DbError> {
+    let labels = serde_json::to_value(&input.current_labels).expect("labels serialize");
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO workflow_items (
+            repository_id,
+            provider_issue_id,
+            issue_number,
+            current_state,
+            current_labels
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (repository_id, provider_issue_id)
+        DO UPDATE SET
+            issue_number = EXCLUDED.issue_number,
+            current_state = EXCLUDED.current_state,
+            current_labels = EXCLUDED.current_labels,
+            updated_at = now()
+        RETURNING id
+        "#,
+    )
+    .bind(input.repository_id)
+    .bind(&input.provider_issue_id)
+    .bind(input.issue_number)
+    .bind(&input.current_state)
+    .bind(labels)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(id)
+}
+
+pub async fn record_webhook_delivery(
+    pool: &PgPool,
+    repository_id: Option<i64>,
+    delivery_id: &str,
+    event_name: &str,
+    payload: &Value,
+) -> Result<bool, DbError> {
+    let inserted = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO webhook_deliveries (repository_id, delivery_id, event_name, payload)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (delivery_id) DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(repository_id)
+    .bind(delivery_id)
+    .bind(event_name)
+    .bind(payload)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(inserted.is_some())
+}
+
+pub async fn create_job(
+    pool: &PgPool,
+    workflow_item_id: Option<i64>,
+    role: &str,
+    input: &Value,
+) -> Result<JobRecord, DbError> {
+    let id = Uuid::now_v7();
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        INSERT INTO jobs (id, workflow_item_id, role, status, input)
+        VALUES ($1, $2, $3, 'queued', $4)
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .bind(workflow_item_id)
+    .bind(role)
+    .bind(input)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(job)
+}
+
+pub async fn record_state_transition(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    job_id: Option<Uuid>,
+    from_state: Option<&str>,
+    to_state: &str,
+    reason: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        INSERT INTO state_transitions (workflow_item_id, job_id, from_state, to_state, reason)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(job_id)
+    .bind(from_state)
+    .bind(to_state)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_jobs(pool: &PgPool, limit: i64) -> Result<Vec<JobRecord>, DbError> {
+    let jobs = sqlx::query_as::<_, JobRecord>(
+        r#"
+        SELECT *
+        FROM jobs
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(jobs)
+}
+
+pub async fn get_job(pool: &PgPool, id: Uuid) -> Result<Option<JobRecord>, DbError> {
+    let job = sqlx::query_as::<_, JobRecord>("SELECT * FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(job)
+}
+
+pub async fn acquire_job_lease(
+    pool: &PgPool,
+    id: Uuid,
+    lease_owner: &str,
+    lease_seconds: i32,
+) -> Result<Option<JobRecord>, DbError> {
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET
+            status = 'leased',
+            lease_owner = $2,
+            lease_expires_at = now() + ($3::text || ' seconds')::interval,
+            updated_at = now()
+        WHERE id = $1
+          AND status IN ('queued', 'leased')
+          AND (lease_expires_at IS NULL OR lease_expires_at < now())
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .bind(lease_owner)
+    .bind(lease_seconds)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(job)
+}
+
+pub async fn acquire_next_queued_job(
+    pool: &PgPool,
+    lease_owner: &str,
+    lease_seconds: i32,
+) -> Result<Option<JobRecord>, DbError> {
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        WITH candidate AS (
+            SELECT id
+            FROM jobs
+            WHERE status = 'queued'
+               OR (status = 'leased' AND lease_expires_at < now())
+            ORDER BY created_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE jobs
+        SET
+            status = 'leased',
+            lease_owner = $1,
+            lease_expires_at = now() + ($2::text || ' seconds')::interval,
+            updated_at = now()
+        WHERE id = (SELECT id FROM candidate)
+        RETURNING *
+        "#,
+    )
+    .bind(lease_owner)
+    .bind(lease_seconds)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(job)
+}

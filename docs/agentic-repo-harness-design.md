@@ -1,15 +1,16 @@
-# Agentic Repository Harness Design
+# donkeyspace Design
 
 ## Problem Statement
 
 Modern software teams are beginning to use coding agents, reviewer agents, and issue triage agents, but the surrounding workflow is still fragmented. Agents can write code or review changes, but teams still need a reliable way to decide when an issue is clear enough for agent work, what level of autonomy is allowed, which tests are required, when humans must intervene, and how agent decisions should be audited.
 
-This project is a self-hosted orchestration and policy harness for agentic repository work. It connects project-management signals, repository state, agent execution, tests, pull requests, reviews, and human approval into one controlled workflow.
+donkeyspace is a self-hosted orchestration and policy harness for agentic repository work. It connects project-management signals, repository state, agent execution, tests, pull requests, reviews, and human approval into one controlled workflow.
 
 The intended end state is that developers spend most of their time communicating real observations, resolving ambiguity, and reviewing high-stakes work. Routine clarification, implementation, testing, review preparation, and low-risk workflow coordination should be handled by agents under explicit policy.
 
 ## Goals
 
+- Establish donkeyspace as the project name and product identity.
 - Provide a self-hosted, containerized system that coordinates agentic work in repositories.
 - Start with a GitHub-first workflow using Issues, labels, comments, pull requests, and CI.
 - Let agents ask clarifying questions before implementation begins.
@@ -129,7 +130,7 @@ Only one active AI workflow-state label should apply to an issue at a time. The 
 
 ## Policy Model
 
-Policies should be stored in repository or organization configuration. YAML is the default initial format, though TOML remains acceptable if the project later chooses it.
+Policies should be stored in repository or organization configuration. V1 uses YAML at `.donkeyspace/policy.yml`.
 
 Policies should define:
 
@@ -177,6 +178,8 @@ The system should distinguish between:
 
 Repository and project-management credentials should be scoped per run or per installation wherever practical.
 
+Agent CLIs should produce a structured result file at `.donkeyspace/run-result.json` inside the run workspace. The orchestrator should use this file to interpret outcomes, risk, confidence, questions, tests, and escalation reasons. Missing or invalid structured results should cause the run to fail closed by routing to humans or marking the job failed.
+
 ## Architecture
 
 Core components:
@@ -190,6 +193,10 @@ Core components:
 - Audit and log store.
 - Minimal dashboard.
 
+Backend services should be implemented in Rust. UI work should use TypeScript React. The recommended v1 backend stack is `axum`, `tokio`, `sqlx`, `serde`, and `tracing`, with PostgreSQL as the database. The recommended UI stack is Vite, React, TypeScript, and TanStack Query.
+
+The v1 database should be PostgreSQL. It stores installation metadata, repository records, job leases, state transitions, policy snapshots, command results, agent summaries, and audit metadata.
+
 GitHub remains the primary collaboration surface. The local database stores coordination metadata and audit history, but visible workflow state should remain understandable from GitHub labels and comments.
 
 The dashboard should initially provide:
@@ -202,7 +209,7 @@ The dashboard should initially provide:
 - Logs and command results.
 - Basic policy visibility.
 
-Policy editing may be added later. The first version can rely on repository configuration files.
+Policy editing may be added later. The first version relies on repository configuration files and shows policy snapshots in read-only form.
 
 ## Auditability
 
@@ -240,6 +247,25 @@ This should support one self-hosted installation managing one or more repositori
 
 Kubernetes support can come later if larger teams need stronger scheduling, scaling, and isolation.
 
+## V1 Decisions
+
+- Project name: `donkeyspace`.
+- Policy format: YAML.
+- Policy path: `.donkeyspace/policy.yml`.
+- GitHub identity: GitHub App for team deployments; personal access token only as a local-development fallback.
+- Control surface: labels and normal GitHub comments.
+- Slash commands: deferred.
+- Database: PostgreSQL.
+- Backend: Rust.
+- UI: TypeScript React.
+- Dashboard: read-only operational visibility in v1, with policy editing deferred.
+- Automatic merge: deferred and disabled by default.
+- Duplicate work prevention: GitHub labels for visible state plus database leases for execution locking.
+- Agent result schema: `schemas/run-result.schema.json`.
+- First reference agent adapter: Codex CLI through the generic command-runner contract.
+- Local development credentials: personal token fallback through `DONKEYSPACE_GITHUB_TOKEN`; team deployments should use GitHub App credentials.
+- First dashboard slice: run list and run detail.
+
 ## Future Extensions
 
 Future versions may add:
@@ -256,14 +282,9 @@ Future versions may add:
 - Organization-wide policy inheritance.
 - Cost tracking and model-provider routing.
 
-## Open Questions
+## Deferred Design Questions
 
-- Should policy files standardize on YAML or TOML?
-- How much policy editing should eventually happen through the dashboard?
-- Which credential providers should be supported first?
-- How should agents express uncertainty in a machine-readable way?
-- What exact criteria should enable automatic merge in a future version?
-- How should cross-repo dependency awareness work after the one-repo MVP?
-- Should issue comments support explicit commands in addition to labels?
-- How should the system prevent duplicate agent claims on the same issue?
-- What is the minimum useful dashboard for v1?
+- What exact workspace-group model should support cross-repo dependency awareness after the one-repo MVP?
+- Which project-management integration should follow GitHub Issues?
+- When should automatic merge graduate from deferred feature to supported policy mode?
+- How much dashboard-based policy editing is worth adding before multi-repo support?

@@ -1,30 +1,37 @@
 # V1 Readiness Checklist
 
-This checklist tracks the work needed before the first useful version of the agentic repository harness is ready.
+This checklist tracks the work needed before the first useful version of donkeyspace is ready.
 
 ## Product Definition
 
-- [ ] Finalize the project name.
-- [ ] Decide whether policy config uses YAML or TOML.
-- [ ] Define the exact MVP user journey from issue creation to human-reviewed PR.
-- [ ] Define v1 non-goals clearly enough to avoid scope creep.
-- [ ] Decide which GitHub events trigger triage, implementation, and review jobs.
-- [ ] Define how humans pause, resume, retry, or cancel agent work.
+- [x] Finalize the project name.
+- [x] Decide whether policy config uses YAML or TOML.
+- [x] Define the exact MVP user journey from issue creation to human-reviewed PR.
+- [x] Define v1 non-goals clearly enough to avoid scope creep.
+- [x] Decide which GitHub events trigger triage, implementation, and review jobs.
+- [x] Define how humans pause, resume, retry, or cancel agent work.
+- [x] Choose the first reference agent CLI adapter.
+- [x] Define the local-development credential default.
+- [x] Choose backend and frontend implementation stack.
+- [x] Scaffold Rust workspace and TypeScript React dashboard.
+- [x] Add Docker Compose skeleton.
+- [x] Add repository policy file at `.donkeyspace/policy.yml`.
 
 ## GitHub Workflow
 
-- [ ] Define the complete AI label set.
-- [ ] Implement one-active-state-label behavior.
-- [ ] Define allowed label transitions.
-- [ ] Define how the system handles invalid or conflicting labels.
-- [ ] Define issue comment format for triage questions.
-- [ ] Define PR description format for agent-authored PRs.
-- [ ] Define reviewer-agent comment format.
-- [ ] Decide whether v1 supports slash commands or labels only.
+- [x] Define the complete AI label set.
+- [x] Implement one-active-state-label behavior.
+- [x] Define allowed label transitions.
+- [x] Define how the system handles invalid or conflicting labels.
+- [x] Define issue comment format for triage questions.
+- [x] Define PR description format for agent-authored PRs.
+- [x] Define reviewer-agent comment format.
+- [x] Decide whether v1 supports slash commands or labels only.
 
 ## Policy System
 
-- [ ] Design the first policy file schema.
+- [x] Design the first policy file schema.
+- [x] Add examples for a minimal policy and a stricter team policy.
 - [ ] Support enabling and disabling agent roles.
 - [ ] Support required local commands.
 - [ ] Support required GitHub CI checks.
@@ -33,19 +40,19 @@ This checklist tracks the work needed before the first useful version of the age
 - [ ] Support labels that allow agent work.
 - [ ] Support risk classification defaults.
 - [ ] Define policy behavior when config is missing or invalid.
-- [ ] Add examples for a minimal policy and a stricter team policy.
 
 ## Agent Orchestration
 
-- [ ] Define the external agent CLI interface.
-- [ ] Define required inputs passed to each agent role.
-- [ ] Define required outputs from each agent role.
-- [ ] Define how agents report uncertainty.
-- [ ] Define how agents request human help.
-- [ ] Define job claiming and locking behavior.
+- [x] Define the external agent CLI interface.
+- [x] Define required inputs passed to each agent role.
+- [x] Define required outputs from each agent role.
+- [x] Define how agents report uncertainty.
+- [x] Define how agents request human help.
+- [x] Define job claiming and locking behavior.
 - [ ] Define retry behavior.
-- [ ] Define timeout behavior.
+- [x] Define timeout behavior.
 - [ ] Define cancellation behavior.
+- [x] Implement DB-backed job lease acquisition.
 
 ## Sandboxing And Execution
 
@@ -62,8 +69,8 @@ This checklist tracks the work needed before the first useful version of the age
 ## GitHub Integration
 
 - [ ] Create GitHub App or bot identity design.
-- [ ] Handle issue events.
-- [ ] Handle issue comment events.
+- [x] Handle issue events.
+- [x] Handle issue comment events.
 - [ ] Handle label events.
 - [ ] Handle pull request events.
 - [ ] Handle check-suite or check-run events if needed.
@@ -76,27 +83,28 @@ This checklist tracks the work needed before the first useful version of the age
 
 ## Audit And Storage
 
-- [ ] Choose the database.
-- [ ] Define run records.
-- [ ] Define state transition records.
-- [ ] Define policy decision records.
-- [ ] Define command result records.
-- [ ] Define agent decision summary records.
+- [x] Choose the database.
+- [x] Define run records.
+- [x] Define state transition records.
+- [x] Define policy decision records.
+- [x] Define command result records.
+- [x] Define agent decision summary records.
 - [ ] Link audit records to GitHub issues, PRs, comments, commits, and branches.
 - [ ] Decide log retention defaults.
 - [ ] Decide what data must be redacted.
 
 ## Dashboard
 
-- [ ] Define the minimum dashboard routes.
-- [ ] Show active jobs.
-- [ ] Show run history.
+- [x] Define the minimum dashboard routes.
+- [x] Show active jobs.
+- [x] Show run history.
 - [ ] Show issue and PR links.
 - [ ] Show state transitions.
 - [ ] Show policy decisions.
 - [ ] Show command results.
 - [ ] Show failure and escalation reasons.
 - [ ] Show current policy config in read-only form.
+- [x] Define the first useful dashboard slice.
 
 ## Testing
 
@@ -113,8 +121,8 @@ This checklist tracks the work needed before the first useful version of the age
 
 ## Documentation
 
-- [ ] Write quickstart instructions.
-- [ ] Write Docker Compose setup instructions.
+- [x] Write quickstart instructions.
+- [x] Write Docker Compose setup instructions.
 - [ ] Document required GitHub App permissions.
 - [ ] Document policy file configuration.
 - [ ] Document label meanings.

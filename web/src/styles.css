@@ -1,0 +1,149 @@
+:root {
+  color: #17201a;
+  background: #f7f7f2;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+a {
+  color: #255c48;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.app-shell {
+  margin: 0 auto;
+  max-width: 1120px;
+  padding: 32px 24px 56px;
+}
+
+.topbar {
+  align-items: center;
+  display: flex;
+  gap: 24px;
+  justify-content: space-between;
+  margin-bottom: 28px;
+}
+
+.topbar h1,
+.topbar p,
+.run-panel h2,
+.run-row h3,
+.run-row p {
+  margin: 0;
+}
+
+.topbar h1 {
+  font-size: 32px;
+  line-height: 1.1;
+}
+
+.topbar p {
+  color: #59655d;
+  margin-top: 6px;
+}
+
+.summary-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 20px;
+}
+
+.summary-grid > div,
+.run-panel {
+  background: #ffffff;
+  border: 1px solid #dfe3da;
+  border-radius: 8px;
+}
+
+.summary-grid > div {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+}
+
+.summary-grid span,
+.panel-header span,
+.run-row dt {
+  color: #68736a;
+  font-size: 13px;
+}
+
+.summary-grid strong {
+  font-size: 28px;
+}
+
+.run-panel {
+  overflow: hidden;
+}
+
+.panel-header {
+  align-items: center;
+  border-bottom: 1px solid #dfe3da;
+  display: flex;
+  justify-content: space-between;
+  padding: 16px 18px;
+}
+
+.run-list {
+  display: grid;
+}
+
+.run-row {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 1fr auto;
+  padding: 18px;
+}
+
+.run-row + .run-row {
+  border-top: 1px solid #edf0e8;
+}
+
+.run-row h3 {
+  font-size: 16px;
+}
+
+.run-row p {
+  color: #59655d;
+  margin-top: 6px;
+}
+
+.run-row dl {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(3, minmax(72px, auto));
+  margin: 0;
+}
+
+.run-row dd {
+  font-weight: 700;
+  margin: 3px 0 0;
+}
+
+@media (max-width: 760px) {
+  .topbar,
+  .run-row {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    display: grid;
+  }
+
+  .summary-grid,
+  .run-row dl {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/donkeyspace-api",
+    "crates/donkeyspace-core",
+    "crates/donkeyspace-db",
+    "crates/donkeyspace-github",
+    "crates/donkeyspace-runner",
+    "crates/donkeyspace-worker",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/donkeyspace/donkeyspace"
+
+[workspace.dependencies]
+axum = "0.8"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v7"] }
