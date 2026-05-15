@@ -6,8 +6,18 @@ type Run = {
   role: string;
   status: string;
   lease_owner: string | null;
+  result: RunResult | null;
   created_at: string;
   updated_at: string;
+};
+
+type RunResult = {
+  outcome: string;
+  summary: string;
+  confidence: string;
+  risk: string;
+  questions: string[];
+  blocked_reason: string | null;
 };
 
 const placeholderRuns: Run[] = [
@@ -17,6 +27,7 @@ const placeholderRuns: Run[] = [
     role: "triage",
     status: "queued",
     lease_owner: null,
+    result: null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
   }
@@ -40,7 +51,9 @@ export function App() {
     retry: 1
   });
   const runs = runsQuery.data ?? placeholderRuns;
-  const activeRuns = runs.filter((run) => run.status === "leased").length;
+  const activeRuns = runs.filter((run) =>
+    ["leased", "running"].includes(run.status)
+  ).length;
   const queuedRuns = runs.filter((run) => run.status === "queued").length;
 
   return (
@@ -79,10 +92,18 @@ export function App() {
               <div>
                 <h3>{run.id}</h3>
                 <p>
-                  {run.workflow_item_id
-                    ? `Workflow item ${run.workflow_item_id}`
-                    : "No workflow item linked yet"}
+                  {run.result?.summary ??
+                    (run.workflow_item_id
+                      ? `Workflow item ${run.workflow_item_id}`
+                      : "No workflow item linked yet")}
                 </p>
+                {run.result?.questions.length ? (
+                  <ul className="question-list">
+                    {run.result.questions.map((question) => (
+                      <li key={question}>{question}</li>
+                    ))}
+                  </ul>
+                ) : null}
               </div>
               <dl>
                 <div>
@@ -96,6 +117,10 @@ export function App() {
                 <div>
                   <dt>Lease</dt>
                   <dd>{run.lease_owner ?? "none"}</dd>
+                </div>
+                <div>
+                  <dt>Outcome</dt>
+                  <dd>{run.result?.outcome ?? "pending"}</dd>
                 </div>
               </dl>
             </article>

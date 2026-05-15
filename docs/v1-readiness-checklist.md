@@ -53,6 +53,9 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Define timeout behavior.
 - [ ] Define cancellation behavior.
 - [x] Implement DB-backed job lease acquisition.
+- [x] Implement fake triage agent execution.
+- [x] Persist completed and failed job results.
+- [x] Record result-driven workflow transitions.
 
 ## Sandboxing And Execution
 
@@ -99,10 +102,10 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Show active jobs.
 - [x] Show run history.
 - [ ] Show issue and PR links.
-- [ ] Show state transitions.
+- [x] Show state transitions.
 - [ ] Show policy decisions.
 - [ ] Show command results.
-- [ ] Show failure and escalation reasons.
+- [x] Show failure and escalation reasons.
 - [ ] Show current policy config in read-only form.
 - [x] Define the first useful dashboard slice.
 
