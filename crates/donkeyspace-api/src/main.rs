@@ -379,7 +379,12 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
-    if !should_queue_triage(event, &payload.action) {
+    if !should_queue_triage(
+        event,
+        &payload.action,
+        &label_state,
+        payload.comment.as_ref(),
+    ) {
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
@@ -403,16 +408,26 @@ async fn persist_issue_webhook(
     Ok(WebhookPersistOutcome::Queued(job))
 }
 
-fn should_queue_triage(event: &str, action: &str) -> bool {
-    matches!(
-        (event, action),
-        ("issues", "opened")
-            | ("issues", "edited")
-            | ("issues", "reopened")
-            | ("issues", "labeled")
-            | ("issues", "unlabeled")
-            | ("issue_comment", "created")
-    )
+fn should_queue_triage(
+    event: &str,
+    action: &str,
+    label_state: &LabelState,
+    comment: Option<&GitHubComment>,
+) -> bool {
+    match (event, action) {
+        ("issues", "opened" | "edited" | "reopened") => true,
+        ("issue_comment", "created") => {
+            matches!(
+                label_state,
+                LabelState::One(label) if label.state == WorkflowState::NeedsInfo
+            ) && !comment.map(comment_is_from_donkeyspace).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn comment_is_from_donkeyspace(comment: &GitHubComment) -> bool {
+    comment.body.trim_start().starts_with("donkeyspace ")
 }
 
 enum WebhookPersistOutcome {
@@ -426,6 +441,8 @@ struct GitHubIssueWebhook {
     action: String,
     repository: GitHubRepository,
     issue: GitHubIssue,
+    #[serde(default)]
+    comment: Option<GitHubComment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -453,6 +470,11 @@ struct GitHubLabel {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubComment {
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct LeaseRequest {
     lease_owner: String,
     lease_seconds: Option<i32>,
@@ -475,5 +497,71 @@ impl ApiError {
         Self {
             error: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GitHubComment, comment_is_from_donkeyspace, should_queue_triage};
+    use donkeyspace_core::{LabelState, WorkflowLabel, WorkflowState};
+
+    #[test]
+    fn issue_opened_queues_triage() {
+        assert!(should_queue_triage(
+            "issues",
+            "opened",
+            &LabelState::None,
+            None
+        ));
+    }
+
+    #[test]
+    fn label_events_do_not_queue_triage() {
+        assert!(!should_queue_triage(
+            "issues",
+            "labeled",
+            &LabelState::One(WorkflowLabel {
+                state: WorkflowState::NeedsInfo,
+                label: "ai:needs-info".to_string(),
+            }),
+            None
+        ));
+    }
+
+    #[test]
+    fn human_comment_on_needs_info_queues_triage() {
+        assert!(should_queue_triage(
+            "issue_comment",
+            "created",
+            &LabelState::One(WorkflowLabel {
+                state: WorkflowState::NeedsInfo,
+                label: "ai:needs-info".to_string(),
+            }),
+            Some(&GitHubComment {
+                body: "Here are the reproduction steps.".to_string(),
+            }),
+        ));
+    }
+
+    #[test]
+    fn donkeyspace_comment_does_not_queue_triage() {
+        assert!(!should_queue_triage(
+            "issue_comment",
+            "created",
+            &LabelState::One(WorkflowLabel {
+                state: WorkflowState::NeedsInfo,
+                label: "ai:needs-info".to_string(),
+            }),
+            Some(&GitHubComment {
+                body: "donkeyspace triage needs clarification before this issue can move to implementation.".to_string(),
+            }),
+        ));
+    }
+
+    #[test]
+    fn detects_donkeyspace_generated_comment_after_whitespace() {
+        assert!(comment_is_from_donkeyspace(&GitHubComment {
+            body: "\n  donkeyspace marked this issue ready for agent implementation.".to_string(),
+        }));
     }
 }

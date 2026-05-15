@@ -119,6 +119,26 @@ async fn execute_job(
 
     match running_job.role.as_str() {
         "triage" => {
+            if input_is_donkeyspace_comment(&running_job.input) {
+                let result_value = json!({
+                    "outcome": "blocked",
+                    "summary": "Ignored donkeyspace-generated comment webhook.",
+                    "confidence": "high",
+                    "risk": "unknown",
+                    "questions": [],
+                    "tests": [],
+                    "changed_files": [],
+                    "human_review_reason": null,
+                    "blocked_reason": "donkeyspace-generated comments do not trigger triage",
+                });
+                complete_job(pool, running_job.id, &result_value).await?;
+                tracing::info!(
+                    job_id = %running_job.id,
+                    "ignored donkeyspace-generated comment job"
+                );
+                return Ok(());
+            }
+
             let result = fake_triage_issue(&running_job.input);
             result.validate_for_orchestration()?;
             let result_value = serde_json::to_value(&result)?;
@@ -193,6 +213,15 @@ async fn execute_job(
     }
 
     Ok(())
+}
+
+fn input_is_donkeyspace_comment(input: &serde_json::Value) -> bool {
+    input.pointer("/action").and_then(serde_json::Value::as_str) == Some("created")
+        && input
+            .pointer("/comment/body")
+            .and_then(serde_json::Value::as_str)
+            .map(|body| body.trim_start().starts_with("donkeyspace "))
+            .unwrap_or(false)
 }
 
 async fn process_outbound_actions(
@@ -290,6 +319,32 @@ struct CreateCommentPayload {
     repo: String,
     issue_number: i64,
     body: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_is_donkeyspace_comment;
+    use serde_json::json;
+
+    #[test]
+    fn detects_generated_comment_job() {
+        assert!(input_is_donkeyspace_comment(&json!({
+            "action": "created",
+            "comment": {
+                "body": "donkeyspace triage needs clarification before this issue can move to implementation."
+            }
+        })));
+    }
+
+    #[test]
+    fn human_comment_job_is_not_generated() {
+        assert!(!input_is_donkeyspace_comment(&json!({
+            "action": "created",
+            "comment": {
+                "body": "Here are the reproduction steps."
+            }
+        })));
+    }
 }
 
 fn init_tracing() {
