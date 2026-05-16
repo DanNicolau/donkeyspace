@@ -6,6 +6,19 @@ type Run = {
   role: string;
   status: string;
   lease_owner: string | null;
+  input?: {
+    issue?: {
+      number?: number;
+      title?: string | null;
+    };
+    repository?: {
+      full_name?: string;
+      name?: string;
+      owner?: {
+        login?: string;
+      };
+    };
+  };
   result: RunResult | null;
   created_at: string;
   updated_at: string;
@@ -134,7 +147,13 @@ export function App() {
           {runs.map((run) => (
             <article className="run-row" key={run.id}>
               <div>
-                <h3>{run.id}</h3>
+                <h3>{runIssueTitle(run)}</h3>
+                <div className="run-meta">
+                  <span>{run.id}</span>
+                  {run.input?.issue?.number ? (
+                    <span>Issue #{run.input.issue.number}</span>
+                  ) : null}
+                </div>
                 <p>
                   {run.result?.summary ??
                     (run.workflow_item_id
@@ -228,4 +247,8 @@ function describeAction(action: OutboundAction): string {
   }
 
   return action.provider;
+}
+
+function runIssueTitle(run: Run): string {
+  return run.input?.issue?.title?.trim() || "Untitled issue";
 }

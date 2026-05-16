@@ -159,6 +159,8 @@ Default v1 safety behavior:
 
 The system should orchestrate external agent CLIs rather than implement a custom agent runtime in v1.
 
+Agents should use the file search and read capabilities of their configured runtime inside the prepared workspace. donkeyspace may pass bounded repository excerpts for cheap triage, but v1 should not depend on prompt-only repository context as the primary interface for agentic work.
+
 Each agent run should execute in an ephemeral container with:
 
 - A fresh repository workspace or controlled checkout.

@@ -571,11 +571,13 @@ dependencies = [
  "donkeyspace-core",
  "donkeyspace-db",
  "donkeyspace-github",
+ "octocrab",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

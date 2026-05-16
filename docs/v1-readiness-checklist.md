@@ -52,6 +52,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] Define retry behavior.
 - [x] Define timeout behavior.
 - [ ] Define cancellation behavior.
+- [x] Decide repo file/search access model for agents.
 - [x] Implement DB-backed job lease acquisition.
 - [x] Implement fake triage agent execution.
 - [x] Persist completed and failed job results.
@@ -61,10 +62,10 @@ This checklist tracks the work needed before the first useful version of donkeys
 
 - [ ] Define the container image strategy for agent runs.
 - [ ] Create ephemeral workspace behavior.
-- [ ] Define repository checkout behavior.
+- [x] Define repository checkout behavior.
 - [ ] Define branch naming behavior.
 - [ ] Define allowed network behavior.
-- [ ] Define how model-provider credentials are injected.
+- [x] Define how model-provider credentials are injected.
 - [ ] Define how GitHub credentials are injected.
 - [ ] Capture command logs and exit codes.
 - [ ] Clean up workspaces after completion or failure.

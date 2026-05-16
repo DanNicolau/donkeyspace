@@ -60,7 +60,7 @@ Required fields:
 
 Role-specific notes:
 
-- Triage jobs receive issue title, body, labels, and recent comments.
+- Triage jobs receive issue title, body, labels, recent comments, and bounded read-only repository context.
 - Developer jobs receive issue context, policy checks, branch naming hints, and repository checkout path.
 - Reviewer jobs receive issue context, PR metadata, diff summary, changed files, and check status.
 

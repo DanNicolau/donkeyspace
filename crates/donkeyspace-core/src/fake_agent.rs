@@ -12,8 +12,33 @@ pub fn fake_triage_issue(input: &Value) -> RunResult {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
+    let latest_human_comment = input
+        .pointer("/comment/body")
+        .and_then(Value::as_str)
+        .filter(|comment| !comment.trim_start().starts_with("donkeyspace "))
+        .unwrap_or_default()
+        .trim();
+    let repository_context = input
+        .pointer("/repository_context")
+        .map(Value::to_string)
+        .unwrap_or_default();
 
-    if title.is_empty() || meaningful_word_count(body) < 8 {
+    if short_issue_has_unique_file_context(title, body, &repository_context) {
+        return RunResult {
+            outcome: Outcome::Ready,
+            summary: "The issue is short, but repository context identifies the target file."
+                .to_string(),
+            confidence: Confidence::Medium,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+    }
+
+    if title.is_empty() || meaningful_word_count(&format!("{body}\n{latest_human_comment}")) < 8 {
         return RunResult {
             outcome: Outcome::NeedsInfo,
             summary: "The issue needs clearer acceptance criteria before implementation."
@@ -63,6 +88,11 @@ fn meaningful_word_count(value: &str) -> usize {
         .count()
 }
 
+fn short_issue_has_unique_file_context(title: &str, body: &str, repository_context: &str) -> bool {
+    let issue_text = format!("{title}\n{body}").to_ascii_lowercase();
+    issue_text.contains("readme") && repository_context.to_ascii_lowercase().contains("readme")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{fake_triage_issue, workflow_state_for_outcome};
@@ -88,6 +118,37 @@ mod tests {
             "issue": {
                 "title": "Fix invoice export",
                 "body": "The CSV export fails for accounts with many invoices. Reproduce by exporting an account with more than 100 invoices and verify the download succeeds."
+            }
+        }));
+
+        assert_eq!(result.outcome, Outcome::Ready);
+    }
+
+    #[test]
+    fn human_clarification_comment_can_make_issue_ready() {
+        let result = fake_triage_issue(&json!({
+            "issue": {
+                "title": "Fix invoice export",
+                "body": "Export fails"
+            },
+            "comment": {
+                "body": "Reproduce by exporting an account with more than 100 invoices. The expected result is a downloadable CSV with all invoice rows."
+            }
+        }));
+
+        assert_eq!(result.outcome, Outcome::Ready);
+    }
+
+    #[test]
+    fn short_readme_issue_is_ready_when_repo_context_has_readme() {
+        let result = fake_triage_issue(&json!({
+            "issue": {
+                "title": "Capitize D and S in README",
+                "body": null
+            },
+            "repository_context": {
+                "file_tree": ["README.md"],
+                "excerpts": [{"path": "README.md", "content": "# donkeyspace-test-repo", "truncated": false}]
             }
         }));
 

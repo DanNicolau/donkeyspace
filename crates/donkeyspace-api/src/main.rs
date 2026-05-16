@@ -9,9 +9,9 @@ use axum::{
 use donkeyspace_core::{AgentRole, LabelState, Policy, WorkflowState, normalize_workflow_labels};
 use donkeyspace_db::{
     DbConfig, JobRecord, PgPool, RepositoryInput, WorkflowItemInput, acquire_job_lease,
-    apply_migrations, connect, create_job, get_job, list_job_outbound_actions,
-    list_job_transitions, list_jobs, list_recent_outbound_actions, record_state_transition,
-    record_webhook_delivery, upsert_repository, upsert_workflow_item,
+    apply_migrations, connect, create_job, get_job, get_workflow_item_state,
+    list_job_outbound_actions, list_job_transitions, list_jobs, list_recent_outbound_actions,
+    record_state_transition, record_webhook_delivery, upsert_repository, upsert_workflow_item,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -348,11 +348,14 @@ async fn persist_issue_webhook(
         .map(|label| label.name)
         .collect::<Vec<_>>();
     let label_state = normalize_workflow_labels(&labels, &policy.workflow.state_labels);
-    let current_state = match &label_state {
+    let label_state_name = match &label_state {
         LabelState::None => None,
         LabelState::One(label) => Some(label.state.to_string()),
         LabelState::Conflict(_) => Some(WorkflowState::NeedsHuman.to_string()),
     };
+    let previous_state =
+        get_workflow_item_state(pool, repository_id, &payload.issue.id.to_string()).await?;
+    let current_state = label_state_name.or(previous_state);
 
     let workflow_item_id = upsert_workflow_item(
         pool,
@@ -382,9 +385,16 @@ async fn persist_issue_webhook(
     if !should_queue_triage(
         event,
         &payload.action,
-        &label_state,
+        current_state.as_deref(),
         payload.comment.as_ref(),
     ) {
+        tracing::info!(
+            event,
+            action = payload.action,
+            issue_number = payload.issue.number,
+            current_state = current_state.as_deref().unwrap_or("none"),
+            "webhook did not queue triage"
+        );
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
@@ -411,19 +421,27 @@ async fn persist_issue_webhook(
 fn should_queue_triage(
     event: &str,
     action: &str,
-    label_state: &LabelState,
+    current_state: Option<&str>,
     comment: Option<&GitHubComment>,
 ) -> bool {
     match (event, action) {
         ("issues", "opened" | "edited" | "reopened") => true,
-        ("issue_comment", "created") => {
+        ("issue_comment", "created" | "edited") => {
             matches!(
-                label_state,
-                LabelState::One(label) if label.state == WorkflowState::NeedsInfo
-            ) && !comment.map(comment_is_from_donkeyspace).unwrap_or(false)
+                current_state,
+                Some(state)
+                    if matches!(
+                        state,
+                        "needs_info" | "blocked"
+                    )
+            ) && comment.map(is_human_comment).unwrap_or(false)
         }
         _ => false,
     }
+}
+
+fn is_human_comment(comment: &GitHubComment) -> bool {
+    !comment_is_from_donkeyspace(comment)
 }
 
 fn comment_is_from_donkeyspace(comment: &GitHubComment) -> bool {
@@ -503,16 +521,10 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::{GitHubComment, comment_is_from_donkeyspace, should_queue_triage};
-    use donkeyspace_core::{LabelState, WorkflowLabel, WorkflowState};
 
     #[test]
     fn issue_opened_queues_triage() {
-        assert!(should_queue_triage(
-            "issues",
-            "opened",
-            &LabelState::None,
-            None
-        ));
+        assert!(should_queue_triage("issues", "opened", None, None));
     }
 
     #[test]
@@ -520,10 +532,7 @@ mod tests {
         assert!(!should_queue_triage(
             "issues",
             "labeled",
-            &LabelState::One(WorkflowLabel {
-                state: WorkflowState::NeedsInfo,
-                label: "ai:needs-info".to_string(),
-            }),
+            Some("needs_info"),
             None
         ));
     }
@@ -533,13 +542,56 @@ mod tests {
         assert!(should_queue_triage(
             "issue_comment",
             "created",
-            &LabelState::One(WorkflowLabel {
-                state: WorkflowState::NeedsInfo,
-                label: "ai:needs-info".to_string(),
-            }),
+            Some("needs_info"),
             Some(&GitHubComment {
                 body: "Here are the reproduction steps.".to_string(),
             }),
+        ));
+    }
+
+    #[test]
+    fn human_comment_on_blocked_queues_triage() {
+        assert!(should_queue_triage(
+            "issue_comment",
+            "created",
+            Some("blocked"),
+            Some(&GitHubComment {
+                body: "I added the missing detail.".to_string(),
+            }),
+        ));
+    }
+
+    #[test]
+    fn edited_human_comment_on_blocked_queues_triage() {
+        assert!(should_queue_triage(
+            "issue_comment",
+            "edited",
+            Some("blocked"),
+            Some(&GitHubComment {
+                body: "Updated with more details.".to_string(),
+            }),
+        ));
+    }
+
+    #[test]
+    fn human_comment_without_retriable_state_does_not_queue_triage() {
+        assert!(!should_queue_triage(
+            "issue_comment",
+            "created",
+            Some("ready"),
+            Some(&GitHubComment {
+                body: "Looks good.".to_string(),
+            }),
+        ));
+    }
+
+    #[test]
+    fn missing_comment_payload_does_not_queue_triage() {
+        assert!(!should_queue_triage(
+            "issue_comment",
+            "created",
+            Some("blocked"),
+            None,
         ));
     }
 
@@ -548,10 +600,7 @@ mod tests {
         assert!(!should_queue_triage(
             "issue_comment",
             "created",
-            &LabelState::One(WorkflowLabel {
-                state: WorkflowState::NeedsInfo,
-                label: "ai:needs-info".to_string(),
-            }),
+            Some("blocked"),
             Some(&GitHubComment {
                 body: "donkeyspace triage needs clarification before this issue can move to implementation.".to_string(),
             }),
