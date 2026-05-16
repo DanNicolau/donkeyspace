@@ -47,6 +47,8 @@ services:
       DONKEYSPACE_REPO_CONTEXT_MAX_FILES: ${DONKEYSPACE_REPO_CONTEXT_MAX_FILES:-12}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       RUST_LOG: donkeyspace=info
+    volumes:
+      - codex-home:/root/.codex
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,4 +64,5 @@ services:
       - .:/app
 
 volumes:
+  codex-home:
   postgres-data:

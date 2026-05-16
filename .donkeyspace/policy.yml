@@ -16,7 +16,7 @@ workflow:
 agents:
   triage:
     enabled: true
-    command: ["donkeyspace-agent-triage", "--input", ".donkeyspace/run-input.json"]
+    command: ["donkeyspace-codex-triage", ".donkeyspace/run-input.json"]
   developer:
     enabled: true
     command: ["codex", "exec", "--input", ".donkeyspace/run-input.json"]

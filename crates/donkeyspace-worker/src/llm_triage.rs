@@ -8,6 +8,7 @@ pub enum TriageProvider {
     Auto,
     Deterministic,
     OpenAiCompatible,
+    Agent,
 }
 
 impl TriageProvider {
@@ -15,6 +16,7 @@ impl TriageProvider {
         match value.trim().to_ascii_lowercase().as_str() {
             "llm" | "openai" | "openai-compatible" | "openrouter" => Self::OpenAiCompatible,
             "deterministic" | "fake" | "local" => Self::Deterministic,
+            "agent" | "command" | "external" => Self::Agent,
             _ => Self::Auto,
         }
     }
@@ -37,7 +39,7 @@ impl LlmTriageConfig {
                 .as_ref()
                 .map(|key| !key.trim().is_empty())
                 .unwrap_or(false),
-            TriageProvider::Deterministic => false,
+            TriageProvider::Deterministic | TriageProvider::Agent => false,
         }
     }
 }
@@ -271,6 +273,19 @@ mod tests {
         };
 
         assert!(!config.should_use_llm());
+    }
+
+    #[test]
+    fn agent_provider_does_not_use_llm() {
+        let config = LlmTriageConfig {
+            provider: TriageProvider::Agent,
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_key: Some("key".to_string()),
+            model: "openrouter/free".to_string(),
+        };
+
+        assert!(!config.should_use_llm());
+        assert_eq!(TriageProvider::parse("external"), TriageProvider::Agent);
     }
 
     #[test]

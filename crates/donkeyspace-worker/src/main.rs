@@ -4,15 +4,18 @@ use donkeyspace_core::{
     workflow_state_for_outcome,
 };
 use donkeyspace_db::{
-    DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord, acquire_next_queued_job,
-    apply_migrations, complete_job, connect, create_outbound_action, fail_job,
-    list_pending_outbound_actions, mark_job_running, mark_outbound_action_completed,
-    mark_outbound_action_failed, record_state_transition, update_workflow_item_state,
+    CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
+    acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
+    create_outbound_action, fail_job, list_pending_outbound_actions, mark_job_running,
+    mark_outbound_action_completed, mark_outbound_action_failed, record_state_transition,
+    update_workflow_item_state,
 };
 use donkeyspace_github::GitHubClient;
-use serde::Deserialize;
-use serde_json::json;
+use donkeyspace_runner::{AgentCommand, AgentCommandStatus, read_run_result, run_agent_command};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{env, fs, path::PathBuf, time::Duration};
+use tokio::fs as tokio_fs;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod llm_triage;
@@ -21,7 +24,7 @@ mod repo_context;
 use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
 use repo_context::{
     RepoContextConfig, build_repository_context, cleanup_repository_context,
-    enrich_input_with_repository_context,
+    enrich_input_with_repository_context, workspace_path,
 };
 
 #[derive(Debug, Parser)]
@@ -102,6 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_url = triage_config.base_url,
             "llm triage enabled"
         );
+    } else if triage_config.provider == TriageProvider::Agent {
+        tracing::info!("external agent triage enabled");
     } else {
         tracing::info!("deterministic triage enabled");
     }
@@ -120,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             poll_once(
                 pool,
                 &policy,
+                &triage_config.provider,
                 triage_client.as_ref(),
                 &repo_context_config,
                 args.github_token.as_deref(),
@@ -137,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             poll_once(
                 pool,
                 &policy,
+                &triage_config.provider,
                 triage_client.as_ref(),
                 &repo_context_config,
                 args.github_token.as_deref(),
@@ -153,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn poll_once(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
+    triage_provider: &TriageProvider,
     triage_client: Option<&OpenAiTriageClient>,
     repo_context_config: &RepoContextConfig,
     github_token: Option<&str>,
@@ -169,6 +177,7 @@ async fn poll_once(
             execute_job(
                 pool,
                 policy,
+                triage_provider,
                 triage_client,
                 repo_context_config,
                 github_token,
@@ -192,6 +201,7 @@ async fn poll_once(
 async fn execute_job(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
+    triage_provider: &TriageProvider,
     triage_client: Option<&OpenAiTriageClient>,
     repo_context_config: &RepoContextConfig,
     github_token: Option<&str>,
@@ -252,8 +262,20 @@ async fn execute_job(
             let enriched_input =
                 enrich_input_with_repository_context(&running_job.input, repository_context);
 
-            let (result, transition_reason) = match run_triage(triage_client, &enriched_input).await
-            {
+            let triage_result = if *triage_provider == TriageProvider::Agent {
+                run_agent_triage(
+                    pool,
+                    policy,
+                    &running_job,
+                    &enriched_input,
+                    repo_context_config,
+                )
+                .await
+            } else {
+                run_triage(triage_client, &enriched_input).await
+            };
+
+            let (result, transition_reason) = match triage_result {
                 Ok(result) => result,
                 Err(error) => {
                     fail_triage_job(
@@ -405,6 +427,242 @@ async fn run_triage(
     Ok(result)
 }
 
+async fn run_agent_triage(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    running_job: &JobRecord,
+    input: &Value,
+    repo_context_config: &RepoContextConfig,
+) -> Result<(RunResult, &'static str), Box<dyn std::error::Error>> {
+    if !policy.agents.triage.enabled {
+        return Err("triage agent is disabled by policy".into());
+    }
+    if policy.agents.triage.command.is_empty() {
+        return Err("triage agent command is empty".into());
+    }
+
+    let workspace_path = workspace_path(running_job.id, repo_context_config);
+    let donkeyspace_path = workspace_path.join(".donkeyspace");
+    let input_path = donkeyspace_path.join("run-input.json");
+    let result_path = donkeyspace_path.join("run-result.json");
+    let contract_result_path = ".donkeyspace/run-result.json";
+    tokio_fs::create_dir_all(&donkeyspace_path).await?;
+    let run_input = agent_run_input(
+        running_job.id,
+        &running_job.role,
+        input,
+        contract_result_path,
+    );
+    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
+
+    let command =
+        AgentCommand::from_parts(&policy.agents.triage.command, &workspace_path, &result_path)?;
+    let command_result = run_agent_command(&command).await?;
+    record_agent_command_result(pool, running_job.id, "triage agent", &command_result).await?;
+
+    if command_result.status != AgentCommandStatus::Passed {
+        return Err(format!(
+            "triage agent exited unsuccessfully with code {:?}",
+            command_result.exit_code
+        )
+        .into());
+    }
+
+    Ok((
+        read_run_result(&result_path).await?,
+        "external triage agent completed",
+    ))
+}
+
+async fn record_agent_command_result(
+    pool: &donkeyspace_db::PgPool,
+    job_id: uuid::Uuid,
+    name: &str,
+    output: &donkeyspace_runner::AgentCommandResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    create_command_result(
+        pool,
+        &CommandResultInput {
+            job_id,
+            name: name.to_string(),
+            command: output.command.clone(),
+            status: output.status.as_str().to_string(),
+            exit_code: output.exit_code,
+            summary: command_summary(&output.stdout, &output.stderr),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+fn command_summary(stdout: &str, stderr: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    if !stdout.trim().is_empty() {
+        parts.push(format!("stdout:\n{}", stdout.trim()));
+    }
+    if !stderr.trim().is_empty() {
+        parts.push(format!("stderr:\n{}", stderr.trim()));
+    }
+    let summary = parts.join("\n\n");
+    if summary.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&summary, 4_000))
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push_str("\n[truncated]");
+    truncated
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRunInput {
+    run_id: String,
+    role: String,
+    repository: AgentRepositoryInput,
+    issue: AgentIssueInput,
+    pull_request: Option<Value>,
+    policy: AgentPolicyInput,
+    workspace: AgentWorkspaceInput,
+    repository_context: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRepositoryInput {
+    provider: String,
+    owner: String,
+    name: String,
+    default_branch: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentIssueInput {
+    number: Option<i64>,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    comments: Vec<AgentCommentInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentCommentInput {
+    body: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentPolicyInput {
+    path: String,
+    snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentWorkspaceInput {
+    repo_path: String,
+    result_path: String,
+}
+
+fn agent_run_input(
+    run_id: uuid::Uuid,
+    role: &str,
+    input: &Value,
+    result_path: &str,
+) -> AgentRunInput {
+    let issue = input.pointer("/issue").unwrap_or(input);
+    let repository_context = input.pointer("/repository_context").cloned();
+    let repo_path = repository_context
+        .as_ref()
+        .and_then(|context| context.pointer("/checkout_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("repo")
+        .to_string();
+
+    AgentRunInput {
+        run_id: run_id.to_string(),
+        role: role.to_string(),
+        repository: AgentRepositoryInput {
+            provider: "github".to_string(),
+            owner: input
+                .pointer("/repository/owner/login")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            name: input
+                .pointer("/repository/name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            default_branch: input
+                .pointer("/repository/default_branch")
+                .and_then(Value::as_str)
+                .unwrap_or("main")
+                .to_string(),
+        },
+        issue: AgentIssueInput {
+            number: issue.pointer("/number").and_then(Value::as_i64),
+            title: issue
+                .pointer("/title")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            body: issue
+                .pointer("/body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            labels: issue_labels(issue),
+            comments: latest_comment(input)
+                .map(|body| vec![AgentCommentInput { body }])
+                .unwrap_or_default(),
+        },
+        pull_request: None,
+        policy: AgentPolicyInput {
+            path: env::var("DONKEYSPACE_POLICY_PATH")
+                .unwrap_or_else(|_| ".donkeyspace/policy.yml".to_string()),
+            snapshot_id: None,
+        },
+        workspace: AgentWorkspaceInput {
+            repo_path,
+            result_path: result_path.to_string(),
+        },
+        repository_context,
+    }
+}
+
+fn issue_labels(issue: &Value) -> Vec<String> {
+    issue
+        .pointer("/labels")
+        .and_then(Value::as_array)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|label| {
+                    label
+                        .pointer("/name")
+                        .and_then(Value::as_str)
+                        .or_else(|| label.as_str())
+                })
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn latest_comment(input: &Value) -> Option<String> {
+    input
+        .pointer("/comment/body")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .map(ToString::to_string)
+}
+
 fn repository_context_short_circuits_triage(input: &serde_json::Value, result: &RunResult) -> bool {
     result.outcome == Outcome::Ready
         && input.pointer("/repository_context").is_some()
@@ -543,10 +801,12 @@ struct CreateCommentPayload {
 #[cfg(test)]
 mod tests {
     use super::{
-        input_is_donkeyspace_comment, non_empty_string, repository_context_short_circuits_triage,
+        agent_run_input, command_summary, input_is_donkeyspace_comment, non_empty_string,
+        repository_context_short_circuits_triage,
     };
     use donkeyspace_core::{Confidence, Outcome, Risk, RunResult};
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn detects_generated_comment_job() {
@@ -599,6 +859,56 @@ mod tests {
             }),
             &result
         ));
+    }
+
+    #[test]
+    fn agent_run_input_uses_issue_and_workspace_context() {
+        let input = json!({
+            "repository": {
+                "owner": {"login": "example-owner"},
+                "name": "example-repo",
+                "default_branch": "main"
+            },
+            "issue": {
+                "number": 10,
+                "title": "Create src directory",
+                "body": "Add a hello world Rust project.",
+                "labels": [{"name": "ai:needs-info"}]
+            },
+            "comment": {"body": "Use cargo."},
+            "repository_context": {
+                "checkout_path": "/tmp/donkeyspace/workspaces/run/repo",
+                "file_tree": ["README.md"]
+            }
+        });
+
+        let run_input = agent_run_input(
+            Uuid::nil(),
+            "triage",
+            &input,
+            ".donkeyspace/run-result.json",
+        );
+
+        assert_eq!(run_input.repository.owner, "example-owner");
+        assert_eq!(run_input.issue.number, Some(10));
+        assert_eq!(run_input.issue.labels, vec!["ai:needs-info"]);
+        assert_eq!(run_input.issue.comments[0].body, "Use cargo.");
+        assert_eq!(
+            run_input.workspace.repo_path,
+            "/tmp/donkeyspace/workspaces/run/repo"
+        );
+        assert_eq!(
+            run_input.workspace.result_path,
+            ".donkeyspace/run-result.json"
+        );
+    }
+
+    #[test]
+    fn command_summary_includes_stdout_and_stderr() {
+        let summary = command_summary("ok", "warning").unwrap();
+
+        assert!(summary.contains("stdout:\nok"));
+        assert!(summary.contains("stderr:\nwarning"));
     }
 }
 

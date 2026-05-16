@@ -68,7 +68,18 @@ OPENROUTER_API_KEY=...
 
 Set `DONKEYSPACE_TRIAGE_PROVIDER=deterministic` to force local no-token triage.
 
-The worker clones the target repository into an ephemeral read-only triage workspace before deciding whether an issue is ready. The current OpenAI-compatible triage path receives bounded excerpts from that checkout. The intended v1 agentic path is to run a configured external agent CLI in the prepared workspace so the agent can use its own file search and read tools, then report through `.donkeyspace/run-result.json`. Tune prompt context with:
+Set `DONKEYSPACE_TRIAGE_PROVIDER=agent` to run the configured `agents.triage.command` from `.donkeyspace/policy.yml` inside the prepared workspace. In this mode the worker writes `.donkeyspace/run-input.json`, expects `.donkeyspace/run-result.json`, and records the command exit code plus captured stdout/stderr in command results.
+
+The default agent triage command is `donkeyspace-codex-triage`, a small wrapper around Codex CLI. The wrapper uses `schemas/run-result.codex.schema.json` for Codex structured output, then donkeyspace validates the result against the stricter Rust orchestration rules. It disables Codex's inner bubblewrap sandbox because the worker already runs inside Docker and common Docker hosts do not allow the user namespaces bubblewrap needs. For local testing, authenticate Codex once into the Compose-managed `codex-home` volume:
+
+```sh
+docker compose build worker
+docker compose run --rm --no-deps worker codex login --device-auth
+docker compose run --rm --no-deps worker codex login status
+DONKEYSPACE_TRIAGE_PROVIDER=agent docker compose up -d --build worker
+```
+
+The worker clones the target repository into an ephemeral read-only triage workspace before deciding whether an issue is ready. The current OpenAI-compatible triage path receives bounded excerpts from that checkout. The agentic path runs the configured external agent CLI in the prepared workspace so the agent can use its own file search and read tools, then report through `.donkeyspace/run-result.json`. Tune prompt context with:
 
 ```sh
 DONKEYSPACE_WORKSPACE_ROOT=/tmp/donkeyspace/workspaces
@@ -93,4 +104,4 @@ Useful local endpoints:
 - `POST /api/runs/{id}/lease`
 - `POST /webhooks/github`
 
-The current workflow supports deterministic and OpenAI-compatible triage. A signed `issues.opened` webhook creates a triage run, the worker leases it, marks it running, writes a result, completes the run, records a workflow transition, and creates pending GitHub label/comment actions in the outbound action outbox.
+The current workflow supports deterministic, OpenAI-compatible, and external-command triage. A signed `issues.opened` webhook creates a triage run, the worker leases it, marks it running, writes a result, completes the run, records a workflow transition, and creates pending GitHub label/comment actions in the outbound action outbox.

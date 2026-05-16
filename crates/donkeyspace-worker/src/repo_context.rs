@@ -34,6 +34,10 @@ impl RepoContextConfig {
     }
 }
 
+pub fn workspace_path(job_id: Uuid, config: &RepoContextConfig) -> PathBuf {
+    config.workspace_root.join(job_id.to_string())
+}
+
 #[derive(Debug, Serialize)]
 pub struct RepositoryContext {
     pub owner: String,
@@ -74,7 +78,7 @@ pub async fn build_repository_context(
         .filter(|branch| !branch.trim().is_empty())
         .unwrap_or("main");
 
-    let workspace_path = config.workspace_root.join(job_id.to_string());
+    let workspace_path = workspace_path(job_id, config);
     let repo_path = workspace_path.join("repo");
     if workspace_path.exists() {
         fs::remove_dir_all(&workspace_path)?;
@@ -107,7 +111,7 @@ pub fn cleanup_repository_context(
     job_id: Uuid,
     config: &RepoContextConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace_path = config.workspace_root.join(job_id.to_string());
+    let workspace_path = workspace_path(job_id, config);
     if workspace_path.exists() {
         fs::remove_dir_all(workspace_path)?;
     }

@@ -108,7 +108,7 @@ The result should include:
 
 The orchestrator should treat missing, invalid, or contradictory result files as `needs_human` or `failed`, depending on whether the agent produced useful partial work.
 
-## Agent Repository Access
+## Agent Repository Access And Triage Runtimes
 
 V1 should prefer external agent CLIs with workspace-native file and search tools over a custom donkeyspace LLM tool loop.
 
@@ -116,7 +116,12 @@ The worker may still build bounded repository context for cheap deterministic or
 
 Triage agents should receive read-only repository access. Developer agents may write to the workspace and create branches or PRs according to policy. Reviewer agents should inspect diffs, test output, and policy context, and should avoid mutating repository state except for structured review output and approved GitHub comments.
 
-A donkeyspace-owned MCP or tool API can be added later for portable tools such as `repo.list_tree`, `repo.search`, `repo.read_file`, `issue.context`, `policy.read`, and `result.write`. This should come after the generic external command path works, so the project remains an orchestrator instead of becoming a new agent runtime too early.
+donkeyspace should eventually support two agentic triage workflows:
+
+- External CLI triage: run a configured agent command such as Codex CLI in the prepared workspace. This remains the first reference path because mature CLIs already provide file search, file read, and tool-use loops.
+- Built-in OpenAI-compatible triage: run a donkeyspace-owned tool loop against OpenRouter or another OpenAI-compatible endpoint. OpenRouter acts as the model router, while donkeyspace exposes and executes tools such as `repo.list_tree`, `repo.search`, `repo.read_file`, `issue.context`, `policy.read`, and `result.write`.
+
+The built-in OpenAI-compatible loop should be implemented after the external command path is working. That keeps the near-term project focused on orchestration while preserving a longer-term default that does not require every installation to install and authenticate a separate agent CLI.
 
 ## Duplicate Work Prevention
 

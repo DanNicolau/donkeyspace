@@ -108,6 +108,16 @@ pub struct OutboundActionInput {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandResultInput {
+    pub job_id: Uuid,
+    pub name: String,
+    pub command: Vec<String>,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub summary: Option<String>,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct OutboundActionRecord {
     pub id: i64,
@@ -317,6 +327,36 @@ pub async fn create_outbound_action(
     .await?;
 
     Ok(action)
+}
+
+pub async fn create_command_result(
+    pool: &PgPool,
+    input: &CommandResultInput,
+) -> Result<(), DbError> {
+    let command = serde_json::to_value(&input.command).expect("command serializes");
+    sqlx::query(
+        r#"
+        INSERT INTO command_results (
+            job_id,
+            name,
+            command,
+            status,
+            exit_code,
+            summary
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(input.job_id)
+    .bind(&input.name)
+    .bind(&command)
+    .bind(&input.status)
+    .bind(input.exit_code)
+    .bind(&input.summary)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 pub async fn list_recent_outbound_actions(

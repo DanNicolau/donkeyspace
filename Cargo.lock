@@ -571,6 +571,7 @@ dependencies = [
  "donkeyspace-core",
  "donkeyspace-db",
  "donkeyspace-github",
+ "donkeyspace-runner",
  "octocrab",
  "serde",
  "serde_json",
