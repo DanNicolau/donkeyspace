@@ -16,6 +16,36 @@ pub enum RunnerError {
 }
 
 #[derive(Debug, Clone)]
+pub struct AgentRunOutput {
+    pub result: RunResult,
+    pub command_result: AgentCommandResult,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentCommandResult {
+    pub command: Vec<String>,
+    pub status: AgentCommandStatus,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCommandStatus {
+    Passed,
+    Failed,
+}
+
+impl AgentCommandStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentCommand {
     pub program: String,
     pub args: Vec<String>,
@@ -38,17 +68,45 @@ impl AgentCommand {
             result_path: result_path.into(),
         })
     }
+
+    pub fn command_line(&self) -> Vec<String> {
+        let mut command = Vec::with_capacity(self.args.len() + 1);
+        command.push(self.program.clone());
+        command.extend(self.args.clone());
+        command
+    }
 }
 
-pub async fn run_agent(command: &AgentCommand) -> Result<RunResult, RunnerError> {
-    let status = Command::new(&command.program)
+pub async fn run_agent(command: &AgentCommand) -> Result<AgentRunOutput, RunnerError> {
+    let command_result = run_agent_command(command).await?;
+    let result = read_run_result(&command.result_path).await?;
+    Ok(AgentRunOutput {
+        result,
+        command_result,
+    })
+}
+
+pub async fn run_agent_command(command: &AgentCommand) -> Result<AgentCommandResult, RunnerError> {
+    let output = Command::new(&command.program)
         .args(&command.args)
         .current_dir(&command.working_dir)
-        .status()
+        .output()
         .await?;
 
-    tracing::info!(?status, "agent command completed");
-    read_run_result(&command.result_path).await
+    let command_result = AgentCommandResult {
+        command: command.command_line(),
+        status: if output.status.success() {
+            AgentCommandStatus::Passed
+        } else {
+            AgentCommandStatus::Failed
+        },
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    };
+
+    tracing::info!(status = ?output.status, "agent command completed");
+    Ok(command_result)
 }
 
 pub async fn read_run_result(path: impl AsRef<Path>) -> Result<RunResult, RunnerError> {
@@ -56,4 +114,34 @@ pub async fn read_run_result(path: impl AsRef<Path>) -> Result<RunResult, Runner
     let result: RunResult = serde_json::from_str(&raw)?;
     result.validate_for_orchestration()?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentCommand, AgentCommandStatus, run_agent_command};
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn run_agent_command_captures_output_and_status() {
+        let command = AgentCommand {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf stdout; printf stderr >&2; exit 7".to_string(),
+            ],
+            working_dir: PathBuf::from("."),
+            result_path: PathBuf::from("unused.json"),
+        };
+
+        let result = run_agent_command(&command).await.unwrap();
+
+        assert_eq!(
+            result.command,
+            vec!["sh", "-c", "printf stdout; printf stderr >&2; exit 7"]
+        );
+        assert_eq!(result.status, AgentCommandStatus::Failed);
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.stdout, "stdout");
+        assert_eq!(result.stderr, "stderr");
+    }
 }

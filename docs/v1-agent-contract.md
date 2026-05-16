@@ -16,9 +16,9 @@ The exact command is configured by policy. Example:
 ```yaml
 agents:
   triage:
-    command: ["donkeyspace-agent-triage", "--input", ".donkeyspace/run-input.json"]
+    command: ["donkeyspace-codex-triage", ".donkeyspace/run-input.json"]
   developer:
-    command: ["codex", "exec", "--json", "--input", ".donkeyspace/run-input.json"]
+    command: ["codex", "exec", "--json", "Read .donkeyspace/run-input.json and write .donkeyspace/run-result.json"]
   reviewer:
     command: ["donkeyspace-agent-review", "--input", ".donkeyspace/run-input.json"]
 ```
@@ -69,6 +69,8 @@ Role-specific notes:
 Every agent must write `.donkeyspace/run-result.json`.
 
 The validation schema lives at `schemas/run-result.schema.json`.
+
+Codex CLI triage uses `schemas/run-result.codex.schema.json` for model-facing structured output because OpenAI response-format schemas do not support every JSON Schema feature used by the orchestration schema. The reference wrapper disables Codex's inner bubblewrap sandbox and relies on the worker container boundary for local testing. The orchestrator still applies Rust validation after reading the result file.
 
 Required shape:
 

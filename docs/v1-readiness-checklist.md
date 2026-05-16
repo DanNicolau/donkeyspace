@@ -53,6 +53,8 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Define timeout behavior.
 - [ ] Define cancellation behavior.
 - [x] Decide repo file/search access model for agents.
+- [x] Implement external CLI triage as the first agentic triage workflow.
+- [ ] Implement built-in OpenAI-compatible triage with donkeyspace-owned repo tools.
 - [x] Implement DB-backed job lease acquisition.
 - [x] Implement fake triage agent execution.
 - [x] Persist completed and failed job results.

@@ -1,0 +1,34 @@
+#!/usr/bin/env sh
+set -eu
+
+INPUT_PATH="${1:-.donkeyspace/run-input.json}"
+RESULT_PATH=".donkeyspace/run-result.json"
+SCHEMA_PATH="/app/schemas/run-result.codex.schema.json"
+
+if [ ! -f "$INPUT_PATH" ]; then
+  echo "missing run input: $INPUT_PATH" >&2
+  exit 2
+fi
+
+if [ ! -f "$SCHEMA_PATH" ]; then
+  echo "missing run-result schema: $SCHEMA_PATH" >&2
+  exit 2
+fi
+
+rm -f "$RESULT_PATH"
+
+codex exec \
+  --cd . \
+  --skip-git-repo-check \
+  --model gpt-5.4-mini \
+  --dangerously-bypass-approvals-and-sandbox \
+  --output-schema "$SCHEMA_PATH" \
+  --output-last-message "$RESULT_PATH" \
+  "You are the Donkeyspace triage agent. Read ${INPUT_PATH}. Inspect repo/ as needed. Do not modify files under repo/. Decide whether the issue is ready for implementation. Return only a valid Donkeyspace run-result JSON object."
+
+if [ ! -s "$RESULT_PATH" ]; then
+  echo "codex did not write $RESULT_PATH" >&2
+  exit 1
+fi
+
+node -e "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))" "$RESULT_PATH"
