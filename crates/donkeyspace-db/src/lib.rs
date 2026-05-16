@@ -160,7 +160,7 @@ pub async fn upsert_workflow_item(
         ON CONFLICT (repository_id, provider_issue_id)
         DO UPDATE SET
             issue_number = EXCLUDED.issue_number,
-            current_state = EXCLUDED.current_state,
+            current_state = COALESCE(EXCLUDED.current_state, workflow_items.current_state),
             current_labels = EXCLUDED.current_labels,
             updated_at = now()
         RETURNING id
@@ -175,6 +175,46 @@ pub async fn upsert_workflow_item(
     .await?;
 
     Ok(id)
+}
+
+pub async fn get_workflow_item_state(
+    pool: &PgPool,
+    repository_id: i64,
+    provider_issue_id: &str,
+) -> Result<Option<String>, DbError> {
+    let state = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT COALESCE(
+            workflow_items.current_state,
+            CASE
+                WHEN latest_job.status = 'failed' THEN 'blocked'
+                WHEN latest_job.result->>'outcome' IN ('blocked', 'failed') THEN 'blocked'
+                WHEN latest_job.result->>'outcome' = 'needs_info' THEN 'needs_info'
+                WHEN latest_job.result->>'outcome' = 'needs_human' THEN 'needs_human'
+                WHEN latest_job.result->>'outcome' = 'ready' THEN 'ready'
+                ELSE NULL
+            END
+        )
+        FROM workflow_items
+        LEFT JOIN LATERAL (
+            SELECT status, result
+            FROM jobs
+            WHERE jobs.workflow_item_id = workflow_items.id
+              AND jobs.role = 'triage'
+            ORDER BY jobs.created_at DESC
+            LIMIT 1
+        ) AS latest_job ON true
+        WHERE workflow_items.repository_id = $1
+          AND workflow_items.provider_issue_id = $2
+        "#,
+    )
+    .bind(repository_id)
+    .bind(provider_issue_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+
+    Ok(state)
 }
 
 pub async fn record_webhook_delivery(

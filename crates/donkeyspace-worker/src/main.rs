@@ -1,6 +1,7 @@
 use clap::Parser;
 use donkeyspace_core::{
-    Policy, fake_triage_issue, triage_github_issue_actions, workflow_state_for_outcome,
+    Outcome, Policy, RunResult, fake_triage_issue, triage_github_issue_actions,
+    workflow_state_for_outcome,
 };
 use donkeyspace_db::{
     DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord, acquire_next_queued_job,
@@ -11,13 +12,22 @@ use donkeyspace_db::{
 use donkeyspace_github::GitHubClient;
 use serde::Deserialize;
 use serde_json::json;
-use std::{env, fs, time::Duration};
+use std::{env, fs, path::PathBuf, time::Duration};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod llm_triage;
+mod repo_context;
+
+use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
+use repo_context::{
+    RepoContextConfig, build_repository_context, cleanup_repository_context,
+    enrich_input_with_repository_context,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "donkeyspace-worker")]
 struct Args {
-    #[arg(long, env = "DONKEYSPACE_DATABASE_URL")]
+    #[arg(long, env = "DONKEYSPACE_DATABASE_URL", hide_env_values = true)]
     database_url: Option<String>,
     #[arg(long, env = "DONKEYSPACE_WORKER_ID", default_value = "worker-local")]
     worker_id: String,
@@ -25,8 +35,40 @@ struct Args {
     lease_seconds: i32,
     #[arg(long, default_value_t = false)]
     once: bool,
-    #[arg(long, env = "DONKEYSPACE_GITHUB_TOKEN")]
+    #[arg(long, env = "DONKEYSPACE_GITHUB_TOKEN", hide_env_values = true)]
     github_token: Option<String>,
+    #[arg(long, env = "DONKEYSPACE_TRIAGE_PROVIDER", default_value = "auto")]
+    triage_provider: String,
+    #[arg(
+        long,
+        env = "DONKEYSPACE_LLM_BASE_URL",
+        default_value = "https://openrouter.ai/api/v1"
+    )]
+    llm_base_url: String,
+    #[arg(long, env = "DONKEYSPACE_LLM_MODEL", default_value = "openrouter/free")]
+    llm_model: String,
+    #[arg(long, env = "DONKEYSPACE_LLM_API_KEY", hide_env_values = true)]
+    llm_api_key: Option<String>,
+    #[arg(
+        long,
+        env = "DONKEYSPACE_WORKSPACE_ROOT",
+        default_value = "/tmp/donkeyspace/workspaces"
+    )]
+    workspace_root: PathBuf,
+    #[arg(
+        long,
+        env = "DONKEYSPACE_REPO_CONTEXT_MAX_BYTES",
+        default_value_t = 20_000
+    )]
+    repo_context_max_bytes: usize,
+    #[arg(
+        long,
+        env = "DONKEYSPACE_REPO_CONTEXT_MAX_FILE_BYTES",
+        default_value_t = 4_000
+    )]
+    repo_context_max_file_bytes: usize,
+    #[arg(long, env = "DONKEYSPACE_REPO_CONTEXT_MAX_FILES", default_value_t = 12)]
+    repo_context_max_files: usize,
 }
 
 #[tokio::main]
@@ -45,6 +87,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let triage_config = LlmTriageConfig {
+        provider: TriageProvider::parse(&args.triage_provider),
+        base_url: args.llm_base_url.clone(),
+        api_key: non_empty_string(args.llm_api_key.clone())
+            .or_else(|| non_empty_string(env::var("OPENROUTER_API_KEY").ok())),
+        model: args.llm_model.clone(),
+    };
+    let triage_client = OpenAiTriageClient::new(&triage_config)?;
+    if triage_client.is_some() {
+        tracing::info!(
+            provider = "openai-compatible",
+            model = triage_config.model,
+            base_url = triage_config.base_url,
+            "llm triage enabled"
+        );
+    } else {
+        tracing::info!("deterministic triage enabled");
+    }
+
+    let repo_context_config = RepoContextConfig::new(
+        args.workspace_root.clone(),
+        args.repo_context_max_bytes,
+        args.repo_context_max_file_bytes,
+        args.repo_context_max_files,
+    );
+
     tracing::info!("donkeyspace worker started");
 
     if args.once {
@@ -52,6 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             poll_once(
                 pool,
                 &policy,
+                triage_client.as_ref(),
+                &repo_context_config,
                 args.github_token.as_deref(),
                 &args.worker_id,
                 args.lease_seconds,
@@ -67,6 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             poll_once(
                 pool,
                 &policy,
+                triage_client.as_ref(),
+                &repo_context_config,
                 args.github_token.as_deref(),
                 &args.worker_id,
                 args.lease_seconds,
@@ -81,6 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn poll_once(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
+    triage_client: Option<&OpenAiTriageClient>,
+    repo_context_config: &RepoContextConfig,
     github_token: Option<&str>,
     worker_id: &str,
     lease_seconds: i32,
@@ -92,7 +166,15 @@ async fn poll_once(
                 role = job.role,
                 "leased queued job"
             );
-            execute_job(pool, policy, job).await?;
+            execute_job(
+                pool,
+                policy,
+                triage_client,
+                repo_context_config,
+                github_token,
+                job,
+            )
+            .await?;
         }
         None => tracing::debug!("no queued jobs available"),
     }
@@ -110,6 +192,9 @@ async fn poll_once(
 async fn execute_job(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
+    triage_client: Option<&OpenAiTriageClient>,
+    repo_context_config: &RepoContextConfig,
+    github_token: Option<&str>,
     job: JobRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(running_job) = mark_job_running(pool, job.id).await? else {
@@ -139,11 +224,57 @@ async fn execute_job(
                 return Ok(());
             }
 
-            let result = fake_triage_issue(&running_job.input);
-            result.validate_for_orchestration()?;
+            let repository_context = match build_repository_context(
+                &running_job.input,
+                running_job.id,
+                github_token,
+                repo_context_config,
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    fail_triage_job(
+                        pool,
+                        &running_job,
+                        "Repository checkout context failed.",
+                        &error.to_string(),
+                    )
+                    .await?;
+                    let _ = cleanup_repository_context(running_job.id, repo_context_config);
+                    tracing::warn!(
+                        job_id = %running_job.id,
+                        "repository context failed"
+                    );
+                    return Ok(());
+                }
+            };
+            let enriched_input =
+                enrich_input_with_repository_context(&running_job.input, repository_context);
+
+            let (result, transition_reason) = match run_triage(triage_client, &enriched_input).await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    fail_triage_job(
+                        pool,
+                        &running_job,
+                        "Triage execution failed.",
+                        &error.to_string(),
+                    )
+                    .await?;
+                    let _ = cleanup_repository_context(running_job.id, repo_context_config);
+                    tracing::warn!(
+                        job_id = %running_job.id,
+                        "triage job failed"
+                    );
+                    return Ok(());
+                }
+            };
             let result_value = serde_json::to_value(&result)?;
             let workflow_state = workflow_state_for_outcome(result.outcome);
             complete_job(pool, running_job.id, &result_value).await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
 
             if let Some(workflow_item_id) = running_job.workflow_item_id {
                 update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
@@ -153,7 +284,7 @@ async fn execute_job(
                     Some(running_job.id),
                     None,
                     workflow_state.as_str(),
-                    "fake triage agent completed",
+                    transition_reason,
                 )
                 .await?;
 
@@ -215,6 +346,88 @@ async fn execute_job(
     Ok(())
 }
 
+async fn fail_triage_job(
+    pool: &donkeyspace_db::PgPool,
+    running_job: &JobRecord,
+    summary: &str,
+    blocked_reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result_value = json!({
+        "outcome": "failed",
+        "summary": summary,
+        "confidence": "low",
+        "risk": "unknown",
+        "questions": [],
+        "tests": [],
+        "changed_files": [],
+        "human_review_reason": null,
+        "blocked_reason": blocked_reason,
+    });
+    fail_job(pool, running_job.id, &result_value).await?;
+
+    if let Some(workflow_item_id) = running_job.workflow_item_id {
+        update_workflow_item_state(pool, workflow_item_id, "blocked").await?;
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(running_job.id),
+            None,
+            "blocked",
+            "triage execution failed",
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn run_triage(
+    triage_client: Option<&OpenAiTriageClient>,
+    input: &serde_json::Value,
+) -> Result<(RunResult, &'static str), Box<dyn std::error::Error>> {
+    let deterministic_result = fake_triage_issue(input);
+    if repository_context_short_circuits_triage(input, &deterministic_result) {
+        deterministic_result.validate_for_orchestration()?;
+        return Ok((deterministic_result, "repository context triage completed"));
+    }
+
+    let result = match triage_client {
+        Some(client) => (
+            client.triage_issue(input).await?,
+            "llm triage agent completed",
+        ),
+        None => (
+            fake_triage_issue(input),
+            "deterministic triage agent completed",
+        ),
+    };
+    result.0.validate_for_orchestration()?;
+    Ok(result)
+}
+
+fn repository_context_short_circuits_triage(input: &serde_json::Value, result: &RunResult) -> bool {
+    result.outcome == Outcome::Ready
+        && input.pointer("/repository_context").is_some()
+        && meaningful_word_count(&format!(
+            "{}\n{}",
+            input
+                .pointer("/issue/title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            input
+                .pointer("/issue/body")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        )) < 8
+}
+
+fn meaningful_word_count(value: &str) -> usize {
+    value
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count()
+}
+
 fn input_is_donkeyspace_comment(input: &serde_json::Value) -> bool {
     input.pointer("/action").and_then(serde_json::Value::as_str) == Some("created")
         && input
@@ -222,6 +435,12 @@ fn input_is_donkeyspace_comment(input: &serde_json::Value) -> bool {
             .and_then(serde_json::Value::as_str)
             .map(|body| body.trim_start().starts_with("donkeyspace "))
             .unwrap_or(false)
+}
+
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn process_outbound_actions(
@@ -323,7 +542,10 @@ struct CreateCommentPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::input_is_donkeyspace_comment;
+    use super::{
+        input_is_donkeyspace_comment, non_empty_string, repository_context_short_circuits_triage,
+    };
+    use donkeyspace_core::{Confidence, Outcome, Risk, RunResult};
     use serde_json::json;
 
     #[test]
@@ -344,6 +566,39 @@ mod tests {
                 "body": "Here are the reproduction steps."
             }
         })));
+    }
+
+    #[test]
+    fn empty_env_values_are_treated_as_missing() {
+        assert_eq!(non_empty_string(Some("".to_string())), None);
+        assert_eq!(non_empty_string(Some("   ".to_string())), None);
+        assert_eq!(
+            non_empty_string(Some(" key ".to_string())),
+            Some("key".to_string())
+        );
+    }
+
+    #[test]
+    fn short_ready_repo_context_can_skip_llm() {
+        let result = RunResult {
+            outcome: Outcome::Ready,
+            summary: "Ready".to_string(),
+            confidence: Confidence::Medium,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+
+        assert!(repository_context_short_circuits_triage(
+            &json!({
+                "issue": {"title": "Capitize D and S in README", "body": null},
+                "repository_context": {"file_tree": ["README.md"]}
+            }),
+            &result
+        ));
     }
 }
 

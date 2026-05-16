@@ -130,6 +130,23 @@ a {
   margin-top: 6px;
 }
 
+.run-meta {
+  color: #68736a;
+  display: flex;
+  flex-wrap: wrap;
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  gap: 8px;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+.run-meta span + span::before {
+  content: "/";
+  margin-right: 8px;
+}
+
 .question-list {
   color: #38443c;
   margin: 12px 0 0;

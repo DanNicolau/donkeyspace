@@ -108,6 +108,16 @@ The result should include:
 
 The orchestrator should treat missing, invalid, or contradictory result files as `needs_human` or `failed`, depending on whether the agent produced useful partial work.
 
+## Agent Repository Access
+
+V1 should prefer external agent CLIs with workspace-native file and search tools over a custom donkeyspace LLM tool loop.
+
+The worker may still build bounded repository context for cheap deterministic or OpenAI-compatible triage, but that prompt context is a fallback and fast-path aid rather than the long-term agent interface. For actual agentic triage, implementation, and review, donkeyspace should create the repository workspace, write `.donkeyspace/run-input.json`, run the configured agent command in that workspace, and read `.donkeyspace/run-result.json`.
+
+Triage agents should receive read-only repository access. Developer agents may write to the workspace and create branches or PRs according to policy. Reviewer agents should inspect diffs, test output, and policy context, and should avoid mutating repository state except for structured review output and approved GitHub comments.
+
+A donkeyspace-owned MCP or tool API can be added later for portable tools such as `repo.list_tree`, `repo.search`, `repo.read_file`, `issue.context`, `policy.read`, and `result.write`. This should come after the generic external command path works, so the project remains an orchestrator instead of becoming a new agent runtime too early.
+
 ## Duplicate Work Prevention
 
 V1 should use both visible GitHub state and an internal lease.
