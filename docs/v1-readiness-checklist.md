@@ -32,8 +32,8 @@ This checklist tracks the work needed before the first useful version of donkeys
 
 - [x] Design the first policy file schema.
 - [x] Add examples for a minimal policy and a stricter team policy.
-- [ ] Support enabling and disabling agent roles.
-- [ ] Support required local commands.
+- [x] Support enabling and disabling agent roles.
+- [x] Support required local commands.
 - [ ] Support required GitHub CI checks.
 - [ ] Support path-based human-review requirements.
 - [ ] Support labels that block agent work.
@@ -55,6 +55,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Decide repo file/search access model for agents.
 - [x] Implement external CLI triage as the first agentic triage workflow.
 - [ ] Implement built-in OpenAI-compatible triage with donkeyspace-owned repo tools.
+- [x] Reconcile ready issues into developer jobs without requiring a new webhook.
 - [x] Implement DB-backed job lease acquisition.
 - [x] Implement fake triage agent execution.
 - [x] Persist completed and failed job results.
@@ -63,14 +64,14 @@ This checklist tracks the work needed before the first useful version of donkeys
 ## Sandboxing And Execution
 
 - [ ] Define the container image strategy for agent runs.
-- [ ] Create ephemeral workspace behavior.
+- [x] Create ephemeral workspace behavior.
 - [x] Define repository checkout behavior.
-- [ ] Define branch naming behavior.
+- [x] Define branch naming behavior.
 - [ ] Define allowed network behavior.
 - [x] Define how model-provider credentials are injected.
-- [ ] Define how GitHub credentials are injected.
-- [ ] Capture command logs and exit codes.
-- [ ] Clean up workspaces after completion or failure.
+- [x] Define how GitHub credentials are injected.
+- [x] Capture command logs and exit codes.
+- [x] Clean up workspaces after completion or failure.
 
 ## GitHub Integration
 
@@ -82,9 +83,9 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] Handle check-suite or check-run events if needed.
 - [x] Create issue comments.
 - [x] Apply and remove labels.
-- [ ] Create branches.
-- [ ] Push commits.
-- [ ] Open pull requests.
+- [x] Create branches.
+- [x] Push commits.
+- [x] Open pull requests.
 - [ ] Read PR diffs and CI status.
 
 ## Audit And Storage
@@ -109,7 +110,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] Show issue and PR links.
 - [x] Show state transitions.
 - [ ] Show policy decisions.
-- [ ] Show command results.
+- [x] Show command results.
 - [x] Show failure and escalation reasons.
 - [ ] Show current policy config in read-only form.
 - [x] Define the first useful dashboard slice.
@@ -144,9 +145,9 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] A GitHub repo can be connected.
 - [ ] The system can triage an issue and ask clarifying questions.
 - [ ] The system can mark a clear issue as agent-ready.
-- [ ] The system can run a developer agent in an isolated container.
-- [ ] The system can open a pull request for a ready issue.
-- [ ] The system can run configured checks and record results.
+- [x] The system can run a developer agent in an isolated container.
+- [x] The system can open a pull request for a ready issue.
+- [x] The system can run configured checks and record results.
 - [ ] The system can run a reviewer agent on the PR.
 - [ ] The system can route uncertain or high-risk work to humans.
 - [ ] Humans remain responsible for merge by default.

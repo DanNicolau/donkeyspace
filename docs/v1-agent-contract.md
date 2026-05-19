@@ -18,7 +18,7 @@ agents:
   triage:
     command: ["donkeyspace-codex-triage", ".donkeyspace/run-input.json"]
   developer:
-    command: ["codex", "exec", "--json", "Read .donkeyspace/run-input.json and write .donkeyspace/run-result.json"]
+    command: ["donkeyspace-codex-developer", ".donkeyspace/run-input.json"]
   reviewer:
     command: ["donkeyspace-agent-review", "--input", ".donkeyspace/run-input.json"]
 ```
@@ -61,7 +61,7 @@ Required fields:
 Role-specific notes:
 
 - Triage jobs receive issue title, body, labels, recent comments, and bounded read-only repository context.
-- Developer jobs receive issue context, policy checks, branch naming hints, and repository checkout path.
+- Developer jobs receive issue context, policy checks, and a writable repository checkout path.
 - Reviewer jobs receive issue context, PR metadata, diff summary, changed files, and check status.
 
 ## Run Result
@@ -70,7 +70,7 @@ Every agent must write `.donkeyspace/run-result.json`.
 
 The validation schema lives at `schemas/run-result.schema.json`.
 
-Codex CLI triage uses `schemas/run-result.codex.schema.json` for model-facing structured output because OpenAI response-format schemas do not support every JSON Schema feature used by the orchestration schema. The reference wrapper disables Codex's inner bubblewrap sandbox and relies on the worker container boundary for local testing. The orchestrator still applies Rust validation after reading the result file.
+Codex CLI triage uses `schemas/run-result.codex.schema.json` and Codex CLI developer runs use `schemas/run-result.codex-developer.schema.json` for model-facing structured output because OpenAI response-format schemas do not support every JSON Schema feature used by the orchestration schema. The reference wrappers disable Codex's inner bubblewrap sandbox and rely on the worker container boundary for local testing. The orchestrator still applies Rust validation after reading the result file.
 
 Required shape:
 
@@ -121,6 +121,12 @@ Allowed `risk` values:
 - `failed`: must include `blocked_reason`.
 - `implemented`: must include `tests`; `changed_files` should be present when available.
 - `needs_changes`: must include a summary specific enough for a developer agent or human to act on.
+
+## Developer PR Behavior
+
+Developer agents modify files in the checkout only. They must not commit, push, apply labels, or open pull requests directly. When a developer result is `implemented`, the worker inspects `git status`, commits actual checkout changes, pushes `donkeyspace/issue-{issue_number}-{job_id_short}`, opens a PR, and transitions the issue to `pr_open`.
+
+Commit and PR titles use Conventional Commit formatting. The current heuristic chooses `docs:` for README or documentation-only changes, `fix:` for bug/failure language, `feat:` for add/create/feature language, and `chore:` otherwise.
 
 ## Failure Handling
 

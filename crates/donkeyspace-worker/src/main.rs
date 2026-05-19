@@ -1,21 +1,28 @@
 use clap::Parser;
+use donkeyspace_core::policy::RequiredCommand;
 use donkeyspace_core::{
-    Outcome, Policy, RunResult, fake_triage_issue, triage_github_issue_actions,
-    workflow_state_for_outcome,
+    Outcome, Policy, RunResult, TestResult, TestStatus, WorkflowState, fake_triage_issue,
+    triage_github_issue_actions, workflow_state_for_outcome,
 };
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
     acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
-    create_outbound_action, fail_job, list_pending_outbound_actions, mark_job_running,
-    mark_outbound_action_completed, mark_outbound_action_failed, record_state_transition,
-    update_workflow_item_state,
+    create_job, create_outbound_action, fail_job, list_pending_outbound_actions,
+    list_ready_developer_candidates, mark_job_running, mark_outbound_action_completed,
+    mark_outbound_action_failed, record_state_transition, update_workflow_item_state,
 };
 use donkeyspace_github::GitHubClient;
 use donkeyspace_runner::{AgentCommand, AgentCommandStatus, read_run_result, run_agent_command};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 use tokio::fs as tokio_fs;
+use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod llm_triage;
@@ -24,7 +31,7 @@ mod repo_context;
 use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
 use repo_context::{
     RepoContextConfig, build_repository_context, cleanup_repository_context,
-    enrich_input_with_repository_context, workspace_path,
+    enrich_input_with_repository_context, workspace_path, write_askpass_script,
 };
 
 #[derive(Debug, Parser)]
@@ -72,6 +79,8 @@ struct Args {
     repo_context_max_file_bytes: usize,
     #[arg(long, env = "DONKEYSPACE_REPO_CONTEXT_MAX_FILES", default_value_t = 12)]
     repo_context_max_files: usize,
+    #[arg(long, env = "DONKEYSPACE_READY_RECONCILE_LIMIT", default_value_t = 1)]
+    ready_reconcile_limit: i64,
 }
 
 #[tokio::main]
@@ -131,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.github_token.as_deref(),
                 &args.worker_id,
                 args.lease_seconds,
+                args.ready_reconcile_limit,
             )
             .await?;
         }
@@ -149,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.github_token.as_deref(),
                 &args.worker_id,
                 args.lease_seconds,
+                args.ready_reconcile_limit,
             )
             .await?;
         }
@@ -166,7 +177,10 @@ async fn poll_once(
     github_token: Option<&str>,
     worker_id: &str,
     lease_seconds: i32,
+    ready_reconcile_limit: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    reconcile_ready_developer_jobs(pool, policy, ready_reconcile_limit).await?;
+
     match acquire_next_queued_job(pool, worker_id, lease_seconds).await? {
         Some(job) => {
             tracing::info!(
@@ -198,6 +212,48 @@ async fn poll_once(
     Ok(())
 }
 
+async fn reconcile_ready_developer_jobs(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    limit: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !policy.agents.developer.enabled {
+        return Ok(());
+    }
+
+    let limit = limit.clamp(0, 50);
+    if limit == 0 {
+        return Ok(());
+    }
+
+    for candidate in list_ready_developer_candidates(pool, limit).await? {
+        let job = create_job(
+            pool,
+            Some(candidate.workflow_item_id),
+            "developer",
+            &candidate.input,
+        )
+        .await?;
+        record_state_transition(
+            pool,
+            candidate.workflow_item_id,
+            Some(job.id),
+            Some(WorkflowState::Ready.as_str()),
+            "developer_queued",
+            "queued developer job during ready issue reconciliation",
+        )
+        .await?;
+
+        tracing::info!(
+            workflow_item_id = candidate.workflow_item_id,
+            developer_job_id = %job.id,
+            "queued missing developer job for ready issue"
+        );
+    }
+
+    Ok(())
+}
+
 async fn execute_job(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
@@ -211,6 +267,16 @@ async fn execute_job(
         tracing::warn!(job_id = %job.id, "leased job was not available to mark running");
         return Ok(());
     };
+
+    if input_issue_is_closed(&running_job.input) {
+        complete_ignored_closed_issue_job(pool, &running_job).await?;
+        tracing::info!(
+            job_id = %running_job.id,
+            role = running_job.role,
+            "ignored closed issue job"
+        );
+        return Ok(());
+    }
 
     match running_job.role.as_str() {
         "triage" => {
@@ -325,6 +391,30 @@ async fn execute_job(
                     )
                     .await?;
                 }
+
+                if result.outcome == Outcome::Ready && policy.agents.developer.enabled {
+                    let developer_job = create_job(
+                        pool,
+                        Some(workflow_item_id),
+                        "developer",
+                        &running_job.input,
+                    )
+                    .await?;
+                    record_state_transition(
+                        pool,
+                        workflow_item_id,
+                        Some(developer_job.id),
+                        Some(WorkflowState::Ready.as_str()),
+                        "developer_queued",
+                        "queued developer job after ready triage",
+                    )
+                    .await?;
+                    tracing::info!(
+                        triage_job_id = %running_job.id,
+                        developer_job_id = %developer_job.id,
+                        "queued developer job for ready issue"
+                    );
+                }
             }
 
             tracing::info!(
@@ -333,6 +423,10 @@ async fn execute_job(
                 workflow_state = workflow_state.as_str(),
                 "job completed"
             );
+        }
+        "developer" => {
+            execute_developer_job(pool, policy, repo_context_config, github_token, running_job)
+                .await?;
         }
         unsupported => {
             let result_value = json!({
@@ -396,6 +490,437 @@ async fn fail_triage_job(
             None,
             "blocked",
             "triage execution failed",
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn complete_ignored_closed_issue_job(
+    pool: &donkeyspace_db::PgPool,
+    running_job: &JobRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result_value = json!({
+        "outcome": "blocked",
+        "summary": "Ignored closed GitHub issue.",
+        "confidence": "high",
+        "risk": "unknown",
+        "questions": [],
+        "tests": [],
+        "changed_files": [],
+        "human_review_reason": null,
+        "blocked_reason": "closed issues are not eligible for agent work",
+    });
+    complete_job(pool, running_job.id, &result_value).await?;
+    Ok(())
+}
+
+async fn execute_developer_job(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    repo_context_config: &RepoContextConfig,
+    github_token: Option<&str>,
+    running_job: JobRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !policy.agents.developer.enabled {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Developer execution failed.",
+            "developer agent is disabled by policy",
+            "developer execution failed",
+        )
+        .await?;
+        return Ok(());
+    }
+    if policy.agents.developer.command.is_empty() {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Developer execution failed.",
+            "developer agent command is empty",
+            "developer execution failed",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    match current_github_issue_is_closed(&running_job.input, github_token).await {
+        Ok(true) => {
+            complete_ignored_closed_issue_job(pool, &running_job).await?;
+            tracing::info!(
+                job_id = %running_job.id,
+                "ignored developer job because github issue is closed"
+            );
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                job_id = %running_job.id,
+                %error,
+                "could not verify github issue state before developer execution"
+            );
+        }
+    }
+
+    let repository_context = match build_repository_context(
+        &running_job.input,
+        running_job.id,
+        github_token,
+        repo_context_config,
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Repository checkout context failed.",
+                &error.to_string(),
+                "developer execution failed",
+            )
+            .await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            tracing::warn!(job_id = %running_job.id, "developer repository context failed");
+            return Ok(());
+        }
+    };
+
+    if let Some(workflow_item_id) = running_job.workflow_item_id {
+        update_workflow_item_state(pool, workflow_item_id, WorkflowState::InProgress.as_str())
+            .await?;
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(running_job.id),
+            Some(WorkflowState::Ready.as_str()),
+            WorkflowState::InProgress.as_str(),
+            "developer agent started",
+        )
+        .await?;
+    }
+
+    let enriched_input =
+        enrich_input_with_repository_context(&running_job.input, repository_context.clone());
+    let developer_result = run_agent_developer(
+        pool,
+        policy,
+        &running_job,
+        &enriched_input,
+        repo_context_config,
+    )
+    .await;
+
+    let mut result = match developer_result {
+        Ok(result) => result,
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Developer execution failed.",
+                &error.to_string(),
+                "developer execution failed",
+            )
+            .await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            tracing::warn!(job_id = %running_job.id, "developer job failed");
+            return Ok(());
+        }
+    };
+
+    if result.outcome != Outcome::Implemented {
+        let result_value = serde_json::to_value(&result)?;
+        let workflow_state = workflow_state_for_outcome(result.outcome);
+        complete_job(pool, running_job.id, &result_value).await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+        if let Some(workflow_item_id) = running_job.workflow_item_id {
+            update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+            record_state_transition(
+                pool,
+                workflow_item_id,
+                Some(running_job.id),
+                Some(WorkflowState::InProgress.as_str()),
+                workflow_state.as_str(),
+                "developer agent completed without implementation",
+            )
+            .await?;
+
+            for action in
+                triage_github_issue_actions(policy, &running_job.input, &result, workflow_state)
+            {
+                create_outbound_action(
+                    pool,
+                    &OutboundActionInput {
+                        workflow_item_id,
+                        job_id: Some(running_job.id),
+                        provider: "github".to_string(),
+                        action_type: action.action_type,
+                        payload: action.payload,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        tracing::info!(
+            job_id = %running_job.id,
+            outcome = ?result.outcome,
+            "developer job completed without implementation"
+        );
+        return Ok(());
+    }
+
+    let repo_path = repository_checkout_path(&repository_context)?;
+    let changed_files = git_changed_files(&repo_path).await?;
+    if changed_files.is_empty() {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Developer execution failed.",
+            "developer agent returned implemented but did not modify the repository checkout",
+            "developer execution failed",
+        )
+        .await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        return Ok(());
+    }
+
+    result.changed_files = changed_files.clone();
+    let required_check_results =
+        run_required_commands(pool, policy, running_job.id, &repo_path).await?;
+    let required_checks_failed = required_check_results
+        .iter()
+        .any(|check| check.status == TestStatus::Failed);
+    result.tests.extend(required_check_results);
+    if required_checks_failed {
+        result.outcome = Outcome::Failed;
+        result.summary = "Developer implementation failed required checks.".to_string();
+        result.blocked_reason = Some(required_check_failure_summary(&result.tests));
+        let result_value = serde_json::to_value(&result)?;
+        fail_job(pool, running_job.id, &result_value).await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+        if let Some(workflow_item_id) = running_job.workflow_item_id {
+            update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str())
+                .await?;
+            record_state_transition(
+                pool,
+                workflow_item_id,
+                Some(running_job.id),
+                Some(WorkflowState::InProgress.as_str()),
+                WorkflowState::Blocked.as_str(),
+                "developer required checks failed",
+            )
+            .await?;
+
+            for action in triage_github_issue_actions(
+                policy,
+                &running_job.input,
+                &result,
+                WorkflowState::Blocked,
+            ) {
+                create_outbound_action(
+                    pool,
+                    &OutboundActionInput {
+                        workflow_item_id,
+                        job_id: Some(running_job.id),
+                        provider: "github".to_string(),
+                        action_type: action.action_type,
+                        payload: action.payload,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        tracing::warn!(
+            job_id = %running_job.id,
+            "developer job blocked by required checks"
+        );
+        return Ok(());
+    }
+
+    let issue_num = issue_number(&running_job.input).unwrap_or(0);
+    let branch_name = developer_branch_name(issue_num, running_job.id);
+    let commit_title = conventional_commit_title(&running_job.input, &changed_files);
+    let commit_body = developer_commit_body(&running_job, &result, &changed_files);
+    let base_branch = repository_default_branch(&running_job.input);
+    let workspace = workspace_path(running_job.id, repo_context_config);
+    if let Err(error) = push_developer_branch(
+        &repo_path,
+        &workspace,
+        github_token,
+        &branch_name,
+        &commit_title,
+        &commit_body,
+    )
+    .await
+    {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Developer execution failed.",
+            &error.to_string(),
+            "developer execution failed",
+        )
+        .await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        return Ok(());
+    }
+
+    let pull_request = async {
+        let owner = repository_owner(&running_job.input)?;
+        let repo = repository_name(&running_job.input)?;
+        let pull_request_body = developer_pull_request_body(&running_job, &result, &changed_files);
+        let github_token = github_token
+            .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to open developer pull requests")?;
+        let github_client = GitHubClient::new(github_token)?;
+        let pull_request_url = github_client
+            .create_pull_request(
+                &owner,
+                &repo,
+                &commit_title,
+                &branch_name,
+                &base_branch,
+                &pull_request_body,
+            )
+            .await?;
+        Ok::<_, Box<dyn std::error::Error>>((owner, repo, pull_request_url))
+    }
+    .await;
+
+    let (owner, repo, pull_request_url) = match pull_request {
+        Ok(pull_request) => pull_request,
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Developer execution failed.",
+                &error.to_string(),
+                "developer execution failed",
+            )
+            .await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            return Ok(());
+        }
+    };
+
+    let result_value = serde_json::to_value(&result)?;
+    complete_job(pool, running_job.id, &result_value).await?;
+    let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+    if let Some(workflow_item_id) = running_job.workflow_item_id {
+        update_workflow_item_state(pool, workflow_item_id, WorkflowState::PrOpen.as_str()).await?;
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(running_job.id),
+            Some(WorkflowState::InProgress.as_str()),
+            WorkflowState::PrOpen.as_str(),
+            "developer agent opened pull request",
+        )
+        .await?;
+
+        for action in
+            triage_github_issue_actions(policy, &running_job.input, &result, WorkflowState::PrOpen)
+        {
+            create_outbound_action(
+                pool,
+                &OutboundActionInput {
+                    workflow_item_id,
+                    job_id: Some(running_job.id),
+                    provider: "github".to_string(),
+                    action_type: action.action_type,
+                    payload: action.payload,
+                },
+            )
+            .await?;
+        }
+
+        if let Some(issue_number) = issue_number(&running_job.input) {
+            create_outbound_action(
+                pool,
+                &OutboundActionInput {
+                    workflow_item_id,
+                    job_id: Some(running_job.id),
+                    provider: "github".to_string(),
+                    action_type: "issue.create_comment".to_string(),
+                    payload: json!({
+                        "owner": owner,
+                        "repo": repo,
+                        "issue_number": issue_number,
+                        "body": format!("donkeyspace developer opened a pull request: {pull_request_url}"),
+                    }),
+                },
+            )
+            .await?;
+        }
+    }
+
+    tracing::info!(
+        job_id = %running_job.id,
+        branch = branch_name,
+        pull_request_url,
+        "developer job completed"
+    );
+
+    Ok(())
+}
+
+async fn current_github_issue_is_closed(
+    input: &Value,
+    github_token: Option<&str>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(token) = github_token.filter(|token| !token.trim().is_empty()) else {
+        return Ok(false);
+    };
+    let Some(issue_number) = issue_number(input) else {
+        return Ok(false);
+    };
+
+    let client = GitHubClient::new(token)?;
+    Ok(client
+        .issue_is_closed(
+            &repository_owner(input)?,
+            &repository_name(input)?,
+            issue_number,
+        )
+        .await?)
+}
+
+async fn fail_role_job(
+    pool: &donkeyspace_db::PgPool,
+    running_job: &JobRecord,
+    summary: &str,
+    blocked_reason: &str,
+    transition_reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result_value = json!({
+        "outcome": "failed",
+        "summary": summary,
+        "confidence": "low",
+        "risk": "unknown",
+        "questions": [],
+        "tests": [],
+        "changed_files": [],
+        "human_review_reason": null,
+        "blocked_reason": blocked_reason,
+    });
+    fail_job(pool, running_job.id, &result_value).await?;
+
+    if let Some(workflow_item_id) = running_job.workflow_item_id {
+        update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str()).await?;
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(running_job.id),
+            None,
+            WorkflowState::Blocked.as_str(),
+            transition_reason,
         )
         .await?;
     }
@@ -472,6 +997,418 @@ async fn run_agent_triage(
         read_run_result(&result_path).await?,
         "external triage agent completed",
     ))
+}
+
+async fn run_agent_developer(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    running_job: &JobRecord,
+    input: &Value,
+    repo_context_config: &RepoContextConfig,
+) -> Result<RunResult, Box<dyn std::error::Error>> {
+    let workspace_path = workspace_path(running_job.id, repo_context_config);
+    let donkeyspace_path = workspace_path.join(".donkeyspace");
+    let input_path = donkeyspace_path.join("run-input.json");
+    let result_path = donkeyspace_path.join("run-result.json");
+    let contract_result_path = ".donkeyspace/run-result.json";
+    tokio_fs::create_dir_all(&donkeyspace_path).await?;
+    let run_input = agent_run_input(
+        running_job.id,
+        &running_job.role,
+        input,
+        contract_result_path,
+    );
+    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
+
+    let command = AgentCommand::from_parts(
+        &policy.agents.developer.command,
+        &workspace_path,
+        &result_path,
+    )?;
+    let command_result = run_agent_command(&command).await?;
+    record_agent_command_result(pool, running_job.id, "developer agent", &command_result).await?;
+
+    if command_result.status != AgentCommandStatus::Passed {
+        return Err(format!(
+            "developer agent exited unsuccessfully with code {:?}",
+            command_result.exit_code
+        )
+        .into());
+    }
+
+    Ok(read_run_result(&result_path).await?)
+}
+
+async fn run_required_commands(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    job_id: uuid::Uuid,
+    repo_path: &Path,
+) -> Result<Vec<TestResult>, Box<dyn std::error::Error>> {
+    let mut results = Vec::new();
+
+    for required in &policy.checks.required_commands {
+        let result = run_required_command(pool, job_id, repo_path, required).await?;
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
+async fn run_required_command(
+    pool: &donkeyspace_db::PgPool,
+    job_id: uuid::Uuid,
+    repo_path: &Path,
+    required: &RequiredCommand,
+) -> Result<TestResult, Box<dyn std::error::Error>> {
+    if required.command.is_empty() {
+        let summary = "required command is empty".to_string();
+        create_command_result(
+            pool,
+            &CommandResultInput {
+                job_id,
+                name: required.name.clone(),
+                command: Vec::new(),
+                status: "failed".to_string(),
+                exit_code: None,
+                summary: Some(summary.clone()),
+            },
+        )
+        .await?;
+        return Ok(TestResult {
+            name: required.name.clone(),
+            command: Vec::new(),
+            status: TestStatus::Failed,
+            exit_code: None,
+            summary: Some(summary),
+        });
+    }
+
+    let command =
+        AgentCommand::from_parts(&required.command, repo_path, repo_path.join(".unused"))?;
+    let output = match run_agent_command(&command).await {
+        Ok(output) => output,
+        Err(error) => {
+            let summary = format!("required command failed to start or complete: {error}");
+            create_command_result(
+                pool,
+                &CommandResultInput {
+                    job_id,
+                    name: required.name.clone(),
+                    command: required.command.clone(),
+                    status: "failed".to_string(),
+                    exit_code: None,
+                    summary: Some(summary.clone()),
+                },
+            )
+            .await?;
+            return Ok(TestResult {
+                name: required.name.clone(),
+                command: required.command.clone(),
+                status: TestStatus::Failed,
+                exit_code: None,
+                summary: Some(summary),
+            });
+        }
+    };
+
+    record_agent_command_result(pool, job_id, &required.name, &output).await?;
+    let status = match output.status {
+        AgentCommandStatus::Passed => TestStatus::Passed,
+        AgentCommandStatus::Failed => TestStatus::Failed,
+    };
+    let summary = command_summary(&output.stdout, &output.stderr);
+
+    Ok(TestResult {
+        name: required.name.clone(),
+        command: output.command,
+        status,
+        exit_code: output.exit_code,
+        summary,
+    })
+}
+
+fn required_check_failure_summary(tests: &[TestResult]) -> String {
+    let failures = tests
+        .iter()
+        .filter(|test| test.status == TestStatus::Failed)
+        .map(|test| {
+            let command = if test.command.is_empty() {
+                "<empty>".to_string()
+            } else {
+                test.command.join(" ")
+            };
+            match &test.summary {
+                Some(summary) if !summary.trim().is_empty() => {
+                    format!("{} (`{}`): {}", test.name, command, summary.trim())
+                }
+                _ => format!("{} (`{}`) failed", test.name, command),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if failures.is_empty() {
+        "required checks failed".to_string()
+    } else {
+        truncate_chars(&failures.join("\n\n"), 4_000)
+    }
+}
+
+fn repository_checkout_path(context: &Value) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = context
+        .pointer("/checkout_path")
+        .and_then(Value::as_str)
+        .ok_or("repository context is missing checkout_path")?;
+    Ok(PathBuf::from(path))
+}
+
+async fn git_changed_files(repo_path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = run_git(repo_path, &["status", "--porcelain"], None, None).await?;
+    Ok(parse_porcelain_status(&output))
+}
+
+async fn push_developer_branch(
+    repo_path: &Path,
+    workspace_path: &Path,
+    github_token: Option<&str>,
+    branch_name: &str,
+    commit_title: &str,
+    commit_body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token = github_token
+        .filter(|token| !token.trim().is_empty())
+        .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to push developer branches")?;
+    let askpass_path = workspace_path.join("git-askpass.sh");
+    write_askpass_script(&askpass_path)?;
+
+    run_git(
+        repo_path,
+        &["config", "user.name", "donkeyspace"],
+        None,
+        None,
+    )
+    .await?;
+    run_git(
+        repo_path,
+        &["config", "user.email", "donkeyspace@example.invalid"],
+        None,
+        None,
+    )
+    .await?;
+    run_git(repo_path, &["checkout", "-b", branch_name], None, None).await?;
+    run_git(repo_path, &["add", "-A"], None, None).await?;
+    run_git(
+        repo_path,
+        &["commit", "-m", commit_title, "-m", commit_body],
+        None,
+        None,
+    )
+    .await?;
+    let push_ref = format!("HEAD:refs/heads/{branch_name}");
+    run_git(
+        repo_path,
+        &["push", "origin", &push_ref],
+        Some(token),
+        Some(&askpass_path),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn run_git(
+    repo_path: &Path,
+    args: &[&str],
+    github_token: Option<&str>,
+    askpass_path: Option<&Path>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(token) = github_token {
+        command.env("DONKEYSPACE_GIT_TOKEN", token);
+    }
+    if let Some(path) = askpass_path {
+        command.env("GIT_ASKPASS", path);
+    }
+
+    let output = command.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {:?} failed: {}", args, stderr.trim()).into());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_porcelain_status(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let path = line.get(3..)?.trim();
+            let path = path.rsplit_once(" -> ").map(|(_, new)| new).unwrap_or(path);
+            (!path.is_empty()).then(|| path.to_string())
+        })
+        .collect()
+}
+
+fn developer_branch_name(issue_number: i64, job_id: uuid::Uuid) -> String {
+    let short_id = job_id.to_string().chars().take(8).collect::<String>();
+    format!("donkeyspace/issue-{issue_number}-{short_id}")
+}
+
+fn conventional_commit_title(input: &Value, changed_files: &[String]) -> String {
+    let issue_number = issue_number(input).unwrap_or(0);
+    let issue_text = format!(
+        "{}\n{}",
+        input
+            .pointer("/issue/title")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        input
+            .pointer("/issue/body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+
+    if changed_files.iter().all(is_documentation_path) {
+        if changed_files.iter().any(|path| {
+            path.eq_ignore_ascii_case("README.md") || path.eq_ignore_ascii_case("README")
+        }) {
+            return format!("docs: update README for issue #{issue_number}");
+        }
+        return format!("docs: implement issue #{issue_number}");
+    }
+
+    if contains_any(
+        &issue_text,
+        &["bug", "fix", "broken", "error", "fail", "failing"],
+    ) {
+        return format!("fix: implement issue #{issue_number}");
+    }
+
+    if contains_any(
+        &issue_text,
+        &["feature", "add", "create", "implement", "support"],
+    ) {
+        return format!("feat: implement issue #{issue_number}");
+    }
+
+    format!("chore: implement issue #{issue_number}")
+}
+
+fn is_documentation_path(path: &String) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower == "readme"
+        || lower.starts_with("readme.")
+        || lower.ends_with(".md")
+        || lower.starts_with("docs/")
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn developer_commit_body(
+    running_job: &JobRecord,
+    result: &RunResult,
+    changed_files: &[String],
+) -> String {
+    format!(
+        "Implements issue #{}.\n\n{}\n\nChanged files:\n{}\n\nGenerated by donkeyspace job {}.",
+        issue_number(&running_job.input).unwrap_or(0),
+        result.summary,
+        changed_files
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        running_job.id
+    )
+}
+
+fn developer_pull_request_body(
+    running_job: &JobRecord,
+    result: &RunResult,
+    changed_files: &[String],
+) -> String {
+    let tests = if result.tests.is_empty() {
+        "- Not reported".to_string()
+    } else {
+        result
+            .tests
+            .iter()
+            .map(|test| {
+                format!(
+                    "- `{}`: {}{}",
+                    test.command.join(" "),
+                    test_status_text(test.status),
+                    test.summary
+                        .as_ref()
+                        .map(|summary| format!(" - {summary}"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "Closes #{}\n\n## Summary\n{}\n\n## Changed Files\n{}\n\n## Tests\n{}\n\nGenerated by donkeyspace developer job `{}`.",
+        issue_number(&running_job.input).unwrap_or(0),
+        result.summary,
+        changed_files
+            .iter()
+            .map(|path| format!("- `{path}`"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        tests,
+        running_job.id
+    )
+}
+
+fn test_status_text(status: TestStatus) -> &'static str {
+    match status {
+        TestStatus::Passed => "passed",
+        TestStatus::Failed => "failed",
+        TestStatus::Skipped => "skipped",
+        TestStatus::NotRun => "not_run",
+    }
+}
+
+fn issue_number(input: &Value) -> Option<i64> {
+    input.pointer("/issue/number").and_then(Value::as_i64)
+}
+
+fn repository_owner(input: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    input
+        .pointer("/repository/owner/login")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| "webhook payload is missing repository owner".into())
+}
+
+fn repository_name(input: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    input
+        .pointer("/repository/name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| "webhook payload is missing repository name".into())
+}
+
+fn repository_default_branch(input: &Value) -> String {
+    input
+        .pointer("/repository/default_branch")
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.trim().is_empty())
+        .unwrap_or("main")
+        .to_string()
 }
 
 async fn record_agent_command_result(
@@ -695,6 +1632,13 @@ fn input_is_donkeyspace_comment(input: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
+fn input_issue_is_closed(input: &serde_json::Value) -> bool {
+    input
+        .pointer("/issue/state")
+        .and_then(serde_json::Value::as_str)
+        == Some("closed")
+}
+
 fn non_empty_string(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -801,10 +1745,11 @@ struct CreateCommentPayload {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_run_input, command_summary, input_is_donkeyspace_comment, non_empty_string,
-        repository_context_short_circuits_triage,
+        agent_run_input, command_summary, conventional_commit_title, input_is_donkeyspace_comment,
+        input_issue_is_closed, non_empty_string, parse_porcelain_status,
+        repository_context_short_circuits_triage, required_check_failure_summary,
     };
-    use donkeyspace_core::{Confidence, Outcome, Risk, RunResult};
+    use donkeyspace_core::{Confidence, Outcome, Risk, RunResult, TestResult, TestStatus};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -825,6 +1770,16 @@ mod tests {
             "comment": {
                 "body": "Here are the reproduction steps."
             }
+        })));
+    }
+
+    #[test]
+    fn closed_issue_input_is_not_eligible_for_agent_work() {
+        assert!(input_issue_is_closed(&json!({
+            "issue": {"state": "closed"}
+        })));
+        assert!(!input_issue_is_closed(&json!({
+            "issue": {"state": "open"}
         })));
     }
 
@@ -909,6 +1864,92 @@ mod tests {
 
         assert!(summary.contains("stdout:\nok"));
         assert!(summary.contains("stderr:\nwarning"));
+    }
+
+    #[test]
+    fn required_check_failure_summary_lists_failed_checks() {
+        let summary = required_check_failure_summary(&[
+            TestResult {
+                name: "format".to_string(),
+                command: vec!["cargo".to_string(), "fmt".to_string()],
+                status: TestStatus::Passed,
+                exit_code: Some(0),
+                summary: None,
+            },
+            TestResult {
+                name: "tests".to_string(),
+                command: vec!["cargo".to_string(), "test".to_string()],
+                status: TestStatus::Failed,
+                exit_code: Some(101),
+                summary: Some("stderr:\nfailed".to_string()),
+            },
+        ]);
+
+        assert!(summary.contains("tests (`cargo test`)"));
+        assert!(summary.contains("stderr:\nfailed"));
+        assert!(!summary.contains("format"));
+    }
+
+    #[test]
+    fn conventional_commit_title_uses_docs_for_readme_changes() {
+        let title = conventional_commit_title(
+            &json!({
+                "issue": {
+                    "number": 12,
+                    "title": "Add description to README",
+                    "body": ""
+                }
+            }),
+            &["README.md".to_string()],
+        );
+
+        assert_eq!(title, "docs: update README for issue #12");
+    }
+
+    #[test]
+    fn conventional_commit_title_uses_fix_for_bug_language() {
+        let title = conventional_commit_title(
+            &json!({
+                "issue": {
+                    "number": 13,
+                    "title": "Fix failing login",
+                    "body": ""
+                }
+            }),
+            &["src/auth.rs".to_string()],
+        );
+
+        assert_eq!(title, "fix: implement issue #13");
+    }
+
+    #[test]
+    fn conventional_commit_title_uses_feat_for_add_language() {
+        let title = conventional_commit_title(
+            &json!({
+                "issue": {
+                    "number": 14,
+                    "title": "Add webhook retry endpoint",
+                    "body": ""
+                }
+            }),
+            &["src/routes.rs".to_string()],
+        );
+
+        assert_eq!(title, "feat: implement issue #14");
+    }
+
+    #[test]
+    fn parses_git_porcelain_status_paths() {
+        let paths = parse_porcelain_status(" M README.md\n?? src/main.rs\nR  old.md -> new.md\n");
+
+        assert_eq!(
+            paths,
+            vec![
+                "README.md".to_string(),
+                "src/main.rs".to_string(),
+                "new.md".to_string()
+            ]
+        );
     }
 }
 

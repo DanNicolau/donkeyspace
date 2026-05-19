@@ -56,9 +56,15 @@ Start the local API, worker, and PostgreSQL services:
 docker compose up --build
 ```
 
-To let the worker apply pending GitHub labels and comments, set `DONKEYSPACE_GITHUB_TOKEN` in your environment before starting Compose. Without it, outbound actions remain pending and visible in the dashboard.
+To let the worker clone private repos, push branches, open PRs, and apply pending GitHub labels/comments, set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. Compose automatically reads `.env` from the donkeyspace project directory. If your credentials live elsewhere, pass them explicitly:
 
-Triage defaults to `DONKEYSPACE_TRIAGE_PROVIDER=auto`. If `DONKEYSPACE_LLM_API_KEY` or `OPENROUTER_API_KEY` is present, the worker calls an OpenAI-compatible chat endpoint. The default test configuration is:
+```sh
+docker compose --env-file ../donkeyspace-test-repo/.env up -d --force-recreate worker
+```
+
+Without the token, GitHub writes remain pending and private-repo checkout fails.
+
+Triage defaults to `DONKEYSPACE_TRIAGE_PROVIDER=agent` in Docker Compose. Set `DONKEYSPACE_TRIAGE_PROVIDER=auto` to use an OpenAI-compatible chat endpoint when `DONKEYSPACE_LLM_API_KEY` or `OPENROUTER_API_KEY` is present. The default test configuration for that path is:
 
 ```sh
 DONKEYSPACE_LLM_BASE_URL=https://openrouter.ai/api/v1
@@ -79,7 +85,17 @@ docker compose run --rm --no-deps worker codex login status
 DONKEYSPACE_TRIAGE_PROVIDER=agent docker compose up -d --build worker
 ```
 
-The worker clones the target repository into an ephemeral read-only triage workspace before deciding whether an issue is ready. The current OpenAI-compatible triage path receives bounded excerpts from that checkout. The agentic path runs the configured external agent CLI in the prepared workspace so the agent can use its own file search and read tools, then report through `.donkeyspace/run-result.json`. Tune prompt context with:
+When triage returns `ready`, the worker queues a developer job if `agents.developer.enabled` is true. The default developer command is `donkeyspace-codex-developer`, which runs Codex CLI against the cloned checkout. If it returns `implemented`, donkeyspace commits the changed files, pushes a branch named `donkeyspace/issue-{number}-{job-id}`, opens a GitHub PR with a Conventional Commit title, and moves the issue to `ai:pr-open`.
+
+Before pushing a developer branch, the worker runs every command in `checks.required_commands` from the policy file inside the repository checkout. Each command result is recorded in `command_results` and exposed through `/api/runs/{id}`. If any required command fails or cannot start, donkeyspace marks the developer job failed, moves the issue to `ai:blocked`, and writes the failed command summary to the issue through the GitHub action outbox.
+
+The default local policy uses `git diff --check` because the current worker image is intentionally small. Repo-specific commands such as `cargo test`, `npm test`, or `make test` must be available inside the worker image or wrapped by a custom worker image.
+
+The worker also reconciles ready issues on every poll. If a workflow item is already `ready` and has no queued, leased, or running developer job, the worker queues one from the most recent completed triage input. This covers worker restarts and old ready issues without requiring a new GitHub comment. `DONKEYSPACE_READY_RECONCILE_LIMIT` controls the per-poll batch size and defaults to `1`.
+
+Closed GitHub issues are not eligible for agent work. The API records GitHub's issue state from webhooks and will not queue triage for closed issues. The worker also skips any already-queued closed-issue job before running an agent, and developer jobs verify the current GitHub issue state when `DONKEYSPACE_GITHUB_TOKEN` is available.
+
+The worker clones the target repository into an ephemeral workspace before each agent run. The OpenAI-compatible triage path receives bounded excerpts from that checkout. The external-agent path runs the configured CLI in the prepared workspace so the agent can use its own file search, file read, and edit tools, then report through `.donkeyspace/run-result.json`. Tune prompt context with:
 
 ```sh
 DONKEYSPACE_WORKSPACE_ROOT=/tmp/donkeyspace/workspaces
@@ -104,4 +120,4 @@ Useful local endpoints:
 - `POST /api/runs/{id}/lease`
 - `POST /webhooks/github`
 
-The current workflow supports deterministic, OpenAI-compatible, and external-command triage. A signed `issues.opened` webhook creates a triage run, the worker leases it, marks it running, writes a result, completes the run, records a workflow transition, and creates pending GitHub label/comment actions in the outbound action outbox.
+The current workflow supports deterministic, OpenAI-compatible, and external-command triage plus a first Codex-backed developer path. A signed `issues.opened` webhook creates a triage run, the worker leases it, records the result, updates workflow state, and applies GitHub label/comment actions. Ready issues can now proceed to an agent-authored PR; reviewer-agent and check-gated merge behavior are still future slices.

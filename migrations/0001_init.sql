@@ -23,12 +23,15 @@ CREATE TABLE IF NOT EXISTS workflow_items (
     repository_id BIGINT NOT NULL REFERENCES repositories(id),
     provider_issue_id TEXT NOT NULL,
     issue_number BIGINT NOT NULL,
+    provider_state TEXT NOT NULL DEFAULT 'open',
     current_state TEXT,
     current_labels JSONB NOT NULL DEFAULT '[]'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (repository_id, provider_issue_id)
 );
+
+ALTER TABLE workflow_items ADD COLUMN IF NOT EXISTS provider_state TEXT NOT NULL DEFAULT 'open';
 
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id BIGSERIAL PRIMARY KEY,

@@ -70,6 +70,7 @@ pub struct WorkflowItemInput {
     pub repository_id: i64,
     pub provider_issue_id: String,
     pub issue_number: i64,
+    pub provider_state: String,
     pub current_state: Option<String>,
     pub current_labels: Vec<String>,
 }
@@ -86,6 +87,12 @@ pub struct JobRecord {
     pub result: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ReadyDeveloperCandidate {
+    pub workflow_item_id: i64,
+    pub input: Value,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -116,6 +123,18 @@ pub struct CommandResultInput {
     pub status: String,
     pub exit_code: Option<i32>,
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct CommandResultRecord {
+    pub id: i64,
+    pub job_id: Uuid,
+    pub name: String,
+    pub command: Value,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub summary: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -163,13 +182,15 @@ pub async fn upsert_workflow_item(
             repository_id,
             provider_issue_id,
             issue_number,
+            provider_state,
             current_state,
             current_labels
         )
-        VALUES ($1, $2, $3, $4, $5)
+        VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (repository_id, provider_issue_id)
         DO UPDATE SET
             issue_number = EXCLUDED.issue_number,
+            provider_state = EXCLUDED.provider_state,
             current_state = COALESCE(EXCLUDED.current_state, workflow_items.current_state),
             current_labels = EXCLUDED.current_labels,
             updated_at = now()
@@ -179,6 +200,7 @@ pub async fn upsert_workflow_item(
     .bind(input.repository_id)
     .bind(&input.provider_issue_id)
     .bind(input.issue_number)
+    .bind(&input.provider_state)
     .bind(&input.current_state)
     .bind(labels)
     .fetch_one(pool)
@@ -276,6 +298,49 @@ pub async fn create_job(
     Ok(job)
 }
 
+pub async fn list_ready_developer_candidates(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ReadyDeveloperCandidate>, DbError> {
+    let candidates = sqlx::query_as::<_, ReadyDeveloperCandidate>(
+        r#"
+        SELECT
+            workflow_items.id AS workflow_item_id,
+            latest_triage.input AS input
+        FROM workflow_items
+        JOIN LATERAL (
+            SELECT jobs.input
+            FROM jobs
+            WHERE jobs.workflow_item_id = workflow_items.id
+              AND jobs.role = 'triage'
+              AND jobs.status = 'completed'
+            ORDER BY jobs.created_at DESC
+            LIMIT 1
+        ) AS latest_triage ON true
+        WHERE workflow_items.current_state = 'ready'
+          AND workflow_items.provider_state <> 'closed'
+          AND COALESCE(latest_triage.input #>> '{issue,state}', 'open') <> 'closed'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM jobs developer_jobs
+              WHERE developer_jobs.workflow_item_id = workflow_items.id
+                AND developer_jobs.role = 'developer'
+                AND (
+                    developer_jobs.status IN ('queued', 'leased', 'running')
+                    OR developer_jobs.result->>'blocked_reason' = 'closed issues are not eligible for agent work'
+                )
+          )
+        ORDER BY workflow_items.updated_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(candidates)
+}
+
 pub async fn record_state_transition(
     pool: &PgPool,
     workflow_item_id: i64,
@@ -357,6 +422,25 @@ pub async fn create_command_result(
     .await?;
 
     Ok(())
+}
+
+pub async fn list_job_command_results(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<Vec<CommandResultRecord>, DbError> {
+    let results = sqlx::query_as::<_, CommandResultRecord>(
+        r#"
+        SELECT *
+        FROM command_results
+        WHERE job_id = $1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(results)
 }
 
 pub async fn list_recent_outbound_actions(

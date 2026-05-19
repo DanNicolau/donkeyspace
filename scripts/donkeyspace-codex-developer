@@ -1,0 +1,42 @@
+#!/usr/bin/env sh
+set -eu
+
+INPUT_PATH="${1:-.donkeyspace/run-input.json}"
+SCHEMA_PATH="/app/schemas/run-result.codex-developer.schema.json"
+
+if [ ! -f "$INPUT_PATH" ]; then
+  echo "missing run input: $INPUT_PATH" >&2
+  exit 2
+fi
+
+if [ ! -f "$SCHEMA_PATH" ]; then
+  echo "missing run-result schema: $SCHEMA_PATH" >&2
+  exit 2
+fi
+
+INPUT_ABS="$(node -e "const path=require('path'); console.log(path.resolve(process.argv[1]));" "$INPUT_PATH")"
+REPO_PATH="$(node -e "const fs=require('fs'); const path=require('path'); const inputPath=path.resolve(process.argv[1]); const input=JSON.parse(fs.readFileSync(inputPath,'utf8')); const workspace=path.resolve(path.dirname(inputPath), '..'); const repo=input.workspace.repo_path || 'repo'; console.log(path.isAbsolute(repo) ? repo : path.resolve(workspace, repo));" "$INPUT_PATH")"
+RESULT_PATH="$(node -e "const fs=require('fs'); const path=require('path'); const inputPath=path.resolve(process.argv[1]); const input=JSON.parse(fs.readFileSync(inputPath,'utf8')); const workspace=path.resolve(path.dirname(inputPath), '..'); const result=input.workspace.result_path || '.donkeyspace/run-result.json'; console.log(path.isAbsolute(result) ? result : path.resolve(workspace, result));" "$INPUT_PATH")"
+
+if [ ! -d "$REPO_PATH/.git" ]; then
+  echo "missing git checkout at $REPO_PATH" >&2
+  exit 2
+fi
+
+rm -f "$RESULT_PATH"
+
+codex exec \
+  --cd "$REPO_PATH" \
+  --skip-git-repo-check \
+  --model gpt-5.4-mini \
+  --dangerously-bypass-approvals-and-sandbox \
+  --output-schema "$SCHEMA_PATH" \
+  --output-last-message "$RESULT_PATH" \
+  "You are the Donkeyspace developer agent. Read ${INPUT_ABS}. Implement the issue by modifying files in ${REPO_PATH}. You may inspect and edit the repository checkout, but do not commit, push, open pull requests, or edit files outside the checkout. If the issue is still ambiguous, return needs_info with concrete questions. If blocked, return blocked or needs_human with a reason. If you implement changes, return outcome implemented, include changed_files, and include at least one tests entry; use status not_run with command [\"not_run\"] when no command was run. Return only a valid Donkeyspace run-result JSON object."
+
+if [ ! -s "$RESULT_PATH" ]; then
+  echo "codex did not write $RESULT_PATH" >&2
+  exit 1
+fi
+
+node -e "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))" "$RESULT_PATH"

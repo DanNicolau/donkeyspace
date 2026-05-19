@@ -157,6 +157,58 @@ a {
   margin-top: 6px;
 }
 
+.command-results {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.command-result {
+  background: #f6f8f4;
+  border: 1px solid #dfe3da;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.command-result > div {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.command-result code {
+  color: #46534a;
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.command-result span {
+  color: #68736a;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.command-result span[data-status="failed"] {
+  color: #9b2c2c;
+}
+
+.command-result pre {
+  color: #38443c;
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 .run-row dl,
 .action-row dl {
   display: grid;
