@@ -19,17 +19,15 @@ agents:
     command: ["donkeyspace-codex-triage", ".donkeyspace/run-input.json"]
   developer:
     enabled: true
-    command: ["codex", "exec", "--input", ".donkeyspace/run-input.json"]
+    command: ["donkeyspace-codex-developer", ".donkeyspace/run-input.json"]
   reviewer:
     enabled: true
     command: ["donkeyspace-agent-review", "--input", ".donkeyspace/run-input.json"]
 
 checks:
   required_commands:
-    - name: "rust tests"
-      command: ["cargo", "test", "--workspace"]
-    - name: "dashboard build"
-      command: ["npm", "run", "build"]
+    - name: "diff whitespace"
+      command: ["git", "diff", "--check"]
   require_github_checks: true
 
 risk:

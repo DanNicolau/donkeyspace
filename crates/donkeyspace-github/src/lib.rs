@@ -1,5 +1,5 @@
 use hmac::{Hmac, Mac};
-use octocrab::Octocrab;
+use octocrab::{Octocrab, models::IssueState};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
@@ -82,10 +82,17 @@ impl GitHubClient {
         issue_number: i64,
         label: &str,
     ) -> Result<(), GitHubClientError> {
-        self.client
+        if let Err(error) = self
+            .client
             .issues(owner, repo)
             .remove_label(issue_number as u64, label)
-            .await?;
+            .await
+        {
+            if github_error_status(&error) == Some(404) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -101,6 +108,40 @@ impl GitHubClient {
             .create_comment(issue_number as u64, body)
             .await?;
         Ok(())
+    }
+
+    pub async fn issue_is_closed(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<bool, GitHubClientError> {
+        let issue = self
+            .client
+            .issues(owner, repo)
+            .get(issue_number as u64)
+            .await?;
+        Ok(issue.state == IssueState::Closed)
+    }
+
+    pub async fn create_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        head: &str,
+        base: &str,
+        body: &str,
+    ) -> Result<String, GitHubClientError> {
+        let pull_request = self
+            .client
+            .pulls(owner, repo)
+            .create(title, head, base)
+            .body(body.to_string())
+            .send()
+            .await?;
+
+        Ok(pull_request.html_url.to_string())
     }
 
     async fn ensure_label(
@@ -124,6 +165,13 @@ impl GitHubClient {
             .create_label(label, workflow_label_color(label), "Managed by donkeyspace")
             .await?;
         Ok(())
+    }
+}
+
+fn github_error_status(error: &octocrab::Error) -> Option<u16> {
+    match error {
+        octocrab::Error::GitHub { source, .. } => Some(source.status_code.as_u16()),
+        _ => None,
     }
 }
 

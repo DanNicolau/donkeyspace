@@ -10,8 +10,9 @@ use donkeyspace_core::{AgentRole, LabelState, Policy, WorkflowState, normalize_w
 use donkeyspace_db::{
     DbConfig, JobRecord, PgPool, RepositoryInput, WorkflowItemInput, acquire_job_lease,
     apply_migrations, connect, create_job, get_job, get_workflow_item_state,
-    list_job_outbound_actions, list_job_transitions, list_jobs, list_recent_outbound_actions,
-    record_state_transition, record_webhook_delivery, upsert_repository, upsert_workflow_item,
+    list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
+    list_recent_outbound_actions, record_state_transition, record_webhook_delivery,
+    upsert_repository, upsert_workflow_item,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -140,10 +141,23 @@ async fn api_run(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> im
                 }
             };
 
+            let command_results = match list_job_command_results(pool, id).await {
+                Ok(results) => results,
+                Err(error) => {
+                    tracing::error!(%error, %id, "failed to fetch command results");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError::new("failed to fetch run command results")),
+                    )
+                        .into_response();
+                }
+            };
+
             Json(RunDetail {
                 job,
                 transitions,
                 outbound_actions,
+                command_results,
             })
             .into_response()
         }
@@ -363,6 +377,7 @@ async fn persist_issue_webhook(
             repository_id,
             provider_issue_id: payload.issue.id.to_string(),
             issue_number: payload.issue.number,
+            provider_state: payload.issue.state.clone(),
             current_state: current_state.clone(),
             current_labels: labels,
         },
@@ -382,9 +397,20 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
+    if payload.issue.state == "closed" {
+        tracing::info!(
+            event,
+            action = payload.action,
+            issue_number = payload.issue.number,
+            "closed issue did not queue agent work"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
     if !should_queue_triage(
         event,
         &payload.action,
+        &payload.issue.state,
         current_state.as_deref(),
         payload.comment.as_ref(),
     ) {
@@ -421,9 +447,14 @@ async fn persist_issue_webhook(
 fn should_queue_triage(
     event: &str,
     action: &str,
+    issue_state: &str,
     current_state: Option<&str>,
     comment: Option<&GitHubComment>,
 ) -> bool {
+    if issue_state == "closed" {
+        return false;
+    }
+
     match (event, action) {
         ("issues", "opened" | "edited" | "reopened") => true,
         ("issue_comment", "created" | "edited") => {
@@ -479,6 +510,7 @@ struct GitHubOwner {
 struct GitHubIssue {
     id: i64,
     number: i64,
+    state: String,
     labels: Vec<GitHubLabel>,
 }
 
@@ -503,6 +535,7 @@ struct RunDetail {
     job: JobRecord,
     transitions: Vec<donkeyspace_db::StateTransitionRecord>,
     outbound_actions: Vec<donkeyspace_db::OutboundActionRecord>,
+    command_results: Vec<donkeyspace_db::CommandResultRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -524,7 +557,18 @@ mod tests {
 
     #[test]
     fn issue_opened_queues_triage() {
-        assert!(should_queue_triage("issues", "opened", None, None));
+        assert!(should_queue_triage("issues", "opened", "open", None, None));
+    }
+
+    #[test]
+    fn closed_issue_does_not_queue_triage() {
+        assert!(!should_queue_triage(
+            "issues",
+            "edited",
+            "closed",
+            Some("ready"),
+            None
+        ));
     }
 
     #[test]
@@ -532,6 +576,7 @@ mod tests {
         assert!(!should_queue_triage(
             "issues",
             "labeled",
+            "open",
             Some("needs_info"),
             None
         ));
@@ -542,6 +587,7 @@ mod tests {
         assert!(should_queue_triage(
             "issue_comment",
             "created",
+            "open",
             Some("needs_info"),
             Some(&GitHubComment {
                 body: "Here are the reproduction steps.".to_string(),
@@ -554,6 +600,7 @@ mod tests {
         assert!(should_queue_triage(
             "issue_comment",
             "created",
+            "open",
             Some("blocked"),
             Some(&GitHubComment {
                 body: "I added the missing detail.".to_string(),
@@ -566,6 +613,7 @@ mod tests {
         assert!(should_queue_triage(
             "issue_comment",
             "edited",
+            "open",
             Some("blocked"),
             Some(&GitHubComment {
                 body: "Updated with more details.".to_string(),
@@ -578,6 +626,7 @@ mod tests {
         assert!(!should_queue_triage(
             "issue_comment",
             "created",
+            "open",
             Some("ready"),
             Some(&GitHubComment {
                 body: "Looks good.".to_string(),
@@ -590,6 +639,7 @@ mod tests {
         assert!(!should_queue_triage(
             "issue_comment",
             "created",
+            "open",
             Some("blocked"),
             None,
         ));
@@ -600,6 +650,7 @@ mod tests {
         assert!(!should_queue_triage(
             "issue_comment",
             "created",
+            "open",
             Some("blocked"),
             Some(&GitHubComment {
                 body: "donkeyspace triage needs clarification before this issue can move to implementation.".to_string(),

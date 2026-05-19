@@ -126,9 +126,6 @@ async fn clone_repository(
     workspace_path: &Path,
     github_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let askpass_path = workspace_path.join("git-askpass.sh");
-    write_askpass_script(&askpass_path)?;
-
     let mut command = Command::new("git");
     command
         .arg("clone")
@@ -140,10 +137,12 @@ async fn clone_repository(
         .arg(format!("https://github.com/{owner}/{repo}.git"))
         .arg(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", &askpass_path)
         .stdout(Stdio::null());
 
     if let Some(token) = github_token.filter(|token| !token.trim().is_empty()) {
+        let askpass_path = workspace_path.join("git-askpass.sh");
+        write_askpass_script(&askpass_path)?;
+        command.env("GIT_ASKPASS", &askpass_path);
         command.env("DONKEYSPACE_GIT_TOKEN", token);
     }
 
@@ -156,7 +155,7 @@ async fn clone_repository(
     Ok(())
 }
 
-fn write_askpass_script(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn write_askpass_script(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
         "#!/bin/sh\ncase \"$1\" in\n*Username*) printf '%s' 'x-access-token' ;;\n*Password*) printf '%s' \"$DONKEYSPACE_GIT_TOKEN\" ;;\n*) printf '%s' '' ;;\nesac\n",

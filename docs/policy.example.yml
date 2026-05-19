@@ -22,17 +22,19 @@ agents:
     command: ["donkeyspace-codex-triage", ".donkeyspace/run-input.json"]
   developer:
     enabled: true
-    command: ["codex", "exec", "--input", ".donkeyspace/run-input.json"]
+    command: ["donkeyspace-codex-developer", ".donkeyspace/run-input.json"]
   reviewer:
     enabled: true
     command: ["donkeyspace-agent-review", "--input", ".donkeyspace/run-input.json"]
 
 checks:
   required_commands:
-    - name: "unit tests"
-      command: ["cargo", "test"]
-    - name: "format check"
-      command: ["cargo", "fmt", "--check"]
+    - name: "diff whitespace"
+      command: ["git", "diff", "--check"]
+    - name: "rust tests"
+      command: ["sh", "-lc", "test ! -f Cargo.toml || cargo test --workspace"]
+    - name: "dashboard build"
+      command: ["sh", "-lc", "test ! -f web/package.json || (cd web && npm install && npm run build)"]
   require_github_checks: true
 
 risk:

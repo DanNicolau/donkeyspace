@@ -53,6 +53,22 @@ type OutboundAction = {
   created_at: string;
 };
 
+type CommandResult = {
+  id: number;
+  job_id: string;
+  name: string;
+  command: string[];
+  status: string;
+  exit_code: number | null;
+  summary: string | null;
+  created_at: string;
+};
+
+type RunDetail = {
+  job: Run;
+  command_results: CommandResult[];
+};
+
 const placeholderRuns: Run[] = [
   {
     id: "run_queued",
@@ -81,6 +97,16 @@ async function fetchOutboundActions(): Promise<OutboundAction[]> {
 
   if (!response.ok) {
     throw new Error(`Failed to load outbound actions: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function fetchRunDetail(id: string): Promise<RunDetail> {
+  const response = await fetch(`/api/runs/${id}`);
+
+  if (!response.ok) {
+    throw new Error(`Failed to load run detail: ${response.status}`);
   }
 
   return response.json();
@@ -167,6 +193,7 @@ export function App() {
                     ))}
                   </ul>
                 ) : null}
+                <RunCommandResults runId={run.id} />
               </div>
               <dl>
                 <div>
@@ -229,6 +256,38 @@ export function App() {
   );
 }
 
+function RunCommandResults({ runId }: { runId: string }) {
+  const detailQuery = useQuery({
+    queryKey: ["run-detail", runId],
+    queryFn: () => fetchRunDetail(runId),
+    refetchInterval: 10_000,
+    retry: 1
+  });
+  const commandResults = detailQuery.data?.command_results ?? [];
+
+  if (!commandResults.length) {
+    return null;
+  }
+
+  return (
+    <div className="command-results">
+      {commandResults.map((result) => (
+        <div className="command-result" key={result.id}>
+          <div>
+            <strong>{result.name}</strong>
+            <code>{formatCommand(result.command)}</code>
+          </div>
+          <span data-status={result.status}>
+            {result.status}
+            {result.exit_code === null ? "" : ` ${result.exit_code}`}
+          </span>
+          {result.summary ? <pre>{result.summary}</pre> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function describeAction(action: OutboundAction): string {
   if (action.last_error) {
     return action.last_error;
@@ -251,4 +310,8 @@ function describeAction(action: OutboundAction): string {
 
 function runIssueTitle(run: Run): string {
   return run.input?.issue?.title?.trim() || "Untitled issue";
+}
+
+function formatCommand(command: string[]): string {
+  return command.length ? command.join(" ") : "<empty>";
 }

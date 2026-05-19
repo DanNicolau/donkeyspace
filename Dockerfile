@@ -15,11 +15,13 @@ WORKDIR /app
 COPY .donkeyspace/policy.yml /app/.donkeyspace/policy.yml
 COPY schemas/run-result.schema.json /app/schemas/run-result.schema.json
 COPY schemas/run-result.codex.schema.json /app/schemas/run-result.codex.schema.json
+COPY schemas/run-result.codex-developer.schema.json /app/schemas/run-result.codex-developer.schema.json
 COPY scripts/donkeyspace-codex-triage /usr/local/bin/donkeyspace-codex-triage
+COPY scripts/donkeyspace-codex-developer /usr/local/bin/donkeyspace-codex-developer
 COPY --from=builder /app/target/release/donkeyspace-api /usr/local/bin/donkeyspace-api
 COPY --from=builder /app/target/release/donkeyspace-worker /usr/local/bin/donkeyspace-worker
 
-RUN chmod +x /usr/local/bin/donkeyspace-codex-triage
+RUN chmod +x /usr/local/bin/donkeyspace-codex-triage /usr/local/bin/donkeyspace-codex-developer
 
 EXPOSE 8080
 CMD ["donkeyspace-api"]
