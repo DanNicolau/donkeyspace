@@ -75,6 +75,21 @@ pub struct WorkflowItemInput {
     pub current_labels: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestInput {
+    pub repository_id: i64,
+    pub workflow_item_id: Option<i64>,
+    pub provider_pr_id: String,
+    pub pr_number: i64,
+    pub title: String,
+    pub html_url: String,
+    pub state: String,
+    pub head_ref: String,
+    pub head_sha: Option<String>,
+    pub base_ref: String,
+    pub managed_by_donkeyspace: bool,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct JobRecord {
     pub id: Uuid,
@@ -93,6 +108,12 @@ pub struct JobRecord {
 pub struct ReadyDeveloperCandidate {
     pub workflow_item_id: i64,
     pub input: Value,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkflowItemIssueRecord {
+    pub id: i64,
+    pub current_state: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -247,6 +268,130 @@ pub async fn get_workflow_item_state(
     .flatten();
 
     Ok(state)
+}
+
+pub async fn get_workflow_item_by_issue_number(
+    pool: &PgPool,
+    repository_id: i64,
+    issue_number: i64,
+) -> Result<Option<WorkflowItemIssueRecord>, DbError> {
+    let item = sqlx::query_as::<_, WorkflowItemIssueRecord>(
+        r#"
+        SELECT id, current_state
+        FROM workflow_items
+        WHERE repository_id = $1
+          AND issue_number = $2
+        "#,
+    )
+    .bind(repository_id)
+    .bind(issue_number)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(item)
+}
+
+pub async fn latest_workflow_job_input(
+    pool: &PgPool,
+    workflow_item_id: i64,
+) -> Result<Option<Value>, DbError> {
+    let input = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT input
+        FROM jobs
+        WHERE workflow_item_id = $1
+          AND role IN ('developer', 'triage')
+        ORDER BY
+          CASE WHEN role = 'developer' THEN 0 ELSE 1 END,
+          created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(workflow_item_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(input)
+}
+
+pub async fn upsert_pull_request(pool: &PgPool, input: &PullRequestInput) -> Result<i64, DbError> {
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO pull_requests (
+            repository_id,
+            workflow_item_id,
+            provider_pr_id,
+            pr_number,
+            title,
+            html_url,
+            state,
+            head_ref,
+            head_sha,
+            base_ref,
+            managed_by_donkeyspace
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (repository_id, provider_pr_id)
+        DO UPDATE SET
+            workflow_item_id = COALESCE(EXCLUDED.workflow_item_id, pull_requests.workflow_item_id),
+            pr_number = EXCLUDED.pr_number,
+            title = EXCLUDED.title,
+            html_url = EXCLUDED.html_url,
+            state = EXCLUDED.state,
+            head_ref = EXCLUDED.head_ref,
+            head_sha = EXCLUDED.head_sha,
+            base_ref = EXCLUDED.base_ref,
+            managed_by_donkeyspace = EXCLUDED.managed_by_donkeyspace OR pull_requests.managed_by_donkeyspace,
+            updated_at = now()
+        RETURNING id
+        "#,
+    )
+    .bind(input.repository_id)
+    .bind(input.workflow_item_id)
+    .bind(&input.provider_pr_id)
+    .bind(input.pr_number)
+    .bind(&input.title)
+    .bind(&input.html_url)
+    .bind(&input.state)
+    .bind(&input.head_ref)
+    .bind(&input.head_sha)
+    .bind(&input.base_ref)
+    .bind(input.managed_by_donkeyspace)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(id)
+}
+
+pub async fn reviewer_job_exists_for_pr_head(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    pr_number: i64,
+    head_sha: Option<&str>,
+) -> Result<bool, DbError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM jobs
+            WHERE workflow_item_id = $1
+              AND role = 'reviewer'
+              AND input #>> '{pull_request,number}' = $2
+              AND (
+                $3::text IS NULL
+                OR input #>> '{pull_request,head,sha}' = $3
+              )
+              AND status IN ('queued', 'leased', 'running', 'completed')
+        )
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(pr_number.to_string())
+    .bind(head_sha)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
 }
 
 pub async fn record_webhook_delivery(

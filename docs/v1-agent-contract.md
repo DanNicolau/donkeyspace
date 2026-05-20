@@ -72,6 +72,8 @@ The validation schema lives at `schemas/run-result.schema.json`.
 
 Codex CLI triage uses `schemas/run-result.codex.schema.json` and Codex CLI developer runs use `schemas/run-result.codex-developer.schema.json` for model-facing structured output because OpenAI response-format schemas do not support every JSON Schema feature used by the orchestration schema. The reference wrappers disable Codex's inner bubblewrap sandbox and rely on the worker container boundary for local testing. The orchestrator still applies Rust validation after reading the result file.
 
+Codex CLI reviewer runs use `schemas/run-result.codex-reviewer.schema.json`. Reviewer agents may inspect the PR checkout and diff context, but must not edit files, commit, push, apply labels, or open pull requests.
+
 Required shape:
 
 ```json
@@ -127,6 +129,10 @@ Allowed `risk` values:
 Developer agents modify files in the checkout only. They must not commit, push, apply labels, or open pull requests directly. When a developer result is `implemented`, the worker inspects `git status`, commits actual checkout changes, pushes `donkeyspace/issue-{issue_number}-{job_id_short}`, opens a PR, and transitions the issue to `pr_open`.
 
 Commit and PR titles use Conventional Commit formatting. The current heuristic chooses `docs:` for README or documentation-only changes, `fix:` for bug/failure language, `feat:` for add/create/feature language, and `chore:` otherwise.
+
+## Reviewer PR Behavior
+
+Reviewer agents review donkeyspace-managed PRs after `pull_request` webhooks. A reviewer result of `needs_changes` posts a PR comment and keeps the issue in `pr_open`; it does not automatically requeue implementation in v1. A future role may handle approved PR-comment fixes or reviewer-feedback repair under explicit human approval or policy rules.
 
 ## Failure Handling
 

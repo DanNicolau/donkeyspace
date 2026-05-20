@@ -8,11 +8,12 @@ use axum::{
 };
 use donkeyspace_core::{AgentRole, LabelState, Policy, WorkflowState, normalize_workflow_labels};
 use donkeyspace_db::{
-    DbConfig, JobRecord, PgPool, RepositoryInput, WorkflowItemInput, acquire_job_lease,
-    apply_migrations, connect, create_job, get_job, get_workflow_item_state,
+    DbConfig, JobRecord, PgPool, PullRequestInput, RepositoryInput, WorkflowItemInput,
+    acquire_job_lease, apply_migrations, connect, create_job, get_job,
+    get_workflow_item_by_issue_number, get_workflow_item_state, latest_workflow_job_input,
     list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
     list_recent_outbound_actions, record_state_transition, record_webhook_delivery,
-    upsert_repository, upsert_workflow_item,
+    reviewer_job_exists_for_pr_head, upsert_pull_request, upsert_repository, upsert_workflow_item,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -288,7 +289,7 @@ async fn github_webhook(
         return StatusCode::ACCEPTED;
     };
 
-    match persist_issue_webhook(pool, &state.policy, event, delivery, &body).await {
+    match persist_github_webhook(pool, &state.policy, event, delivery, &body).await {
         Ok(WebhookPersistOutcome::Ignored) => StatusCode::ACCEPTED,
         Ok(WebhookPersistOutcome::Duplicate) => StatusCode::OK,
         Ok(WebhookPersistOutcome::Queued(job)) => {
@@ -319,6 +320,30 @@ fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
     Ok(Policy::from_yaml(&raw)?)
 }
 
+async fn persist_github_webhook(
+    pool: &PgPool,
+    policy: &Policy,
+    event: &str,
+    delivery: &str,
+    body: &[u8],
+) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
+    match event {
+        "issues" | "issue_comment" => {
+            persist_issue_webhook(pool, policy, event, delivery, body).await
+        }
+        "pull_request" => persist_pull_request_webhook(pool, policy, event, delivery, body).await,
+        _ => {
+            let payload: Value = serde_json::from_slice(body)?;
+            let inserted = record_webhook_delivery(pool, None, delivery, event, &payload).await?;
+            Ok(if inserted {
+                WebhookPersistOutcome::Ignored
+            } else {
+                WebhookPersistOutcome::Duplicate
+            })
+        }
+    }
+}
+
 async fn persist_issue_webhook(
     pool: &PgPool,
     policy: &Policy,
@@ -326,16 +351,6 @@ async fn persist_issue_webhook(
     delivery: &str,
     body: &[u8],
 ) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
-    if !matches!(event, "issues" | "issue_comment") {
-        let payload: Value = serde_json::from_slice(body)?;
-        let inserted = record_webhook_delivery(pool, None, delivery, event, &payload).await?;
-        return Ok(if inserted {
-            WebhookPersistOutcome::Ignored
-        } else {
-            WebhookPersistOutcome::Duplicate
-        });
-    }
-
     let payload: GitHubIssueWebhook = serde_json::from_slice(body)?;
     let payload_value: Value = serde_json::from_slice(body)?;
     let repository_id = upsert_repository(
@@ -444,6 +459,134 @@ async fn persist_issue_webhook(
     Ok(WebhookPersistOutcome::Queued(job))
 }
 
+async fn persist_pull_request_webhook(
+    pool: &PgPool,
+    policy: &Policy,
+    event: &str,
+    delivery: &str,
+    body: &[u8],
+) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
+    let payload: GitHubPullRequestWebhook = serde_json::from_slice(body)?;
+    let payload_value: Value = serde_json::from_slice(body)?;
+    let repository_id = upsert_repository(
+        pool,
+        &RepositoryInput {
+            provider: "github".to_string(),
+            owner: payload.repository.owner.login.clone(),
+            name: payload.repository.name.clone(),
+            default_branch: payload.repository.default_branch.clone(),
+        },
+    )
+    .await?;
+
+    let inserted =
+        record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
+    if !inserted {
+        return Ok(WebhookPersistOutcome::Duplicate);
+    }
+
+    let managed = pull_request_is_managed(&payload.pull_request);
+    let linked_issue_number = payload
+        .pull_request
+        .body
+        .as_deref()
+        .and_then(extract_linked_issue_number)
+        .or_else(|| issue_number_from_donkeyspace_branch(&payload.pull_request.head.ref_name));
+    let workflow_item = match linked_issue_number {
+        Some(issue_number) => {
+            get_workflow_item_by_issue_number(pool, repository_id, issue_number).await?
+        }
+        None => None,
+    };
+
+    upsert_pull_request(
+        pool,
+        &PullRequestInput {
+            repository_id,
+            workflow_item_id: workflow_item.as_ref().map(|item| item.id),
+            provider_pr_id: payload.pull_request.id.to_string(),
+            pr_number: payload.pull_request.number,
+            title: payload.pull_request.title.clone(),
+            html_url: payload.pull_request.html_url.clone(),
+            state: payload.pull_request.state.clone(),
+            head_ref: payload.pull_request.head.ref_name.clone(),
+            head_sha: Some(payload.pull_request.head.sha.clone()),
+            base_ref: payload.pull_request.base.ref_name.clone(),
+            managed_by_donkeyspace: managed,
+        },
+    )
+    .await?;
+
+    let Some(workflow_item) = workflow_item else {
+        tracing::info!(
+            action = payload.action,
+            pr_number = payload.pull_request.number,
+            "pull request webhook did not match a known workflow item"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    };
+
+    if !should_queue_reviewer(
+        &payload.action,
+        &payload.pull_request.state,
+        payload.pull_request.draft,
+        managed,
+        policy.agents.reviewer.enabled,
+    ) {
+        tracing::info!(
+            action = payload.action,
+            pr_number = payload.pull_request.number,
+            managed,
+            "pull request webhook did not queue reviewer"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
+    if reviewer_job_exists_for_pr_head(
+        pool,
+        workflow_item.id,
+        payload.pull_request.number,
+        Some(&payload.pull_request.head.sha),
+    )
+    .await?
+    {
+        tracing::info!(
+            pr_number = payload.pull_request.number,
+            head_sha = payload.pull_request.head.sha,
+            "reviewer job already exists for pull request head"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
+    let Some(mut job_input) = latest_workflow_job_input(pool, workflow_item.id).await? else {
+        tracing::info!(
+            pr_number = payload.pull_request.number,
+            "pull request webhook found workflow item without reusable job input"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    };
+    attach_pull_request_input(&mut job_input, payload_value["pull_request"].clone());
+
+    let job = create_job(
+        pool,
+        Some(workflow_item.id),
+        AgentRole::Reviewer.as_str(),
+        &job_input,
+    )
+    .await?;
+    record_state_transition(
+        pool,
+        workflow_item.id,
+        Some(job.id),
+        workflow_item.current_state.as_deref(),
+        "reviewer_queued",
+        "queued reviewer job from pull request webhook",
+    )
+    .await?;
+
+    Ok(WebhookPersistOutcome::Queued(job))
+}
+
 fn should_queue_triage(
     event: &str,
     action: &str,
@@ -471,12 +614,67 @@ fn should_queue_triage(
     }
 }
 
+fn should_queue_reviewer(
+    action: &str,
+    pr_state: &str,
+    draft: bool,
+    managed: bool,
+    reviewer_enabled: bool,
+) -> bool {
+    reviewer_enabled
+        && managed
+        && pr_state == "open"
+        && !draft
+        && matches!(
+            action,
+            "opened" | "synchronize" | "reopened" | "ready_for_review"
+        )
+}
+
 fn is_human_comment(comment: &GitHubComment) -> bool {
     !comment_is_from_donkeyspace(comment)
 }
 
 fn comment_is_from_donkeyspace(comment: &GitHubComment) -> bool {
     comment.body.trim_start().starts_with("donkeyspace ")
+}
+
+fn pull_request_is_managed(pull_request: &GitHubPullRequest) -> bool {
+    pull_request.head.ref_name.starts_with("donkeyspace/issue-")
+        || pull_request
+            .body
+            .as_deref()
+            .map(|body| body.contains("Generated by donkeyspace developer job"))
+            .unwrap_or(false)
+}
+
+fn extract_linked_issue_number(value: &str) -> Option<i64> {
+    for token in
+        value.split(|character: char| !character.is_ascii_alphanumeric() && character != '#')
+    {
+        if let Some(number) = token.strip_prefix('#').and_then(parse_positive_i64) {
+            return Some(number);
+        }
+    }
+
+    None
+}
+
+fn issue_number_from_donkeyspace_branch(branch: &str) -> Option<i64> {
+    let suffix = branch.strip_prefix("donkeyspace/issue-")?;
+    let number = suffix.split('-').next()?;
+    parse_positive_i64(number)
+}
+
+fn parse_positive_i64(value: &str) -> Option<i64> {
+    let number = value.parse::<i64>().ok()?;
+    (number > 0).then_some(number)
+}
+
+fn attach_pull_request_input(input: &mut Value, pull_request: Value) {
+    if let Value::Object(map) = input {
+        map.insert("pull_request".to_string(), pull_request);
+    }
 }
 
 enum WebhookPersistOutcome {
@@ -492,6 +690,13 @@ struct GitHubIssueWebhook {
     issue: GitHubIssue,
     #[serde(default)]
     comment: Option<GitHubComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPullRequestWebhook {
+    action: String,
+    repository: GitHubRepository,
+    pull_request: GitHubPullRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +730,27 @@ struct GitHubComment {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubPullRequest {
+    id: i64,
+    number: i64,
+    title: String,
+    body: Option<String>,
+    html_url: String,
+    state: String,
+    #[serde(default)]
+    draft: bool,
+    head: GitHubPullRequestRef,
+    base: GitHubPullRequestRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPullRequestRef {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct LeaseRequest {
     lease_owner: String,
     lease_seconds: Option<i32>,
@@ -553,7 +779,10 @@ impl ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitHubComment, comment_is_from_donkeyspace, should_queue_triage};
+    use super::{
+        GitHubComment, comment_is_from_donkeyspace, extract_linked_issue_number,
+        issue_number_from_donkeyspace_branch, should_queue_reviewer, should_queue_triage,
+    };
 
     #[test]
     fn issue_opened_queues_triage() {
@@ -663,5 +892,37 @@ mod tests {
         assert!(comment_is_from_donkeyspace(&GitHubComment {
             body: "\n  donkeyspace marked this issue ready for agent implementation.".to_string(),
         }));
+    }
+
+    #[test]
+    fn pull_request_webhook_queues_reviewer_for_managed_open_pr() {
+        assert!(should_queue_reviewer(
+            "synchronize",
+            "open",
+            false,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn pull_request_webhook_skips_unmanaged_or_draft_pr() {
+        assert!(!should_queue_reviewer(
+            "synchronize",
+            "open",
+            false,
+            false,
+            true
+        ));
+        assert!(!should_queue_reviewer("opened", "open", true, true, true));
+    }
+
+    #[test]
+    fn extracts_linked_issue_from_pr_text_and_branch() {
+        assert_eq!(extract_linked_issue_number("Closes #12"), Some(12));
+        assert_eq!(
+            issue_number_from_donkeyspace_branch("donkeyspace/issue-12-019e399e"),
+            Some(12)
+        );
     }
 }

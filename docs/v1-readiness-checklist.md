@@ -79,7 +79,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Handle issue events.
 - [x] Handle issue comment events.
 - [ ] Handle label events.
-- [ ] Handle pull request events.
+- [x] Handle pull request events.
 - [ ] Handle check-suite or check-run events if needed.
 - [x] Create issue comments.
 - [x] Apply and remove labels.
@@ -97,6 +97,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Define command result records.
 - [x] Define agent decision summary records.
 - [ ] Link audit records to GitHub issues, PRs, comments, commits, and branches.
+- [x] Link audit records to donkeyspace-managed PRs.
 - [x] Persist pending outbound GitHub actions for audit before live writes.
 - [ ] Decide log retention defaults.
 - [ ] Decide what data must be redacted.
@@ -126,6 +127,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] Integration test issue triage flow.
 - [ ] Integration test ready issue to PR flow.
 - [ ] Integration test reviewer-agent escalation flow.
+- [ ] Integration test reviewer-agent PR comment flow.
 - [ ] End-to-end test the full one-repo loop in a test repository.
 
 ## Documentation
@@ -148,8 +150,12 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] The system can run a developer agent in an isolated container.
 - [x] The system can open a pull request for a ready issue.
 - [x] The system can run configured checks and record results.
-- [ ] The system can run a reviewer agent on the PR.
+- [x] The system can run a reviewer agent on the PR.
 - [ ] The system can route uncertain or high-risk work to humans.
 - [ ] Humans remain responsible for merge by default.
 - [ ] The dashboard shows enough run history and logs to debug failures.
 - [ ] The project documentation is sufficient for another developer to install and test v1.
+
+## Future Notes
+
+- [ ] Consider a second developer-style role for PR comment fixes or reviewer-feedback repair, gated by human approval or explicit policy rules.

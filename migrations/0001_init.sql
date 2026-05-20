@@ -68,6 +68,26 @@ CREATE TABLE IF NOT EXISTS state_transitions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS pull_requests (
+    id BIGSERIAL PRIMARY KEY,
+    repository_id BIGINT NOT NULL REFERENCES repositories(id),
+    workflow_item_id BIGINT REFERENCES workflow_items(id),
+    provider_pr_id TEXT NOT NULL,
+    pr_number BIGINT NOT NULL,
+    title TEXT NOT NULL,
+    html_url TEXT NOT NULL,
+    state TEXT NOT NULL,
+    head_ref TEXT NOT NULL,
+    head_sha TEXT,
+    base_ref TEXT NOT NULL,
+    managed_by_donkeyspace BOOLEAN NOT NULL DEFAULT false,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (repository_id, provider_pr_id)
+);
+
+CREATE INDEX IF NOT EXISTS pull_requests_workflow_item_id_idx ON pull_requests(workflow_item_id);
+
 CREATE TABLE IF NOT EXISTS policy_snapshots (
     id UUID PRIMARY KEY,
     repository_id BIGINT NOT NULL REFERENCES repositories(id),
