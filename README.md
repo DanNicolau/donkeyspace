@@ -91,6 +91,8 @@ Before pushing a developer branch, the worker runs every command in `checks.requ
 
 The default local policy uses `git diff --check` because the current worker image is intentionally small. Repo-specific commands such as `cargo test`, `npm test`, or `make test` must be available inside the worker image or wrapped by a custom worker image.
 
+When GitHub sends a `pull_request` webhook for a donkeyspace-managed PR, the API links it back to the source issue and queues a reviewer job. The default reviewer command is `donkeyspace-codex-reviewer`. Reviewer jobs fetch the PR head into the ephemeral checkout, receive PR metadata plus changed-file and diff context, and post their result as a PR conversation comment. V1 reviewer findings do not automatically start another developer job.
+
 The worker also reconciles ready issues on every poll. If a workflow item is already `ready` and has no queued, leased, or running developer job, the worker queues one from the most recent completed triage input. This covers worker restarts and old ready issues without requiring a new GitHub comment. `DONKEYSPACE_READY_RECONCILE_LIMIT` controls the per-poll batch size and defaults to `1`.
 
 Closed GitHub issues are not eligible for agent work. The API records GitHub's issue state from webhooks and will not queue triage for closed issues. The worker also skips any already-queued closed-issue job before running an agent, and developer jobs verify the current GitHub issue state when `DONKEYSPACE_GITHUB_TOKEN` is available.

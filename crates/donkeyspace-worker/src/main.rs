@@ -428,6 +428,10 @@ async fn execute_job(
             execute_developer_job(pool, policy, repo_context_config, github_token, running_job)
                 .await?;
         }
+        "reviewer" => {
+            execute_reviewer_job(pool, policy, repo_context_config, github_token, running_job)
+                .await?;
+        }
         unsupported => {
             let result_value = json!({
                 "outcome": "failed",
@@ -892,6 +896,150 @@ async fn current_github_issue_is_closed(
         .await?)
 }
 
+async fn execute_reviewer_job(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    repo_context_config: &RepoContextConfig,
+    github_token: Option<&str>,
+    running_job: JobRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !policy.agents.reviewer.enabled {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Reviewer execution failed.",
+            "reviewer agent is disabled by policy",
+            "reviewer execution failed",
+        )
+        .await?;
+        return Ok(());
+    }
+    if policy.agents.reviewer.command.is_empty() {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Reviewer execution failed.",
+            "reviewer agent command is empty",
+            "reviewer execution failed",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let (enriched_input, repository_context) = match prepare_reviewer_input(
+        &running_job.input,
+        running_job.id,
+        github_token,
+        repo_context_config,
+    )
+    .await
+    {
+        Ok(input) => input,
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Reviewer repository context failed.",
+                &error.to_string(),
+                "reviewer execution failed",
+            )
+            .await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            tracing::warn!(job_id = %running_job.id, "reviewer repository context failed");
+            return Ok(());
+        }
+    };
+
+    let reviewer_result = run_agent_reviewer(
+        pool,
+        policy,
+        &running_job,
+        &enriched_input,
+        repo_context_config,
+    )
+    .await;
+    let mut result = match reviewer_result {
+        Ok(result) => normalize_reviewer_result(result),
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Reviewer execution failed.",
+                &error.to_string(),
+                "reviewer execution failed",
+            )
+            .await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            tracing::warn!(job_id = %running_job.id, "reviewer job failed");
+            return Ok(());
+        }
+    };
+
+    result.changed_files = reviewer_changed_files(&enriched_input);
+    let workflow_state = workflow_state_for_outcome(result.outcome);
+    let result_value = serde_json::to_value(&result)?;
+    if result.outcome == Outcome::Failed {
+        fail_job(pool, running_job.id, &result_value).await?;
+    } else {
+        complete_job(pool, running_job.id, &result_value).await?;
+    }
+    let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+    if let Some(workflow_item_id) = running_job.workflow_item_id {
+        update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(running_job.id),
+            Some(WorkflowState::PrOpen.as_str()),
+            workflow_state.as_str(),
+            "reviewer agent completed",
+        )
+        .await?;
+
+        for action in
+            triage_github_issue_actions(policy, &running_job.input, &result, workflow_state)
+        {
+            create_outbound_action(
+                pool,
+                &OutboundActionInput {
+                    workflow_item_id,
+                    job_id: Some(running_job.id),
+                    provider: "github".to_string(),
+                    action_type: action.action_type,
+                    payload: action.payload,
+                },
+            )
+            .await?;
+        }
+
+        create_outbound_action(
+            pool,
+            &OutboundActionInput {
+                workflow_item_id,
+                job_id: Some(running_job.id),
+                provider: "github".to_string(),
+                action_type: "issue.create_comment".to_string(),
+                payload: json!({
+                    "owner": repository_owner(&running_job.input)?,
+                    "repo": repository_name(&running_job.input)?,
+                    "issue_number": pull_request_number(&running_job.input).unwrap_or_else(|| issue_number(&running_job.input).unwrap_or(0)),
+                    "body": reviewer_comment_body(&result, running_job.id, &repository_context),
+                }),
+            },
+        )
+        .await?;
+    }
+
+    tracing::info!(
+        job_id = %running_job.id,
+        outcome = ?result.outcome,
+        "reviewer job completed"
+    );
+
+    Ok(())
+}
+
 async fn fail_role_job(
     pool: &donkeyspace_db::PgPool,
     running_job: &JobRecord,
@@ -1037,6 +1185,150 @@ async fn run_agent_developer(
     }
 
     Ok(read_run_result(&result_path).await?)
+}
+
+async fn run_agent_reviewer(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    running_job: &JobRecord,
+    input: &Value,
+    repo_context_config: &RepoContextConfig,
+) -> Result<RunResult, Box<dyn std::error::Error>> {
+    let workspace_path = workspace_path(running_job.id, repo_context_config);
+    let donkeyspace_path = workspace_path.join(".donkeyspace");
+    let input_path = donkeyspace_path.join("run-input.json");
+    let result_path = donkeyspace_path.join("run-result.json");
+    let contract_result_path = ".donkeyspace/run-result.json";
+    tokio_fs::create_dir_all(&donkeyspace_path).await?;
+    let run_input = agent_run_input(
+        running_job.id,
+        &running_job.role,
+        input,
+        contract_result_path,
+    );
+    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
+
+    let command = AgentCommand::from_parts(
+        &policy.agents.reviewer.command,
+        &workspace_path,
+        &result_path,
+    )?;
+    let command_result = run_agent_command(&command).await?;
+    record_agent_command_result(pool, running_job.id, "reviewer agent", &command_result).await?;
+
+    if command_result.status != AgentCommandStatus::Passed {
+        return Err(format!(
+            "reviewer agent exited unsuccessfully with code {:?}",
+            command_result.exit_code
+        )
+        .into());
+    }
+
+    Ok(read_run_result(&result_path).await?)
+}
+
+async fn prepare_reviewer_input(
+    input: &Value,
+    job_id: uuid::Uuid,
+    github_token: Option<&str>,
+    repo_context_config: &RepoContextConfig,
+) -> Result<(Value, Value), Box<dyn std::error::Error>> {
+    let mut repository_context =
+        build_repository_context(input, job_id, github_token, repo_context_config).await?;
+    let repo_path = repository_checkout_path(&repository_context)?;
+    checkout_pull_request_head(input, job_id, &repo_path, github_token, repo_context_config)
+        .await?;
+
+    if let Value::Object(map) = &mut repository_context {
+        map.insert("checkout_ref".to_string(), json!("pull_request_head"));
+    }
+
+    let mut enriched = enrich_input_with_repository_context(input, repository_context.clone());
+    let base_ref = pull_request_base_ref(input).unwrap_or_else(|| repository_default_branch(input));
+    let changed_files = git_diff_name_only(&repo_path, &base_ref).await?;
+    let diff_summary = git_diff_summary(&repo_path, &base_ref).await?;
+    let diff = git_diff_patch(&repo_path, &base_ref).await?;
+
+    if let Some(pull_request) = enriched
+        .pointer_mut("/pull_request")
+        .and_then(Value::as_object_mut)
+    {
+        pull_request.insert("changed_files".to_string(), json!(changed_files));
+        pull_request.insert("diff_summary".to_string(), json!(diff_summary));
+        pull_request.insert("diff".to_string(), json!(truncate_chars(&diff, 20_000)));
+    }
+
+    Ok((enriched, repository_context))
+}
+
+async fn checkout_pull_request_head(
+    input: &Value,
+    job_id: uuid::Uuid,
+    repo_path: &Path,
+    github_token: Option<&str>,
+    repo_context_config: &RepoContextConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pr_number =
+        pull_request_number(input).ok_or("reviewer input is missing pull request number")?;
+    let workspace = workspace_path(job_id, repo_context_config);
+    let askpass_path = workspace.join("git-askpass.sh");
+    let token = github_token.filter(|token| !token.trim().is_empty());
+    if token.is_some() {
+        write_askpass_script(&askpass_path)?;
+    }
+    let askpass = token.map(|_| askpass_path.as_path());
+    let pr_ref = format!("pull/{pr_number}/head");
+    run_git(repo_path, &["fetch", "origin", &pr_ref], token, askpass).await?;
+    run_git(
+        repo_path,
+        &["checkout", "--detach", "FETCH_HEAD"],
+        None,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn git_diff_name_only(
+    repo_path: &Path,
+    base_ref: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let base = format!("origin/{base_ref}");
+    let output = run_git(
+        repo_path,
+        &["diff", "--name-only", &base, "HEAD"],
+        None,
+        None,
+    )
+    .await?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+async fn git_diff_summary(
+    repo_path: &Path,
+    base_ref: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base = format!("origin/{base_ref}");
+    run_git(repo_path, &["diff", "--stat", &base, "HEAD"], None, None).await
+}
+
+async fn git_diff_patch(
+    repo_path: &Path,
+    base_ref: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base = format!("origin/{base_ref}");
+    run_git(
+        repo_path,
+        &["diff", "--no-ext-diff", "--unified=80", &base, "HEAD"],
+        None,
+        None,
+    )
+    .await
 }
 
 async fn run_required_commands(
@@ -1373,6 +1665,105 @@ fn developer_pull_request_body(
     )
 }
 
+fn normalize_reviewer_result(mut result: RunResult) -> RunResult {
+    if matches!(
+        result.outcome,
+        Outcome::NeedsChanges | Outcome::NeedsHuman | Outcome::Blocked | Outcome::Failed
+    ) {
+        return result;
+    }
+
+    result.summary = format!(
+        "Reviewer returned unsupported outcome `{:?}`; routing to human review.",
+        result.outcome
+    );
+    result.outcome = Outcome::NeedsHuman;
+    result.confidence = donkeyspace_core::Confidence::Low;
+    result.human_review_reason =
+        Some("Reviewer returned an unsupported outcome for the reviewer role.".to_string());
+    result
+}
+
+fn reviewer_comment_body(
+    result: &RunResult,
+    job_id: uuid::Uuid,
+    repository_context: &Value,
+) -> String {
+    let reason = result
+        .human_review_reason
+        .as_ref()
+        .or(result.blocked_reason.as_ref())
+        .map(|value| format!("\n\nReason:\n{value}"))
+        .unwrap_or_default();
+    let changed_files = result.changed_files.join(", ");
+    let changed_files = if changed_files.is_empty() {
+        "Not reported".to_string()
+    } else {
+        changed_files
+    };
+    let diff_note = repository_context
+        .pointer("/truncated")
+        .and_then(Value::as_bool)
+        .filter(|truncated| *truncated)
+        .map(|_| "\n\nNote: repository context was truncated.")
+        .unwrap_or_default();
+
+    format!(
+        "donkeyspace reviewer result: {}\n\nSummary:\n{}\n\nRisk: {}\nConfidence: {}\nChanged files: {}{}{}\n\nRun: `{}`",
+        outcome_text(result.outcome),
+        result.summary,
+        risk_text(result.risk),
+        confidence_text(result.confidence),
+        changed_files,
+        reason,
+        diff_note,
+        job_id
+    )
+}
+
+fn reviewer_changed_files(input: &Value) -> Vec<String> {
+    input
+        .pointer("/pull_request/changed_files")
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn outcome_text(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Ready => "ready",
+        Outcome::NeedsInfo => "needs_info",
+        Outcome::Implemented => "implemented",
+        Outcome::NeedsChanges => "needs_changes",
+        Outcome::NeedsHuman => "needs_human",
+        Outcome::Blocked => "blocked",
+        Outcome::Failed => "failed",
+    }
+}
+
+fn confidence_text(confidence: donkeyspace_core::Confidence) -> &'static str {
+    match confidence {
+        donkeyspace_core::Confidence::Low => "low",
+        donkeyspace_core::Confidence::Medium => "medium",
+        donkeyspace_core::Confidence::High => "high",
+    }
+}
+
+fn risk_text(risk: donkeyspace_core::Risk) -> &'static str {
+    match risk {
+        donkeyspace_core::Risk::Low => "low",
+        donkeyspace_core::Risk::Medium => "medium",
+        donkeyspace_core::Risk::High => "high",
+        donkeyspace_core::Risk::Unknown => "unknown",
+    }
+}
+
 fn test_status_text(status: TestStatus) -> &'static str {
     match status {
         TestStatus::Passed => "passed",
@@ -1384,6 +1775,20 @@ fn test_status_text(status: TestStatus) -> &'static str {
 
 fn issue_number(input: &Value) -> Option<i64> {
     input.pointer("/issue/number").and_then(Value::as_i64)
+}
+
+fn pull_request_number(input: &Value) -> Option<i64> {
+    input
+        .pointer("/pull_request/number")
+        .and_then(Value::as_i64)
+}
+
+fn pull_request_base_ref(input: &Value) -> Option<String> {
+    input
+        .pointer("/pull_request/base/ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
 }
 
 fn repository_owner(input: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -1558,7 +1963,7 @@ fn agent_run_input(
                 .map(|body| vec![AgentCommentInput { body }])
                 .unwrap_or_default(),
         },
-        pull_request: None,
+        pull_request: input.pointer("/pull_request").cloned(),
         policy: AgentPolicyInput {
             path: env::var("DONKEYSPACE_POLICY_PATH")
                 .unwrap_or_else(|_| ".donkeyspace/policy.yml".to_string()),
@@ -1746,8 +2151,9 @@ struct CreateCommentPayload {
 mod tests {
     use super::{
         agent_run_input, command_summary, conventional_commit_title, input_is_donkeyspace_comment,
-        input_issue_is_closed, non_empty_string, parse_porcelain_status,
+        input_issue_is_closed, non_empty_string, normalize_reviewer_result, parse_porcelain_status,
         repository_context_short_circuits_triage, required_check_failure_summary,
+        reviewer_changed_files, reviewer_comment_body,
     };
     use donkeyspace_core::{Confidence, Outcome, Risk, RunResult, TestResult, TestStatus};
     use serde_json::json;
@@ -1859,6 +2265,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_run_input_includes_pull_request_context() {
+        let input = json!({
+            "repository": {
+                "owner": {"login": "example-owner"},
+                "name": "example-repo",
+                "default_branch": "main"
+            },
+            "issue": {"number": 12, "title": "Update README", "body": ""},
+            "pull_request": {
+                "number": 13,
+                "title": "docs: update README",
+                "changed_files": ["README.md"]
+            }
+        });
+
+        let run_input = agent_run_input(
+            Uuid::nil(),
+            "reviewer",
+            &input,
+            ".donkeyspace/run-result.json",
+        );
+
+        assert_eq!(run_input.pull_request.unwrap()["number"], 13);
+    }
+
+    #[test]
     fn command_summary_includes_stdout_and_stderr() {
         let summary = command_summary("ok", "warning").unwrap();
 
@@ -1888,6 +2320,49 @@ mod tests {
         assert!(summary.contains("tests (`cargo test`)"));
         assert!(summary.contains("stderr:\nfailed"));
         assert!(!summary.contains("format"));
+    }
+
+    #[test]
+    fn reviewer_helpers_report_findings_and_changed_files() {
+        let files = reviewer_changed_files(&json!({
+            "pull_request": {"changed_files": ["README.md", "src/main.rs"]}
+        }));
+        assert_eq!(files, vec!["README.md", "src/main.rs"]);
+
+        let result = RunResult {
+            outcome: Outcome::NeedsChanges,
+            summary: "README wording should be clearer.".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: files,
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+        let body = reviewer_comment_body(&result, Uuid::nil(), &json!({"truncated": false}));
+
+        assert!(body.contains("donkeyspace reviewer result: needs_changes"));
+        assert!(body.contains("README wording should be clearer."));
+        assert!(body.contains("README.md, src/main.rs"));
+    }
+
+    #[test]
+    fn reviewer_unsupported_outcome_routes_to_human() {
+        let normalized = normalize_reviewer_result(RunResult {
+            outcome: Outcome::Ready,
+            summary: "Looks good.".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: None,
+            blocked_reason: None,
+        });
+
+        assert_eq!(normalized.outcome, Outcome::NeedsHuman);
+        assert!(normalized.human_review_reason.is_some());
     }
 
     #[test]
