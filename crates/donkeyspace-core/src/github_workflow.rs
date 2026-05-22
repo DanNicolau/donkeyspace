@@ -36,7 +36,6 @@ pub fn triage_github_issue_actions(
             .state_labels
             .values()
             .filter(|label| *label != target_label)
-            .filter(|label| current_labels.iter().any(|current| current == *label))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -166,12 +165,13 @@ mod tests {
             WorkflowState::Ready,
         );
 
-        assert_eq!(actions.len(), 2);
-        assert_eq!(actions[0].action_type, "issue.add_label");
-        assert_eq!(actions[0].payload["owner"], "owner");
-        assert_eq!(actions[0].payload["repo"], "repo");
-        assert_eq!(actions[0].payload["label"], "ai:ready");
-        assert_eq!(actions[1].action_type, "issue.create_comment");
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].action_type, "issue.remove_labels");
+        assert_eq!(actions[1].action_type, "issue.add_label");
+        assert_eq!(actions[1].payload["owner"], "owner");
+        assert_eq!(actions[1].payload["repo"], "repo");
+        assert_eq!(actions[1].payload["label"], "ai:ready");
+        assert_eq!(actions[2].action_type, "issue.create_comment");
     }
 
     #[test]
@@ -205,7 +205,16 @@ mod tests {
 
         assert_eq!(actions.len(), 3);
         assert_eq!(actions[0].action_type, "issue.remove_labels");
-        assert_eq!(actions[0].payload["labels"], json!(["ai:ready"]));
+        assert_eq!(
+            actions[0].payload["labels"],
+            json!([
+                "ai:blocked",
+                "ai:in-progress",
+                "ai:needs-human",
+                "ai:pr-open",
+                "ai:ready"
+            ])
+        );
         assert_eq!(actions[1].action_type, "issue.add_label");
         assert_eq!(actions[1].payload["label"], "ai:needs-info");
     }
