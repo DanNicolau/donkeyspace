@@ -70,6 +70,7 @@ pub enum Outcome {
     Ready,
     NeedsInfo,
     Implemented,
+    Reviewed,
     NeedsChanges,
     NeedsHuman,
     Blocked,

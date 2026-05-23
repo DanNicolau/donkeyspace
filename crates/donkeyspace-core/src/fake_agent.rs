@@ -75,6 +75,7 @@ pub fn workflow_state_for_outcome(outcome: Outcome) -> WorkflowState {
         Outcome::Ready => WorkflowState::Ready,
         Outcome::NeedsInfo => WorkflowState::NeedsInfo,
         Outcome::Implemented => WorkflowState::PrOpen,
+        Outcome::Reviewed => WorkflowState::PrOpen,
         Outcome::NeedsChanges => WorkflowState::PrOpen,
         Outcome::NeedsHuman => WorkflowState::NeedsHuman,
         Outcome::Blocked | Outcome::Failed => WorkflowState::Blocked,
@@ -164,6 +165,10 @@ mod tests {
         assert_eq!(
             workflow_state_for_outcome(Outcome::Ready),
             WorkflowState::Ready
+        );
+        assert_eq!(
+            workflow_state_for_outcome(Outcome::Reviewed),
+            WorkflowState::PrOpen
         );
     }
 }

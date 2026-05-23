@@ -1668,7 +1668,11 @@ fn developer_pull_request_body(
 fn normalize_reviewer_result(mut result: RunResult) -> RunResult {
     if matches!(
         result.outcome,
-        Outcome::NeedsChanges | Outcome::NeedsHuman | Outcome::Blocked | Outcome::Failed
+        Outcome::Reviewed
+            | Outcome::NeedsChanges
+            | Outcome::NeedsHuman
+            | Outcome::Blocked
+            | Outcome::Failed
     ) {
         return result;
     }
@@ -1740,6 +1744,7 @@ fn outcome_text(outcome: Outcome) -> &'static str {
         Outcome::Ready => "ready",
         Outcome::NeedsInfo => "needs_info",
         Outcome::Implemented => "implemented",
+        Outcome::Reviewed => "reviewed",
         Outcome::NeedsChanges => "needs_changes",
         Outcome::NeedsHuman => "needs_human",
         Outcome::Blocked => "blocked",
@@ -2345,6 +2350,28 @@ mod tests {
         assert!(body.contains("donkeyspace reviewer result: needs_changes"));
         assert!(body.contains("README wording should be clearer."));
         assert!(body.contains("README.md, src/main.rs"));
+    }
+
+    #[test]
+    fn reviewer_reviewed_outcome_is_supported() {
+        let result = RunResult {
+            outcome: Outcome::Reviewed,
+            summary: "No actionable findings.".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: vec!["README.md".to_string()],
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+
+        let normalized = normalize_reviewer_result(result.clone());
+        assert_eq!(normalized.outcome, Outcome::Reviewed);
+
+        let body = reviewer_comment_body(&result, Uuid::nil(), &json!({"truncated": false}));
+        assert!(body.contains("donkeyspace reviewer result: reviewed"));
+        assert!(body.contains("No actionable findings."));
     }
 
     #[test]
