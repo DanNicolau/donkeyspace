@@ -97,6 +97,7 @@ Allowed `outcome` values:
 - `ready` - Triage believes the issue is ready for implementation.
 - `needs_info` - Triage needs human clarification.
 - `implemented` - Developer completed implementation and checks.
+- `reviewed` - Reviewer completed review and found no actionable changes.
 - `needs_changes` - Reviewer found fixable problems that should return to the developer agent.
 - `needs_human` - The agent cannot safely continue without human judgment.
 - `blocked` - The run cannot proceed because of a hard external blocker.
@@ -133,6 +134,8 @@ Commit and PR titles use Conventional Commit formatting. The current heuristic c
 ## Reviewer PR Behavior
 
 Reviewer agents review donkeyspace-managed PRs after `pull_request` webhooks. A reviewer result of `needs_changes` posts a PR comment and keeps the issue in `pr_open`; it does not automatically requeue implementation in v1. A future role may handle approved PR-comment fixes or reviewer-feedback repair under explicit human approval or policy rules.
+
+A reviewer result of `reviewed` also posts a PR comment and leaves the issue in `pr_open`; it is an audit signal, not automatic approval or merge authority in v1.
 
 ## Failure Handling
 

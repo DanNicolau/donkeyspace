@@ -19,6 +19,7 @@
     "outcome": {
       "type": "string",
       "enum": [
+        "reviewed",
         "needs_changes",
         "needs_human",
         "blocked",

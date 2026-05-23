@@ -96,7 +96,7 @@ Default path inside the run workspace:
 
 The result should include:
 
-- `outcome`: `ready`, `needs_info`, `implemented`, `needs_changes`, `needs_human`, `blocked`, or `failed`.
+- `outcome`: `ready`, `needs_info`, `implemented`, `reviewed`, `needs_changes`, `needs_human`, `blocked`, or `failed`.
 - `summary`: short human-readable explanation.
 - `confidence`: `low`, `medium`, or `high`.
 - `risk`: `low`, `medium`, `high`, or `unknown`.

@@ -22,6 +22,7 @@
         "ready",
         "needs_info",
         "implemented",
+        "reviewed",
         "needs_changes",
         "needs_human",
         "blocked",

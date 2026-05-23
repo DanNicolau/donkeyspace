@@ -42,6 +42,7 @@ Expected issue transitions:
 - Triage returns `ready` -> apply `ai:ready`.
 - Developer job starts -> apply `ai:in-progress`.
 - Developer returns `implemented` and opens PR -> apply `ai:pr-open`.
+- Reviewer returns `reviewed` -> keep `ai:pr-open` and post the reviewer summary.
 - Reviewer returns `needs_changes` -> keep `ai:pr-open` and request updates.
 - Reviewer returns `needs_human` -> apply `ai:needs-human`.
 - Any hard blocker -> apply `ai:blocked`.

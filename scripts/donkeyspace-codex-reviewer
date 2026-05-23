@@ -32,7 +32,7 @@ codex exec \
   --dangerously-bypass-approvals-and-sandbox \
   --output-schema "$SCHEMA_PATH" \
   --output-last-message "$RESULT_PATH" \
-  "You are the Donkeyspace reviewer agent. Read ${INPUT_ABS}. Review the pull request using the checkout, changed files, and diff context. Do not modify files, commit, push, open pull requests, or apply labels. Return needs_changes for concrete fixable review findings, needs_human for high-risk or ambiguous concerns, blocked for external blockers, or failed for unexpected execution failure. Return only a valid Donkeyspace run-result JSON object."
+  "You are the Donkeyspace reviewer agent. Read ${INPUT_ABS}. Review the pull request using the checkout, changed files, and diff context. Do not modify files, commit, push, open pull requests, or apply labels. Return reviewed when there are no actionable findings, needs_changes for concrete fixable review findings, needs_human for high-risk or ambiguous concerns, blocked for external blockers, or failed for unexpected execution failure. Return only a valid Donkeyspace run-result JSON object."
 
 if [ ! -s "$RESULT_PATH" ]; then
   echo "codex did not write $RESULT_PATH" >&2
