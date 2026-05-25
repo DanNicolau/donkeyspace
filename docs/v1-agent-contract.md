@@ -21,6 +21,8 @@ agents:
     command: ["donkeyspace-codex-developer", ".donkeyspace/run-input.json"]
   reviewer:
     command: ["donkeyspace-agent-review", "--input", ".donkeyspace/run-input.json"]
+  repair:
+    command: ["donkeyspace-codex-repair", ".donkeyspace/run-input.json"]
 ```
 
 ## Run Input
@@ -63,6 +65,7 @@ Role-specific notes:
 - Triage jobs receive issue title, body, labels, recent comments, and bounded read-only repository context.
 - Developer jobs receive issue context, policy checks, and a writable repository checkout path.
 - Reviewer jobs receive issue context, PR metadata, diff summary, changed files, and check status.
+- Repair jobs receive issue context, PR metadata, and merge-conflict details after the worker attempts to merge the base branch into the PR branch.
 
 ## Run Result
 
@@ -136,6 +139,10 @@ Commit and PR titles use Conventional Commit formatting. The current heuristic c
 Reviewer agents review donkeyspace-managed PRs after `pull_request` webhooks. A reviewer result of `needs_changes` posts a PR comment and keeps the issue in `pr_open`; it does not automatically requeue implementation in v1. A future role may handle approved PR-comment fixes or reviewer-feedback repair under explicit human approval or policy rules.
 
 A reviewer result of `reviewed` also posts a PR comment and leaves the issue in `pr_open`; it is an audit signal, not automatic approval or merge authority in v1.
+
+## Repair PR Behavior
+
+Repair agents resolve merge conflicts on donkeyspace-managed PRs after default-branch `push` webhooks. The worker checks out the PR branch, attempts to merge the current base branch, and invokes the repair agent only when Git reports conflicted files. Repair agents may edit the checkout but must not commit, push, open pull requests, or apply labels directly; donkeyspace commits and pushes successful repairs to the existing PR branch.
 
 ## Failure Handling
 

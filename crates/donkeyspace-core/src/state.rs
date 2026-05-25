@@ -7,6 +7,7 @@ pub enum AgentRole {
     Triage,
     Developer,
     Reviewer,
+    Repair,
 }
 
 impl AgentRole {
@@ -15,6 +16,7 @@ impl AgentRole {
             Self::Triage => "triage",
             Self::Developer => "developer",
             Self::Reviewer => "reviewer",
+            Self::Repair => "repair",
         }
     }
 }

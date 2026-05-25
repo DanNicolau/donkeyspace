@@ -40,12 +40,23 @@ pub struct AgentConfig {
     pub triage: AgentRoleConfig,
     pub developer: AgentRoleConfig,
     pub reviewer: AgentRoleConfig,
+    #[serde(default)]
+    pub repair: AgentRoleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentRoleConfig {
     pub enabled: bool,
     pub command: Vec<String>,
+}
+
+impl Default for AgentRoleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -99,6 +110,43 @@ mod tests {
 
         assert_eq!(policy.version, 1);
         assert!(policy.agents.triage.enabled);
+        assert!(policy.agents.repair.enabled);
         assert_eq!(policy.workflow.state_labels["ready"], "ai:ready");
+    }
+
+    #[test]
+    fn repair_agent_defaults_disabled_for_older_policy_files() {
+        let policy = Policy::from_yaml(
+            r#"
+version: 1
+workflow:
+  state_labels:
+    ready: "ai:ready"
+agents:
+  triage:
+    enabled: true
+    command: ["triage"]
+  developer:
+    enabled: true
+    command: ["developer"]
+  reviewer:
+    enabled: true
+    command: ["reviewer"]
+checks: {}
+risk:
+  default: "unknown"
+  agent_classification: true
+  route_unknown_to_human: true
+  route_high_to_human: true
+automation:
+  max_concurrent_jobs: 1
+  retry_failed_jobs: false
+  auto_merge: false
+"#,
+        )
+        .unwrap();
+
+        assert!(!policy.agents.repair.enabled);
+        assert!(policy.agents.repair.command.is_empty());
     }
 }

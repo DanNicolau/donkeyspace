@@ -29,6 +29,7 @@ V1 should subscribe to these GitHub events:
 - `pull_request.synchronize`: schedule reviewer agent for donkeyspace-managed PRs.
 - `pull_request.reopened`: schedule reviewer agent for donkeyspace-managed PRs.
 - `pull_request.ready_for_review`: schedule reviewer agent for donkeyspace-managed PRs.
+- `push` to the default branch: schedule repair checks for open donkeyspace-managed PRs targeting that branch.
 - `check_run.completed` or `check_suite.completed`: update required-check status for donkeyspace-managed PRs.
 
 Webhook delivery IDs should be recorded for idempotency.
@@ -42,6 +43,7 @@ Expected issue transitions:
 - Triage returns `ready` -> apply `ai:ready`.
 - Developer job starts -> apply `ai:in-progress`.
 - Developer returns `implemented` and opens PR -> apply `ai:pr-open`.
+- Default branch push creates a merge conflict for a managed PR -> run repair, then push to the existing PR branch.
 - Reviewer returns `reviewed` -> keep `ai:pr-open` and post the reviewer summary.
 - Reviewer returns `needs_changes` -> keep `ai:pr-open` and request updates.
 - Reviewer returns `needs_human` -> apply `ai:needs-human`.

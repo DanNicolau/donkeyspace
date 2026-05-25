@@ -17,13 +17,15 @@ COPY schemas/run-result.schema.json /app/schemas/run-result.schema.json
 COPY schemas/run-result.codex.schema.json /app/schemas/run-result.codex.schema.json
 COPY schemas/run-result.codex-developer.schema.json /app/schemas/run-result.codex-developer.schema.json
 COPY schemas/run-result.codex-reviewer.schema.json /app/schemas/run-result.codex-reviewer.schema.json
+COPY schemas/run-result.codex-repair.schema.json /app/schemas/run-result.codex-repair.schema.json
 COPY scripts/donkeyspace-codex-triage /usr/local/bin/donkeyspace-codex-triage
 COPY scripts/donkeyspace-codex-developer /usr/local/bin/donkeyspace-codex-developer
 COPY scripts/donkeyspace-codex-reviewer /usr/local/bin/donkeyspace-codex-reviewer
+COPY scripts/donkeyspace-codex-repair /usr/local/bin/donkeyspace-codex-repair
 COPY --from=builder /app/target/release/donkeyspace-api /usr/local/bin/donkeyspace-api
 COPY --from=builder /app/target/release/donkeyspace-worker /usr/local/bin/donkeyspace-worker
 
-RUN chmod +x /usr/local/bin/donkeyspace-codex-triage /usr/local/bin/donkeyspace-codex-developer /usr/local/bin/donkeyspace-codex-reviewer
+RUN chmod +x /usr/local/bin/donkeyspace-codex-triage /usr/local/bin/donkeyspace-codex-developer /usr/local/bin/donkeyspace-codex-reviewer /usr/local/bin/donkeyspace-codex-repair
 
 EXPOSE 8080
 CMD ["donkeyspace-api"]

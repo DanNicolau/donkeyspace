@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     head_ref TEXT NOT NULL,
     head_sha TEXT,
     base_ref TEXT NOT NULL,
+    base_sha TEXT,
     managed_by_donkeyspace BOOLEAN NOT NULL DEFAULT false,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -87,6 +88,8 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 );
 
 CREATE INDEX IF NOT EXISTS pull_requests_workflow_item_id_idx ON pull_requests(workflow_item_id);
+
+ALTER TABLE pull_requests ADD COLUMN IF NOT EXISTS base_sha TEXT;
 
 CREATE TABLE IF NOT EXISTS policy_snapshots (
     id UUID PRIMARY KEY,
