@@ -87,6 +87,7 @@ pub struct PullRequestInput {
     pub head_ref: String,
     pub head_sha: Option<String>,
     pub base_ref: String,
+    pub base_sha: Option<String>,
     pub managed_by_donkeyspace: bool,
 }
 
@@ -107,6 +108,20 @@ pub struct JobRecord {
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ReadyDeveloperCandidate {
     pub workflow_item_id: i64,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RepairCandidate {
+    pub workflow_item_id: i64,
+    pub pr_number: i64,
+    pub title: String,
+    pub html_url: String,
+    pub state: String,
+    pub head_ref: String,
+    pub head_sha: Option<String>,
+    pub base_ref: String,
+    pub base_sha: Option<String>,
     pub input: Value,
 }
 
@@ -170,6 +185,19 @@ pub struct OutboundActionRecord {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ManagedPullRequestRecord {
+    pub workflow_item_id: i64,
+    pub pr_number: i64,
+    pub title: String,
+    pub html_url: String,
+    pub state: String,
+    pub head_ref: String,
+    pub head_sha: Option<String>,
+    pub base_ref: String,
+    pub base_sha: Option<String>,
 }
 
 pub async fn upsert_repository(pool: &PgPool, input: &RepositoryInput) -> Result<i64, DbError> {
@@ -328,9 +356,10 @@ pub async fn upsert_pull_request(pool: &PgPool, input: &PullRequestInput) -> Res
             head_ref,
             head_sha,
             base_ref,
+            base_sha,
             managed_by_donkeyspace
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (repository_id, provider_pr_id)
         DO UPDATE SET
             workflow_item_id = COALESCE(EXCLUDED.workflow_item_id, pull_requests.workflow_item_id),
@@ -341,6 +370,7 @@ pub async fn upsert_pull_request(pool: &PgPool, input: &PullRequestInput) -> Res
             head_ref = EXCLUDED.head_ref,
             head_sha = EXCLUDED.head_sha,
             base_ref = EXCLUDED.base_ref,
+            base_sha = EXCLUDED.base_sha,
             managed_by_donkeyspace = EXCLUDED.managed_by_donkeyspace OR pull_requests.managed_by_donkeyspace,
             updated_at = now()
         RETURNING id
@@ -356,11 +386,83 @@ pub async fn upsert_pull_request(pool: &PgPool, input: &PullRequestInput) -> Res
     .bind(&input.head_ref)
     .bind(&input.head_sha)
     .bind(&input.base_ref)
+    .bind(&input.base_sha)
     .bind(input.managed_by_donkeyspace)
     .fetch_one(pool)
     .await?;
 
     Ok(id)
+}
+
+pub async fn list_open_managed_pull_requests_for_base(
+    pool: &PgPool,
+    repository_id: i64,
+    base_ref: &str,
+) -> Result<Vec<ManagedPullRequestRecord>, DbError> {
+    let rows = sqlx::query_as::<_, ManagedPullRequestRecord>(
+        r#"
+        SELECT
+            workflow_item_id,
+            pr_number,
+            title,
+            html_url,
+            state,
+            head_ref,
+            head_sha,
+            base_ref,
+            base_sha
+        FROM pull_requests
+        WHERE repository_id = $1
+          AND base_ref = $2
+          AND state = 'open'
+          AND managed_by_donkeyspace = true
+          AND workflow_item_id IS NOT NULL
+        ORDER BY updated_at ASC
+        "#,
+    )
+    .bind(repository_id)
+    .bind(base_ref)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn repair_job_exists_for_pr_base(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    pr_number: i64,
+    head_sha: Option<&str>,
+    base_sha: Option<&str>,
+) -> Result<bool, DbError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM jobs
+            WHERE workflow_item_id = $1
+              AND role = 'repair'
+              AND input #>> '{pull_request,number}' = $2
+              AND (
+                $3::text IS NULL
+                OR input #>> '{pull_request,head,sha}' = $3
+              )
+              AND (
+                $4::text IS NULL
+                OR input #>> '{pull_request,base,sha}' = $4
+              )
+              AND status IN ('queued', 'leased', 'running', 'completed')
+        )
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(pr_number.to_string())
+    .bind(head_sha)
+    .bind(base_sha)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
 }
 
 pub async fn reviewer_job_exists_for_pr_head(
@@ -476,6 +578,64 @@ pub async fn list_ready_developer_candidates(
                 )
           )
         ORDER BY workflow_items.updated_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(candidates)
+}
+
+pub async fn list_repair_candidates(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<RepairCandidate>, DbError> {
+    let candidates = sqlx::query_as::<_, RepairCandidate>(
+        r#"
+        SELECT
+            pull_requests.workflow_item_id AS workflow_item_id,
+            pull_requests.pr_number,
+            pull_requests.title,
+            pull_requests.html_url,
+            pull_requests.state,
+            pull_requests.head_ref,
+            pull_requests.head_sha,
+            pull_requests.base_ref,
+            pull_requests.base_sha,
+            latest_input.input AS input
+        FROM pull_requests
+        JOIN LATERAL (
+            SELECT jobs.input
+            FROM jobs
+            WHERE jobs.workflow_item_id = pull_requests.workflow_item_id
+              AND jobs.role IN ('developer', 'triage')
+            ORDER BY
+              CASE WHEN role = 'developer' THEN 0 ELSE 1 END,
+              created_at DESC
+            LIMIT 1
+        ) AS latest_input ON true
+        WHERE pull_requests.workflow_item_id IS NOT NULL
+          AND pull_requests.state = 'open'
+          AND pull_requests.managed_by_donkeyspace = true
+          AND NOT EXISTS (
+              SELECT 1
+              FROM jobs repair_jobs
+              WHERE repair_jobs.workflow_item_id = pull_requests.workflow_item_id
+                AND repair_jobs.role = 'repair'
+                AND repair_jobs.input #>> '{pull_request,number}' = pull_requests.pr_number::text
+                AND (
+                    pull_requests.head_sha IS NULL
+                    OR repair_jobs.input #>> '{pull_request,head,sha}' = pull_requests.head_sha
+                )
+                AND (
+                    pull_requests.base_sha IS NULL
+                    OR repair_jobs.input #>> '{pull_request,base,sha}' = pull_requests.base_sha
+                )
+                AND repair_jobs.status IN ('queued', 'leased', 'running', 'completed')
+          )
+        ORDER BY pull_requests.updated_at ASC
         LIMIT $1
         "#,
     )

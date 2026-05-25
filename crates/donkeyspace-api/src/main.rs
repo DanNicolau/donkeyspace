@@ -12,11 +12,12 @@ use donkeyspace_db::{
     acquire_job_lease, apply_migrations, connect, create_job, get_job,
     get_workflow_item_by_issue_number, get_workflow_item_state, latest_workflow_job_input,
     list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
-    list_recent_outbound_actions, record_state_transition, record_webhook_delivery,
+    list_open_managed_pull_requests_for_base, list_recent_outbound_actions,
+    record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
     reviewer_job_exists_for_pr_head, upsert_pull_request, upsert_repository, upsert_workflow_item,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{env, fs, net::SocketAddr, sync::Arc};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -332,6 +333,7 @@ async fn persist_github_webhook(
             persist_issue_webhook(pool, policy, event, delivery, body).await
         }
         "pull_request" => persist_pull_request_webhook(pool, policy, event, delivery, body).await,
+        "push" => persist_push_webhook(pool, event, delivery, body).await,
         _ => {
             let payload: Value = serde_json::from_slice(body)?;
             let inserted = record_webhook_delivery(pool, None, delivery, event, &payload).await?;
@@ -512,6 +514,7 @@ async fn persist_pull_request_webhook(
             head_ref: payload.pull_request.head.ref_name.clone(),
             head_sha: Some(payload.pull_request.head.sha.clone()),
             base_ref: payload.pull_request.base.ref_name.clone(),
+            base_sha: Some(payload.pull_request.base.sha.clone()),
             managed_by_donkeyspace: managed,
         },
     )
@@ -585,6 +588,108 @@ async fn persist_pull_request_webhook(
     .await?;
 
     Ok(WebhookPersistOutcome::Queued(job))
+}
+
+async fn persist_push_webhook(
+    pool: &PgPool,
+    event: &str,
+    delivery: &str,
+    body: &[u8],
+) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
+    let payload: GitHubPushWebhook = serde_json::from_slice(body)?;
+    let payload_value: Value = serde_json::from_slice(body)?;
+    let repository_id = upsert_repository(
+        pool,
+        &RepositoryInput {
+            provider: "github".to_string(),
+            owner: payload.repository.owner.login,
+            name: payload.repository.name,
+            default_branch: payload.repository.default_branch.clone(),
+        },
+    )
+    .await?;
+
+    let inserted =
+        record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
+    if !inserted {
+        return Ok(WebhookPersistOutcome::Duplicate);
+    }
+
+    let Some(branch) = payload.git_ref.strip_prefix("refs/heads/") else {
+        return Ok(WebhookPersistOutcome::Ignored);
+    };
+    if branch != payload.repository.default_branch {
+        tracing::info!(
+            branch,
+            default_branch = payload.repository.default_branch,
+            "push webhook ignored for non-default branch"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
+    let candidates = list_open_managed_pull_requests_for_base(pool, repository_id, branch).await?;
+    let mut queued = None;
+
+    for pull_request in candidates {
+        if repair_job_exists_for_pr_base(
+            pool,
+            pull_request.workflow_item_id,
+            pull_request.pr_number,
+            pull_request.head_sha.as_deref(),
+            Some(&payload.after),
+        )
+        .await?
+        {
+            continue;
+        }
+
+        let Some(mut job_input) =
+            latest_workflow_job_input(pool, pull_request.workflow_item_id).await?
+        else {
+            continue;
+        };
+        attach_pull_request_input(
+            &mut job_input,
+            json!({
+                "number": pull_request.pr_number,
+                "title": pull_request.title,
+                "body": null,
+                "html_url": pull_request.html_url,
+                "state": pull_request.state,
+                "draft": false,
+                "head": {
+                    "ref": pull_request.head_ref,
+                    "sha": pull_request.head_sha,
+                },
+                "base": {
+                    "ref": pull_request.base_ref,
+                    "sha": payload.after,
+                },
+            }),
+        );
+
+        let job = create_job(
+            pool,
+            Some(pull_request.workflow_item_id),
+            AgentRole::Repair.as_str(),
+            &job_input,
+        )
+        .await?;
+        record_state_transition(
+            pool,
+            pull_request.workflow_item_id,
+            Some(job.id),
+            Some(WorkflowState::PrOpen.as_str()),
+            "repair_queued",
+            "queued repair check after base branch push",
+        )
+        .await?;
+        queued.get_or_insert(job);
+    }
+
+    Ok(queued
+        .map(WebhookPersistOutcome::Queued)
+        .unwrap_or(WebhookPersistOutcome::Ignored))
 }
 
 fn should_queue_triage(
@@ -697,6 +802,14 @@ struct GitHubPullRequestWebhook {
     action: String,
     repository: GitHubRepository,
     pull_request: GitHubPullRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPushWebhook {
+    #[serde(rename = "ref")]
+    git_ref: String,
+    after: String,
+    repository: GitHubRepository,
 }
 
 #[derive(Debug, Deserialize)]

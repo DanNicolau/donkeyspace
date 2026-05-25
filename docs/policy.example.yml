@@ -26,6 +26,9 @@ agents:
   reviewer:
     enabled: true
     command: ["donkeyspace-codex-reviewer", ".donkeyspace/run-input.json"]
+  repair:
+    enabled: true
+    command: ["donkeyspace-codex-repair", ".donkeyspace/run-input.json"]
 
 checks:
   required_commands:

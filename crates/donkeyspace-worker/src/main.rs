@@ -1,15 +1,16 @@
 use clap::Parser;
 use donkeyspace_core::policy::RequiredCommand;
 use donkeyspace_core::{
-    Outcome, Policy, RunResult, TestResult, TestStatus, WorkflowState, fake_triage_issue,
-    triage_github_issue_actions, workflow_state_for_outcome,
+    Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus, WorkflowState,
+    fake_triage_issue, triage_github_issue_actions, workflow_state_for_outcome,
 };
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
     acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
     create_job, create_outbound_action, fail_job, list_pending_outbound_actions,
-    list_ready_developer_candidates, mark_job_running, mark_outbound_action_completed,
-    mark_outbound_action_failed, record_state_transition, update_workflow_item_state,
+    list_ready_developer_candidates, list_repair_candidates, mark_job_running,
+    mark_outbound_action_completed, mark_outbound_action_failed, record_state_transition,
+    update_workflow_item_state,
 };
 use donkeyspace_github::GitHubClient;
 use donkeyspace_runner::{AgentCommand, AgentCommandStatus, read_run_result, run_agent_command};
@@ -81,6 +82,8 @@ struct Args {
     repo_context_max_files: usize,
     #[arg(long, env = "DONKEYSPACE_READY_RECONCILE_LIMIT", default_value_t = 1)]
     ready_reconcile_limit: i64,
+    #[arg(long, env = "DONKEYSPACE_REPAIR_RECONCILE_LIMIT", default_value_t = 1)]
+    repair_reconcile_limit: i64,
 }
 
 #[tokio::main]
@@ -141,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &args.worker_id,
                 args.lease_seconds,
                 args.ready_reconcile_limit,
+                args.repair_reconcile_limit,
             )
             .await?;
         }
@@ -160,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &args.worker_id,
                 args.lease_seconds,
                 args.ready_reconcile_limit,
+                args.repair_reconcile_limit,
             )
             .await?;
         }
@@ -178,8 +183,10 @@ async fn poll_once(
     worker_id: &str,
     lease_seconds: i32,
     ready_reconcile_limit: i64,
+    repair_reconcile_limit: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     reconcile_ready_developer_jobs(pool, policy, ready_reconcile_limit).await?;
+    reconcile_pr_repair_jobs(pool, policy, repair_reconcile_limit).await?;
 
     match acquire_next_queued_job(pool, worker_id, lease_seconds).await? {
         Some(job) => {
@@ -252,6 +259,89 @@ async fn reconcile_ready_developer_jobs(
     }
 
     Ok(())
+}
+
+async fn reconcile_pr_repair_jobs(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    limit: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !policy.agents.repair.enabled {
+        return Ok(());
+    }
+
+    let limit = limit.clamp(0, 50);
+    if limit == 0 {
+        return Ok(());
+    }
+
+    for candidate in list_repair_candidates(pool, limit).await? {
+        let mut input = candidate.input;
+        attach_repair_pull_request_input(
+            &mut input,
+            candidate.pr_number,
+            candidate.title,
+            candidate.html_url,
+            candidate.state,
+            candidate.head_ref,
+            candidate.head_sha,
+            candidate.base_ref,
+            candidate.base_sha,
+        );
+
+        let job = create_job(pool, Some(candidate.workflow_item_id), "repair", &input).await?;
+        record_state_transition(
+            pool,
+            candidate.workflow_item_id,
+            Some(job.id),
+            Some(WorkflowState::PrOpen.as_str()),
+            "repair_queued",
+            "queued repair check during PR reconciliation",
+        )
+        .await?;
+
+        tracing::info!(
+            workflow_item_id = candidate.workflow_item_id,
+            repair_job_id = %job.id,
+            "queued missing repair check for managed pull request"
+        );
+    }
+
+    Ok(())
+}
+
+fn attach_repair_pull_request_input(
+    input: &mut Value,
+    pr_number: i64,
+    title: String,
+    html_url: String,
+    state: String,
+    head_ref: String,
+    head_sha: Option<String>,
+    base_ref: String,
+    base_sha: Option<String>,
+) {
+    if let Value::Object(map) = input {
+        map.insert(
+            "pull_request".to_string(),
+            json!({
+                "number": pr_number,
+                "title": title,
+                "body": null,
+                "html_url": html_url,
+                "state": state,
+                "draft": false,
+                "head": {
+                    "ref": head_ref,
+                    "sha": head_sha,
+                },
+                "base": {
+                    "ref": base_ref,
+                    "sha": base_sha,
+                },
+            }),
+        );
+    }
 }
 
 async fn execute_job(
@@ -430,6 +520,10 @@ async fn execute_job(
         }
         "reviewer" => {
             execute_reviewer_job(pool, policy, repo_context_config, github_token, running_job)
+                .await?;
+        }
+        "repair" => {
+            execute_repair_job(pool, policy, repo_context_config, github_token, running_job)
                 .await?;
         }
         unsupported => {
@@ -1040,6 +1134,301 @@ async fn execute_reviewer_job(
     Ok(())
 }
 
+async fn execute_repair_job(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    repo_context_config: &RepoContextConfig,
+    github_token: Option<&str>,
+    running_job: JobRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !policy.agents.repair.enabled {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Repair execution failed.",
+            "repair agent is disabled by policy",
+            "repair execution failed",
+        )
+        .await?;
+        return Ok(());
+    }
+    if policy.agents.repair.command.is_empty() {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Repair execution failed.",
+            "repair agent command is empty",
+            "repair execution failed",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let repair_input = match prepare_repair_input(
+        &running_job.input,
+        running_job.id,
+        github_token,
+        repo_context_config,
+    )
+    .await
+    {
+        Ok(input) => input,
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Repair repository context failed.",
+                &error.to_string(),
+                "repair execution failed",
+            )
+            .await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            tracing::warn!(job_id = %running_job.id, "repair repository context failed");
+            return Ok(());
+        }
+    };
+
+    if repair_input.conflicted_files.is_empty() {
+        let result = RunResult {
+            outcome: Outcome::Reviewed,
+            summary: "Pull request branch merged the current base branch without conflicts."
+                .to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+        let result_value = serde_json::to_value(&result)?;
+        complete_job(pool, running_job.id, &result_value).await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+        if let Some(workflow_item_id) = running_job.workflow_item_id {
+            update_workflow_item_state(pool, workflow_item_id, WorkflowState::PrOpen.as_str())
+                .await?;
+            record_state_transition(
+                pool,
+                workflow_item_id,
+                Some(running_job.id),
+                Some(WorkflowState::PrOpen.as_str()),
+                WorkflowState::PrOpen.as_str(),
+                "repair check found no merge conflict",
+            )
+            .await?;
+        }
+
+        tracing::info!(job_id = %running_job.id, "repair job found no conflict");
+        return Ok(());
+    }
+
+    if let Some(workflow_item_id) = running_job.workflow_item_id {
+        update_workflow_item_state(pool, workflow_item_id, WorkflowState::InProgress.as_str())
+            .await?;
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(running_job.id),
+            Some(WorkflowState::PrOpen.as_str()),
+            WorkflowState::InProgress.as_str(),
+            "repair agent started",
+        )
+        .await?;
+    }
+
+    let repair_result = run_agent_repair(
+        pool,
+        policy,
+        &running_job,
+        &repair_input.enriched_input,
+        repo_context_config,
+    )
+    .await;
+    let mut result = match repair_result {
+        Ok(result) => result,
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Repair execution failed.",
+                &error.to_string(),
+                "repair execution failed",
+            )
+            .await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            tracing::warn!(job_id = %running_job.id, "repair job failed");
+            return Ok(());
+        }
+    };
+
+    if result.outcome != Outcome::Implemented {
+        let workflow_state = workflow_state_for_outcome(result.outcome);
+        let result_value = serde_json::to_value(&result)?;
+        complete_job(pool, running_job.id, &result_value).await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+        if let Some(workflow_item_id) = running_job.workflow_item_id {
+            update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+            record_state_transition(
+                pool,
+                workflow_item_id,
+                Some(running_job.id),
+                Some(WorkflowState::InProgress.as_str()),
+                workflow_state.as_str(),
+                "repair agent completed without repair",
+            )
+            .await?;
+
+            for action in
+                triage_github_issue_actions(policy, &running_job.input, &result, workflow_state)
+            {
+                create_outbound_action(
+                    pool,
+                    &OutboundActionInput {
+                        workflow_item_id,
+                        job_id: Some(running_job.id),
+                        provider: "github".to_string(),
+                        action_type: action.action_type,
+                        payload: action.payload,
+                    },
+                )
+                .await?;
+            }
+
+            create_repair_comment_action(pool, workflow_item_id, &running_job, &result).await?;
+        }
+
+        return Ok(());
+    }
+
+    let repo_path = repository_checkout_path(&repair_input.repository_context)?;
+    if conflict_markers_present(&repo_path)? {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Repair execution failed.",
+            "repair agent left merge conflict markers in the checkout",
+            "repair conflict markers remain",
+        )
+        .await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        return Ok(());
+    }
+
+    let changed_files = git_changed_files(&repo_path).await?;
+    if changed_files.is_empty() {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Repair execution failed.",
+            "repair agent returned implemented but did not modify the repository checkout",
+            "repair execution failed",
+        )
+        .await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        return Ok(());
+    }
+
+    result.changed_files = changed_files.clone();
+    let required_check_results =
+        run_required_commands(pool, policy, running_job.id, &repo_path).await?;
+    let required_checks_failed = required_check_results
+        .iter()
+        .any(|check| check.status == TestStatus::Failed);
+    result.tests.extend(required_check_results);
+    if required_checks_failed {
+        result.outcome = Outcome::Failed;
+        result.summary = "Repair failed required checks.".to_string();
+        result.blocked_reason = Some(required_check_failure_summary(&result.tests));
+        let result_value = serde_json::to_value(&result)?;
+        fail_job(pool, running_job.id, &result_value).await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+        if let Some(workflow_item_id) = running_job.workflow_item_id {
+            update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str())
+                .await?;
+            record_state_transition(
+                pool,
+                workflow_item_id,
+                Some(running_job.id),
+                Some(WorkflowState::InProgress.as_str()),
+                WorkflowState::Blocked.as_str(),
+                "repair required checks failed",
+            )
+            .await?;
+
+            for action in triage_github_issue_actions(
+                policy,
+                &running_job.input,
+                &result,
+                WorkflowState::Blocked,
+            ) {
+                create_outbound_action(
+                    pool,
+                    &OutboundActionInput {
+                        workflow_item_id,
+                        job_id: Some(running_job.id),
+                        provider: "github".to_string(),
+                        action_type: action.action_type,
+                        payload: action.payload,
+                    },
+                )
+                .await?;
+            }
+            create_repair_comment_action(pool, workflow_item_id, &running_job, &result).await?;
+        }
+
+        return Ok(());
+    }
+
+    let commit_title = repair_commit_title(&running_job.input);
+    let commit_body = repair_commit_body(&running_job, &result, &changed_files);
+    if let Err(error) = push_repair_branch(
+        &repo_path,
+        &repair_input.workspace_path,
+        github_token,
+        &pull_request_head_ref(&running_job.input)?,
+        &commit_title,
+        &commit_body,
+    )
+    .await
+    {
+        fail_role_job(
+            pool,
+            &running_job,
+            "Repair push failed.",
+            &error.to_string(),
+            "repair push failed",
+        )
+        .await?;
+        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        tracing::warn!(job_id = %running_job.id, "repair push failed");
+        return Ok(());
+    }
+
+    let result_value = serde_json::to_value(&result)?;
+    complete_job(pool, running_job.id, &result_value).await?;
+    let _ = cleanup_repository_context(running_job.id, repo_context_config);
+
+    if let Some(workflow_item_id) = running_job.workflow_item_id {
+        update_workflow_item_state(pool, workflow_item_id, WorkflowState::PrOpen.as_str()).await?;
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(running_job.id),
+            Some(WorkflowState::InProgress.as_str()),
+            WorkflowState::PrOpen.as_str(),
+            "repair agent pushed conflict resolution",
+        )
+        .await?;
+        create_repair_comment_action(pool, workflow_item_id, &running_job, &result).await?;
+    }
+
+    tracing::info!(job_id = %running_job.id, "repair job completed");
+    Ok(())
+}
+
 async fn fail_role_job(
     pool: &donkeyspace_db::PgPool,
     running_job: &JobRecord,
@@ -1227,6 +1616,134 @@ async fn run_agent_reviewer(
     Ok(read_run_result(&result_path).await?)
 }
 
+async fn run_agent_repair(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    running_job: &JobRecord,
+    input: &Value,
+    repo_context_config: &RepoContextConfig,
+) -> Result<RunResult, Box<dyn std::error::Error>> {
+    let workspace_path = workspace_path(running_job.id, repo_context_config);
+    let donkeyspace_path = workspace_path.join(".donkeyspace");
+    let input_path = donkeyspace_path.join("run-input.json");
+    let result_path = donkeyspace_path.join("run-result.json");
+    let contract_result_path = ".donkeyspace/run-result.json";
+    tokio_fs::create_dir_all(&donkeyspace_path).await?;
+    let run_input = agent_run_input(
+        running_job.id,
+        &running_job.role,
+        input,
+        contract_result_path,
+    );
+    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
+
+    let command =
+        AgentCommand::from_parts(&policy.agents.repair.command, &workspace_path, &result_path)?;
+    let command_result = run_agent_command(&command).await?;
+    record_agent_command_result(pool, running_job.id, "repair agent", &command_result).await?;
+
+    if command_result.status != AgentCommandStatus::Passed {
+        return Err(format!(
+            "repair agent exited unsuccessfully with code {:?}",
+            command_result.exit_code
+        )
+        .into());
+    }
+
+    Ok(read_run_result(&result_path).await?)
+}
+
+struct RepairInput {
+    enriched_input: Value,
+    repository_context: Value,
+    workspace_path: PathBuf,
+    conflicted_files: Vec<String>,
+}
+
+async fn prepare_repair_input(
+    input: &Value,
+    job_id: uuid::Uuid,
+    github_token: Option<&str>,
+    repo_context_config: &RepoContextConfig,
+) -> Result<RepairInput, Box<dyn std::error::Error>> {
+    let mut repository_context =
+        build_repository_context(input, job_id, github_token, repo_context_config).await?;
+    let repo_path = repository_checkout_path(&repository_context)?;
+    checkout_pull_request_branch(input, job_id, &repo_path, github_token, repo_context_config)
+        .await?;
+
+    if let Value::Object(map) = &mut repository_context {
+        map.insert("checkout_ref".to_string(), json!("pull_request_head"));
+    }
+
+    let base_ref = pull_request_base_ref(input).unwrap_or_else(|| repository_default_branch(input));
+    fetch_base_branch(
+        &repo_path,
+        &workspace_path(job_id, repo_context_config),
+        &base_ref,
+        github_token,
+    )
+    .await?;
+    configure_git_author(&repo_path).await?;
+    let merge = attempt_base_merge(&repo_path, &base_ref, false).await?;
+    let merge = if merge_refused_unrelated_histories(&merge.stderr) {
+        attempt_base_merge(&repo_path, &base_ref, true).await?
+    } else {
+        merge
+    };
+    let conflicted_files = if merge.success {
+        Vec::new()
+    } else {
+        let files = git_unmerged_files(&repo_path).await?;
+        if files.is_empty() {
+            return Err(
+                format!("base merge failed without unmerged files: {}", merge.stderr).into(),
+            );
+        }
+        files
+    };
+
+    let mut enriched = enrich_input_with_repository_context(input, repository_context.clone());
+    if let Some(pull_request) = enriched
+        .pointer_mut("/pull_request")
+        .and_then(Value::as_object_mut)
+    {
+        pull_request.insert(
+            "merge_conflict".to_string(),
+            json!({
+                "base_ref": base_ref,
+                "head_ref": pull_request_head_ref(input)?,
+                "conflicted": !conflicted_files.is_empty(),
+                "conflicted_files": conflicted_files.clone(),
+                "merge_stderr": truncate_chars(&merge.stderr, 4_000),
+            }),
+        );
+    }
+
+    Ok(RepairInput {
+        enriched_input: enriched,
+        repository_context,
+        workspace_path: workspace_path(job_id, repo_context_config),
+        conflicted_files,
+    })
+}
+
+async fn fetch_base_branch(
+    repo_path: &Path,
+    workspace_path: &Path,
+    base_ref: &str,
+    github_token: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let askpass_path = workspace_path.join("git-askpass.sh");
+    let token = github_token.filter(|token| !token.trim().is_empty());
+    if token.is_some() {
+        write_askpass_script(&askpass_path)?;
+    }
+    let askpass = token.map(|_| askpass_path.as_path());
+    run_git(repo_path, &["fetch", "origin", base_ref], token, askpass).await?;
+    Ok(())
+}
+
 async fn prepare_reviewer_input(
     input: &Value,
     job_id: uuid::Uuid,
@@ -1287,6 +1804,91 @@ async fn checkout_pull_request_head(
     )
     .await?;
     Ok(())
+}
+
+async fn checkout_pull_request_branch(
+    input: &Value,
+    job_id: uuid::Uuid,
+    repo_path: &Path,
+    github_token: Option<&str>,
+    repo_context_config: &RepoContextConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let head_ref = pull_request_head_ref(input)?;
+    let workspace = workspace_path(job_id, repo_context_config);
+    let askpass_path = workspace.join("git-askpass.sh");
+    let token = github_token.filter(|token| !token.trim().is_empty());
+    if token.is_some() {
+        write_askpass_script(&askpass_path)?;
+    }
+    let askpass = token.map(|_| askpass_path.as_path());
+    let head_refspec = format!("refs/heads/{head_ref}");
+    run_git(
+        repo_path,
+        &["fetch", "origin", &head_refspec],
+        token,
+        askpass,
+    )
+    .await?;
+    run_git(
+        repo_path,
+        &["checkout", "-B", &head_ref, "FETCH_HEAD"],
+        None,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+struct MergeAttempt {
+    success: bool,
+    stderr: String,
+}
+
+async fn attempt_base_merge(
+    repo_path: &Path,
+    base_ref: &str,
+    allow_unrelated_histories: bool,
+) -> Result<MergeAttempt, Box<dyn std::error::Error>> {
+    let base = format!("origin/{base_ref}");
+    let mut args = vec!["merge", "--no-commit", "--no-ff"];
+    if allow_unrelated_histories {
+        args.push("--allow-unrelated-histories");
+    }
+    args.push(&base);
+
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    Ok(MergeAttempt {
+        success: output.status.success(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn merge_refused_unrelated_histories(stderr: &str) -> bool {
+    stderr.contains("refusing to merge unrelated histories")
+}
+
+async fn git_unmerged_files(repo_path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = run_git(
+        repo_path,
+        &["diff", "--name-only", "--diff-filter=U"],
+        None,
+        None,
+    )
+    .await?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
 async fn git_diff_name_only(
@@ -1473,21 +2075,43 @@ async fn push_developer_branch(
     let askpass_path = workspace_path.join("git-askpass.sh");
     write_askpass_script(&askpass_path)?;
 
-    run_git(
-        repo_path,
-        &["config", "user.name", "donkeyspace"],
-        None,
-        None,
-    )
-    .await?;
-    run_git(
-        repo_path,
-        &["config", "user.email", "donkeyspace@example.invalid"],
-        None,
-        None,
-    )
-    .await?;
+    configure_git_author(repo_path).await?;
     run_git(repo_path, &["checkout", "-b", branch_name], None, None).await?;
+    run_git(repo_path, &["add", "-A"], None, None).await?;
+    run_git(
+        repo_path,
+        &["commit", "-m", commit_title, "-m", commit_body],
+        None,
+        None,
+    )
+    .await?;
+    let push_ref = format!("HEAD:refs/heads/{branch_name}");
+    run_git(
+        repo_path,
+        &["push", "origin", &push_ref],
+        Some(token),
+        Some(&askpass_path),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn push_repair_branch(
+    repo_path: &Path,
+    workspace_path: &Path,
+    github_token: Option<&str>,
+    branch_name: &str,
+    commit_title: &str,
+    commit_body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token = github_token
+        .filter(|token| !token.trim().is_empty())
+        .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to push repaired branches")?;
+    let askpass_path = workspace_path.join("git-askpass.sh");
+    write_askpass_script(&askpass_path)?;
+
+    configure_git_author(repo_path).await?;
     run_git(repo_path, &["add", "-A"], None, None).await?;
     run_git(
         repo_path,
@@ -1538,6 +2162,24 @@ async fn run_git(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+async fn configure_git_author(repo_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    run_git(
+        repo_path,
+        &["config", "user.name", "donkeyspace"],
+        None,
+        None,
+    )
+    .await?;
+    run_git(
+        repo_path,
+        &["config", "user.email", "donkeyspace@example.invalid"],
+        None,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
 fn parse_porcelain_status(output: &str) -> Vec<String> {
     output
         .lines()
@@ -1547,6 +2189,44 @@ fn parse_porcelain_status(output: &str) -> Vec<String> {
             (!path.is_empty()).then(|| path.to_string())
         })
         .collect()
+}
+
+fn conflict_markers_present(repo_path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    conflict_markers_present_in_dir(repo_path, repo_path)
+}
+
+fn conflict_markers_present_in_dir(
+    repo_path: &Path,
+    dir: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if file_name.to_string_lossy() == ".git" {
+            continue;
+        }
+
+        if path.is_dir() {
+            if conflict_markers_present_in_dir(repo_path, &path)? {
+                return Ok(true);
+            }
+        } else if path.is_file() {
+            let raw = fs::read(&path)?;
+            if raw.contains(&0) {
+                continue;
+            }
+            let content = String::from_utf8_lossy(&raw);
+            if content.contains("<<<<<<<") || content.contains(">>>>>>>") {
+                tracing::warn!(
+                    path = %path.strip_prefix(repo_path).unwrap_or(&path).display(),
+                    "repair checkout still contains conflict marker text"
+                );
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn developer_branch_name(issue_number: i64, job_id: uuid::Uuid) -> String {
@@ -1662,6 +2342,82 @@ fn developer_pull_request_body(
             .join("\n"),
         tests,
         running_job.id
+    )
+}
+
+fn repair_commit_title(input: &Value) -> String {
+    format!(
+        "chore: repair pull request #{}",
+        pull_request_number(input).unwrap_or(0)
+    )
+}
+
+fn repair_commit_body(
+    running_job: &JobRecord,
+    result: &RunResult,
+    changed_files: &[String],
+) -> String {
+    format!(
+        "Repairs merge conflicts for pull request #{}.\n\n{}\n\nChanged files:\n{}\n\nGenerated by donkeyspace repair job {}.",
+        pull_request_number(&running_job.input).unwrap_or(0),
+        result.summary,
+        changed_files
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        running_job.id
+    )
+}
+
+async fn create_repair_comment_action(
+    pool: &donkeyspace_db::PgPool,
+    workflow_item_id: i64,
+    running_job: &JobRecord,
+    result: &RunResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    create_outbound_action(
+        pool,
+        &OutboundActionInput {
+            workflow_item_id,
+            job_id: Some(running_job.id),
+            provider: "github".to_string(),
+            action_type: "issue.create_comment".to_string(),
+            payload: json!({
+                "owner": repository_owner(&running_job.input)?,
+                "repo": repository_name(&running_job.input)?,
+                "issue_number": pull_request_number(&running_job.input).unwrap_or_else(|| issue_number(&running_job.input).unwrap_or(0)),
+                "body": repair_comment_body(result, running_job.id),
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn repair_comment_body(result: &RunResult, job_id: uuid::Uuid) -> String {
+    let reason = result
+        .human_review_reason
+        .as_ref()
+        .or(result.blocked_reason.as_ref())
+        .map(|value| format!("\n\nReason:\n{value}"))
+        .unwrap_or_default();
+    let changed_files = result.changed_files.join(", ");
+    let changed_files = if changed_files.is_empty() {
+        "Not reported".to_string()
+    } else {
+        changed_files
+    };
+
+    format!(
+        "donkeyspace repair result: {}\n\nSummary:\n{}\n\nRisk: {}\nConfidence: {}\nChanged files: {}{}\n\nRun: `{}`",
+        outcome_text(result.outcome),
+        result.summary,
+        risk_text(result.risk),
+        confidence_text(result.confidence),
+        changed_files,
+        reason,
+        job_id
     )
 }
 
@@ -1794,6 +2550,15 @@ fn pull_request_base_ref(input: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
+}
+
+fn pull_request_head_ref(input: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    input
+        .pointer("/pull_request/head/ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| "repair input is missing pull request head ref".into())
 }
 
 fn repository_owner(input: &Value) -> Result<String, Box<dyn std::error::Error>> {
@@ -2156,7 +2921,8 @@ struct CreateCommentPayload {
 mod tests {
     use super::{
         agent_run_input, command_summary, conventional_commit_title, input_is_donkeyspace_comment,
-        input_issue_is_closed, non_empty_string, normalize_reviewer_result, parse_porcelain_status,
+        input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
+        normalize_reviewer_result, parse_porcelain_status,
         repository_context_short_circuits_triage, required_check_failure_summary,
         reviewer_changed_files, reviewer_comment_body,
     };
@@ -2452,6 +3218,16 @@ mod tests {
                 "new.md".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn detects_unrelated_history_merge_refusal() {
+        assert!(merge_refused_unrelated_histories(
+            "fatal: refusing to merge unrelated histories\n"
+        ));
+        assert!(!merge_refused_unrelated_histories(
+            "CONFLICT (content): Merge conflict in README.md\n"
+        ));
     }
 }
 
