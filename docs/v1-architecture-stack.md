@@ -72,7 +72,7 @@ The first implementation slice should prove the backend loop before UI polish:
 2. Receive a GitHub issue webhook.
 3. Validate the webhook signature.
 4. Store a job and state transition in PostgreSQL.
-5. Run a fake triage agent command.
+5. Run the configured triage agent command or OpenAI-compatible triage path.
 6. Validate `.donkeyspace/run-result.json`.
 7. Compute the next issue state.
 8. Record the decision and expose it through an API endpoint.

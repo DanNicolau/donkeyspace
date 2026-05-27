@@ -112,7 +112,7 @@ The orchestrator should treat missing, invalid, or contradictory result files as
 
 V1 should prefer external agent CLIs with workspace-native file and search tools over a custom donkeyspace LLM tool loop.
 
-The worker may still build bounded repository context for cheap deterministic or OpenAI-compatible triage, but that prompt context is a fallback and fast-path aid rather than the long-term agent interface. For actual agentic triage, implementation, and review, donkeyspace should create the repository workspace, write `.donkeyspace/run-input.json`, run the configured agent command in that workspace, and read `.donkeyspace/run-result.json`.
+The worker may still build bounded repository context for OpenAI-compatible triage, but that prompt context is a fast-path aid rather than the long-term agent interface. Donkeyspace should not fall back to deterministic triage when model access fails; it should report the token/quota blocker visibly and wait for operator or quota recovery. For actual agentic triage, implementation, and review, donkeyspace should create the repository workspace, write `.donkeyspace/run-input.json`, run the configured agent command in that workspace, and read `.donkeyspace/run-result.json`.
 
 Triage agents should receive read-only repository access. Developer agents may write to the workspace and create branches or PRs according to policy. Reviewer agents should inspect diffs, test output, and policy context, and should avoid mutating repository state except for structured review output and approved GitHub comments.
 
@@ -122,6 +122,8 @@ donkeyspace should eventually support two agentic triage workflows:
 - Built-in OpenAI-compatible triage: run a donkeyspace-owned tool loop against OpenRouter or another OpenAI-compatible endpoint. OpenRouter acts as the model router, while donkeyspace exposes and executes tools such as `repo.list_tree`, `repo.search`, `repo.read_file`, `issue.context`, `policy.read`, and `result.write`.
 
 The built-in OpenAI-compatible loop should be implemented after the external command path is working. That keeps the near-term project focused on orchestration while preserving a longer-term default that does not require every installation to install and authenticate a separate agent CLI.
+
+Token usage handling is an explicit future requirement. Donkeyspace should track model-provider quota errors and token budgets, pause affected workers or providers when usage is exhausted, surface the pause in GitHub comments and the dashboard, and resume automatically or by operator action when quota refreshes.
 
 ## Duplicate Work Prevention
 
