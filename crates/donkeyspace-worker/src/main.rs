@@ -2,7 +2,7 @@ use clap::Parser;
 use donkeyspace_core::policy::RequiredCommand;
 use donkeyspace_core::{
     Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus, WorkflowState,
-    fake_triage_issue, triage_github_issue_actions, workflow_state_for_outcome,
+    triage_github_issue_actions, workflow_state_for_outcome,
 };
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if triage_config.provider == TriageProvider::Agent {
         tracing::info!("external agent triage enabled");
     } else {
-        tracing::info!("deterministic triage enabled");
+        tracing::info!("llm triage unavailable; token usage block result enabled");
     }
 
     let repo_context_config = RepoContextConfig::new(
@@ -1469,24 +1469,41 @@ async fn run_triage(
     triage_client: Option<&OpenAiTriageClient>,
     input: &serde_json::Value,
 ) -> Result<(RunResult, &'static str), Box<dyn std::error::Error>> {
-    let deterministic_result = fake_triage_issue(input);
-    if repository_context_short_circuits_triage(input, &deterministic_result) {
-        deterministic_result.validate_for_orchestration()?;
-        return Ok((deterministic_result, "repository context triage completed"));
-    }
-
-    let result = match triage_client {
-        Some(client) => (
-            client.triage_issue(input).await?,
-            "llm triage agent completed",
-        ),
-        None => (
-            fake_triage_issue(input),
-            "deterministic triage agent completed",
-        ),
+    let Some(client) = triage_client else {
+        let result = token_usage_exceeded_triage_result();
+        result.validate_for_orchestration()?;
+        return Ok((result, "llm triage token usage exceeded"));
     };
-    result.0.validate_for_orchestration()?;
-    Ok(result)
+
+    match client.triage_issue(input).await {
+        Ok(result) => {
+            result.validate_for_orchestration()?;
+            Ok((result, "llm triage agent completed"))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "llm triage failed without deterministic fallback");
+            let result = token_usage_exceeded_triage_result();
+            result.validate_for_orchestration()?;
+            Ok((result, "llm triage token usage exceeded"))
+        }
+    }
+}
+
+fn token_usage_exceeded_triage_result() -> RunResult {
+    RunResult {
+        outcome: Outcome::Blocked,
+        summary: "LLM triage token usage exceeded.".to_string(),
+        confidence: Confidence::High,
+        risk: Risk::Unknown,
+        questions: Vec::new(),
+        tests: Vec::new(),
+        changed_files: Vec::new(),
+        human_review_reason: None,
+        blocked_reason: Some(
+            "LLM triage could not run because token usage or provider quota was exceeded. Donkeyspace did not use deterministic fallback triage for this issue."
+                .to_string(),
+        ),
+    }
 }
 
 async fn run_agent_triage(
@@ -2775,29 +2792,6 @@ fn latest_comment(input: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn repository_context_short_circuits_triage(input: &serde_json::Value, result: &RunResult) -> bool {
-    result.outcome == Outcome::Ready
-        && input.pointer("/repository_context").is_some()
-        && meaningful_word_count(&format!(
-            "{}\n{}",
-            input
-                .pointer("/issue/title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
-            input
-                .pointer("/issue/body")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-        )) < 8
-}
-
-fn meaningful_word_count(value: &str) -> usize {
-    value
-        .split_whitespace()
-        .filter(|word| word.chars().any(char::is_alphanumeric))
-        .count()
-}
-
 fn input_is_donkeyspace_comment(input: &serde_json::Value) -> bool {
     input.pointer("/action").and_then(serde_json::Value::as_str) == Some("created")
         && input
@@ -2922,9 +2916,8 @@ mod tests {
     use super::{
         agent_run_input, command_summary, conventional_commit_title, input_is_donkeyspace_comment,
         input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
-        normalize_reviewer_result, parse_porcelain_status,
-        repository_context_short_circuits_triage, required_check_failure_summary,
-        reviewer_changed_files, reviewer_comment_body,
+        normalize_reviewer_result, parse_porcelain_status, required_check_failure_summary,
+        reviewer_changed_files, reviewer_comment_body, token_usage_exceeded_triage_result,
     };
     use donkeyspace_core::{Confidence, Outcome, Risk, RunResult, TestResult, TestStatus};
     use serde_json::json;
@@ -2971,26 +2964,17 @@ mod tests {
     }
 
     #[test]
-    fn short_ready_repo_context_can_skip_llm() {
-        let result = RunResult {
-            outcome: Outcome::Ready,
-            summary: "Ready".to_string(),
-            confidence: Confidence::Medium,
-            risk: Risk::Low,
-            questions: Vec::new(),
-            tests: Vec::new(),
-            changed_files: Vec::new(),
-            human_review_reason: None,
-            blocked_reason: None,
-        };
+    fn token_usage_exceeded_result_blocks_triage_without_fallback() {
+        let result = token_usage_exceeded_triage_result();
 
-        assert!(repository_context_short_circuits_triage(
-            &json!({
-                "issue": {"title": "Capitize D and S in README", "body": null},
-                "repository_context": {"file_tree": ["README.md"]}
-            }),
-            &result
-        ));
+        assert_eq!(result.outcome, Outcome::Blocked);
+        assert_eq!(result.summary, "LLM triage token usage exceeded.");
+        assert!(
+            result
+                .blocked_reason
+                .unwrap()
+                .contains("deterministic fallback")
+        );
     }
 
     #[test]

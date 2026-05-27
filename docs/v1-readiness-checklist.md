@@ -57,7 +57,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] Implement built-in OpenAI-compatible triage with donkeyspace-owned repo tools.
 - [x] Reconcile ready issues into developer jobs without requiring a new webhook.
 - [x] Implement DB-backed job lease acquisition.
-- [x] Implement fake triage agent execution.
+- [x] Remove deterministic triage fallback from LLM triage failures.
 - [x] Persist completed and failed job results.
 - [x] Record result-driven workflow transitions.
 
@@ -69,6 +69,8 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Define branch naming behavior.
 - [ ] Define allowed network behavior.
 - [x] Define how model-provider credentials are injected.
+- [ ] Track model token usage and provider quota exhaustion.
+- [ ] Pause and resume affected workers or providers when token quota is exhausted.
 - [x] Define how GitHub credentials are injected.
 - [x] Capture command logs and exit codes.
 - [x] Clean up workspaces after completion or failure.

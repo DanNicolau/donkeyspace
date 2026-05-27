@@ -29,7 +29,7 @@ It coordinates issue triage, clarification, agent implementation, automated chec
 - GitHub labels drive workflow state in v1.
 - GitHub comments carry human clarification and agent summaries.
 - Agent work runs in ephemeral containers.
-- Tool-using agent work runs through external CLIs in a prepared workspace; bounded prompt context is only the fast path or fallback.
+- Tool-using agent work runs through external CLIs in a prepared workspace; bounded prompt context is only used for OpenAI-compatible triage.
 - PostgreSQL stores run history, decisions, locks, and audit records.
 - Rust powers the backend and worker; TypeScript React powers the dashboard.
 
@@ -72,7 +72,7 @@ DONKEYSPACE_LLM_MODEL=openrouter/free
 OPENROUTER_API_KEY=...
 ```
 
-Set `DONKEYSPACE_TRIAGE_PROVIDER=deterministic` to force local no-token triage.
+If the OpenAI-compatible triage path has no usable key, hits provider quota, or fails before producing a valid result, donkeyspace does not use deterministic fallback triage. It marks the triage job blocked and comments that LLM triage token usage was exceeded.
 
 Set `DONKEYSPACE_TRIAGE_PROVIDER=agent` to run the configured `agents.triage.command` from `.donkeyspace/policy.yml` inside the prepared workspace. In this mode the worker writes `.donkeyspace/run-input.json`, expects `.donkeyspace/run-result.json`, and records the command exit code plus captured stdout/stderr in command results.
 
@@ -126,4 +126,4 @@ Useful local endpoints:
 - `POST /api/runs/{id}/lease`
 - `POST /webhooks/github`
 
-The current workflow supports deterministic, OpenAI-compatible, and external-command triage plus a first Codex-backed developer path. A signed `issues.opened` webhook creates a triage run, the worker leases it, records the result, updates workflow state, and applies GitHub label/comment actions. Ready issues can now proceed to an agent-authored PR; reviewer-agent and check-gated merge behavior are still future slices.
+The current workflow supports OpenAI-compatible and external-command triage plus Codex-backed developer, reviewer, and repair paths. A signed `issues.opened` webhook creates a triage run, the worker leases it, records the result, updates workflow state, and applies GitHub label/comment actions. Ready issues can now proceed to an agent-authored PR and Donkeyspace-managed PRs can be reviewed or repaired when needed.

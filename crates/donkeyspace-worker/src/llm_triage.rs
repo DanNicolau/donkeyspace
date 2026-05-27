@@ -62,9 +62,7 @@ impl OpenAiTriageClient {
             .map(str::trim)
             .filter(|key| !key.is_empty())
         else {
-            return Err(
-                "LLM triage provider requires DONKEYSPACE_LLM_API_KEY or OPENROUTER_API_KEY".into(),
-            );
+            return Ok(None);
         };
 
         Ok(Some(Self {
