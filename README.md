@@ -51,7 +51,7 @@ npm install
 npm run build
 ```
 
-Start the local API, worker, and PostgreSQL services:
+Start the local API, worker, PostgreSQL, and dashboard services:
 
 ```sh
 docker compose up --build
@@ -119,15 +119,10 @@ DONKEYSPACE_REPO_CONTEXT_MAX_FILE_BYTES=4000
 DONKEYSPACE_REPO_CONTEXT_MAX_FILES=12
 ```
 
-Start the Vite dashboard dev server:
-
-```sh
-docker compose --profile dev up web
-```
-
 Useful local endpoints:
 
 - `GET /healthz`
+- Dashboard: `http://localhost:5173`
 - `GET /api/runs`
 - `GET /api/outbound-actions`
 - `GET /api/runs/{id}`

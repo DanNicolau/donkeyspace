@@ -58,12 +58,16 @@ services:
   web:
     image: node:25-bookworm
     working_dir: /app/web
-    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
-    profiles: ["dev"]
+    command: ["sh", "-lc", "npm install && npm run dev -- --host 0.0.0.0"]
+    environment:
+      DONKEYSPACE_API_PROXY_TARGET: http://api:8080
     ports:
       - "5173:5173"
     volumes:
       - .:/app
+    depends_on:
+      api:
+        condition: service_started
 
 volumes:
   codex-home:
