@@ -20,6 +20,7 @@ It coordinates issue triage, clarification, agent implementation, automated chec
 - [V1 agent contract](docs/v1-agent-contract.md)
 - [V1 GitHub workflow](docs/v1-github-workflow.md)
 - [V1 architecture stack](docs/v1-architecture-stack.md)
+- [Policy guide](docs/policy.md)
 - [Example policy](docs/policy.example.yml)
 - [Run result JSON Schema](schemas/run-result.schema.json)
 
@@ -56,7 +57,13 @@ Start the local API, worker, and PostgreSQL services:
 docker compose up --build
 ```
 
-To let the worker clone private repos, push branches, open PRs, and apply pending GitHub labels/comments, set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. Compose automatically reads `.env` from the donkeyspace project directory. If your credentials live elsewhere, pass them explicitly:
+To let the worker clone private repos, push branches, open PRs, and apply pending GitHub labels/comments, set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. Compose automatically reads `.env` from the donkeyspace project directory:
+
+```sh
+cp .env.example .env
+```
+
+If your credentials live elsewhere, pass them explicitly:
 
 ```sh
 docker compose --env-file ../donkeyspace-test-repo/.env up -d --force-recreate worker
@@ -89,7 +96,9 @@ When triage returns `ready`, the worker queues a developer job if `agents.develo
 
 Before pushing a developer branch, the worker runs every command in `checks.required_commands` from the policy file inside the repository checkout. Each command result is recorded in `command_results` and exposed through `/api/runs/{id}`. If any required command fails or cannot start, donkeyspace marks the developer job failed, moves the issue to `ai:blocked`, and writes the failed command summary to the issue through the GitHub action outbox.
 
-The default local policy uses `git diff --check` because the current worker image is intentionally small. Repo-specific commands such as `cargo test`, `npm test`, or `make test` must be available inside the worker image or wrapped by a custom worker image.
+The default local policy runs `git diff --check`, `cargo test --workspace`, and the dashboard build before pushing a developer branch. Repo-specific commands must be available inside the worker image or wrapped by a custom worker image.
+
+Policy lives in `.donkeyspace/policy.yml`. It gates automation with allow/block labels, defines agent commands, runs required local checks, and routes high-risk, unknown-risk, or sensitive-path work to humans. See [the policy guide](docs/policy.md) for the supported fields and current limitations.
 
 When GitHub sends a `pull_request` webhook for a donkeyspace-managed PR, the API links it back to the source issue and queues a reviewer job. The default reviewer command is `donkeyspace-codex-reviewer`. Reviewer jobs fetch the PR head into the ephemeral checkout, receive PR metadata plus changed-file and diff context, and post their result as a PR conversation comment. V1 reviewer findings do not automatically start another developer job.
 

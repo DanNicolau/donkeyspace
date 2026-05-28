@@ -396,7 +396,7 @@ async fn persist_issue_webhook(
             issue_number: payload.issue.number,
             provider_state: payload.issue.state.clone(),
             current_state: current_state.clone(),
-            current_labels: labels,
+            current_labels: labels.clone(),
         },
     )
     .await?;
@@ -424,12 +424,26 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
+    let automation_decision = policy.automation_decision_for_labels(&labels);
+    if !automation_decision.is_allowed() {
+        tracing::info!(
+            event,
+            action = payload.action,
+            issue_number = payload.issue.number,
+            reason = automation_decision.reason(),
+            "policy did not allow agent work"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
     if !should_queue_triage(
         event,
         &payload.action,
         &payload.issue.state,
         current_state.as_deref(),
         payload.comment.as_ref(),
+        payload.label.as_ref().map(|label| label.name.as_str()),
+        &policy.workflow.allow_labels,
     ) {
         tracing::info!(
             event,
@@ -698,6 +712,8 @@ fn should_queue_triage(
     issue_state: &str,
     current_state: Option<&str>,
     comment: Option<&GitHubComment>,
+    changed_label: Option<&str>,
+    allow_labels: &[String],
 ) -> bool {
     if issue_state == "closed" {
         return false;
@@ -705,6 +721,15 @@ fn should_queue_triage(
 
     match (event, action) {
         ("issues", "opened" | "edited" | "reopened") => true,
+        ("issues", "labeled") => {
+            changed_label
+                .map(|label| allow_labels.iter().any(|allowed| allowed == label))
+                .unwrap_or(false)
+                && matches!(
+                    current_state,
+                    None | Some("needs_info" | "needs_human" | "blocked")
+                )
+        }
         ("issue_comment", "created" | "edited") => {
             matches!(
                 current_state,
@@ -795,6 +820,8 @@ struct GitHubIssueWebhook {
     issue: GitHubIssue,
     #[serde(default)]
     comment: Option<GitHubComment>,
+    #[serde(default)]
+    label: Option<GitHubLabel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -897,14 +924,32 @@ mod tests {
         issue_number_from_donkeyspace_branch, should_queue_reviewer, should_queue_triage,
     };
 
+    fn queue_triage(
+        event: &str,
+        action: &str,
+        issue_state: &str,
+        current_state: Option<&str>,
+        comment: Option<&GitHubComment>,
+    ) -> bool {
+        should_queue_triage(
+            event,
+            action,
+            issue_state,
+            current_state,
+            comment,
+            None,
+            &[],
+        )
+    }
+
     #[test]
     fn issue_opened_queues_triage() {
-        assert!(should_queue_triage("issues", "opened", "open", None, None));
+        assert!(queue_triage("issues", "opened", "open", None, None));
     }
 
     #[test]
     fn closed_issue_does_not_queue_triage() {
-        assert!(!should_queue_triage(
+        assert!(!queue_triage(
             "issues",
             "edited",
             "closed",
@@ -914,19 +959,47 @@ mod tests {
     }
 
     #[test]
-    fn label_events_do_not_queue_triage() {
+    fn non_allow_label_events_do_not_queue_triage() {
         assert!(!should_queue_triage(
             "issues",
             "labeled",
             "open",
             Some("needs_info"),
-            None
+            None,
+            Some("bug"),
+            &["ai".to_string()],
+        ));
+    }
+
+    #[test]
+    fn allow_label_event_queues_triage_for_unstarted_issue() {
+        assert!(should_queue_triage(
+            "issues",
+            "labeled",
+            "open",
+            None,
+            None,
+            Some("ai"),
+            &["ai".to_string()],
+        ));
+    }
+
+    #[test]
+    fn allow_label_event_does_not_queue_triage_for_active_issue() {
+        assert!(!should_queue_triage(
+            "issues",
+            "labeled",
+            "open",
+            Some("pr_open"),
+            None,
+            Some("ai"),
+            &["ai".to_string()],
         ));
     }
 
     #[test]
     fn human_comment_on_needs_info_queues_triage() {
-        assert!(should_queue_triage(
+        assert!(queue_triage(
             "issue_comment",
             "created",
             "open",
@@ -939,7 +1012,7 @@ mod tests {
 
     #[test]
     fn human_comment_on_blocked_queues_triage() {
-        assert!(should_queue_triage(
+        assert!(queue_triage(
             "issue_comment",
             "created",
             "open",
@@ -952,7 +1025,7 @@ mod tests {
 
     #[test]
     fn edited_human_comment_on_blocked_queues_triage() {
-        assert!(should_queue_triage(
+        assert!(queue_triage(
             "issue_comment",
             "edited",
             "open",
@@ -965,7 +1038,7 @@ mod tests {
 
     #[test]
     fn human_comment_without_retriable_state_does_not_queue_triage() {
-        assert!(!should_queue_triage(
+        assert!(!queue_triage(
             "issue_comment",
             "created",
             "open",
@@ -978,7 +1051,7 @@ mod tests {
 
     #[test]
     fn missing_comment_payload_does_not_queue_triage() {
-        assert!(!should_queue_triage(
+        assert!(!queue_triage(
             "issue_comment",
             "created",
             "open",
@@ -989,7 +1062,7 @@ mod tests {
 
     #[test]
     fn donkeyspace_comment_does_not_queue_triage() {
-        assert!(!should_queue_triage(
+        assert!(!queue_triage(
             "issue_comment",
             "created",
             "open",

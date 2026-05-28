@@ -6,6 +6,10 @@ RUN cargo build --release --bin donkeyspace-api --bin donkeyspace-worker
 
 FROM node:25-bookworm-slim AS runtime
 
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git ripgrep \
     && npm install -g @openai/codex@0.130.0 \
@@ -22,6 +26,8 @@ COPY scripts/donkeyspace-codex-triage /usr/local/bin/donkeyspace-codex-triage
 COPY scripts/donkeyspace-codex-developer /usr/local/bin/donkeyspace-codex-developer
 COPY scripts/donkeyspace-codex-reviewer /usr/local/bin/donkeyspace-codex-reviewer
 COPY scripts/donkeyspace-codex-repair /usr/local/bin/donkeyspace-codex-repair
+COPY --from=builder /usr/local/cargo /usr/local/cargo
+COPY --from=builder /usr/local/rustup /usr/local/rustup
 COPY --from=builder /app/target/release/donkeyspace-api /usr/local/bin/donkeyspace-api
 COPY --from=builder /app/target/release/donkeyspace-worker /usr/local/bin/donkeyspace-worker
 

@@ -35,9 +35,9 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Support enabling and disabling agent roles.
 - [x] Support required local commands.
 - [ ] Support required GitHub CI checks.
-- [ ] Support path-based human-review requirements.
-- [ ] Support labels that block agent work.
-- [ ] Support labels that allow agent work.
+- [x] Support path-based human-review requirements.
+- [x] Support labels that block agent work.
+- [x] Support labels that allow agent work.
 - [ ] Support risk classification defaults.
 - [ ] Define policy behavior when config is missing or invalid.
 
@@ -80,7 +80,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [ ] Create GitHub App or bot identity design.
 - [x] Handle issue events.
 - [x] Handle issue comment events.
-- [ ] Handle label events.
+- [x] Handle label events.
 - [x] Handle pull request events.
 - [ ] Handle check-suite or check-run events if needed.
 - [x] Create issue comments.
@@ -120,10 +120,10 @@ This checklist tracks the work needed before the first useful version of donkeys
 
 ## Testing
 
-- [ ] Unit test policy parsing.
+- [x] Unit test policy parsing.
 - [ ] Unit test state transitions.
-- [ ] Unit test label conflict handling.
-- [ ] Unit test risk routing behavior.
+- [x] Unit test label conflict handling.
+- [x] Unit test risk routing behavior.
 - [ ] Unit test agent-output parsing.
 - [ ] Integration test GitHub webhook handling.
 - [ ] Integration test issue triage flow.
@@ -137,7 +137,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] Write quickstart instructions.
 - [x] Write Docker Compose setup instructions.
 - [ ] Document required GitHub App permissions.
-- [ ] Document policy file configuration.
+- [x] Document policy file configuration.
 - [ ] Document label meanings.
 - [ ] Document the agent role contract.
 - [ ] Document security and credential handling assumptions.
@@ -153,7 +153,7 @@ This checklist tracks the work needed before the first useful version of donkeys
 - [x] The system can open a pull request for a ready issue.
 - [x] The system can run configured checks and record results.
 - [x] The system can run a reviewer agent on the PR.
-- [ ] The system can route uncertain or high-risk work to humans.
+- [x] The system can route uncertain or high-risk work to humans.
 - [ ] Humans remain responsible for merge by default.
 - [ ] The dashboard shows enough run history and logs to debug failures.
 - [ ] The project documentation is sufficient for another developer to install and test v1.

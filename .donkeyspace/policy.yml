@@ -31,7 +31,11 @@ checks:
   required_commands:
     - name: "diff whitespace"
       command: ["git", "diff", "--check"]
-  require_github_checks: true
+    - name: "rust tests"
+      command: ["cargo", "test", "--workspace"]
+    - name: "dashboard build"
+      command: ["sh", "-lc", "test ! -f web/package.json || (cd web && npm install && npm run build)"]
+  require_github_checks: false
 
 risk:
   default: "unknown"

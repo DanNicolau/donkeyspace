@@ -234,6 +234,19 @@ async fn reconcile_ready_developer_jobs(
     }
 
     for candidate in list_ready_developer_candidates(pool, limit).await? {
+        let current_labels =
+            serde_json::from_value::<Vec<String>>(candidate.current_labels.clone())
+                .unwrap_or_default();
+        let automation_decision = policy.automation_decision_for_labels(&current_labels);
+        if !automation_decision.is_allowed() {
+            tracing::debug!(
+                workflow_item_id = candidate.workflow_item_id,
+                reason = automation_decision.reason(),
+                "policy skipped ready issue reconciliation"
+            );
+            continue;
+        }
+
         let job = create_job(
             pool,
             Some(candidate.workflow_item_id),
@@ -431,7 +444,7 @@ async fn execute_job(
                 run_triage(triage_client, &enriched_input).await
             };
 
-            let (result, transition_reason) = match triage_result {
+            let (mut result, transition_reason) = match triage_result {
                 Ok(result) => result,
                 Err(error) => {
                     fail_triage_job(
@@ -449,6 +462,10 @@ async fn execute_job(
                     return Ok(());
                 }
             };
+            let mut transition_reason = transition_reason.to_string();
+            if let Some(policy_reason) = policy.apply_result_routing(&mut result) {
+                transition_reason = policy_reason;
+            }
             let result_value = serde_json::to_value(&result)?;
             let workflow_state = workflow_state_for_outcome(result.outcome);
             complete_job(pool, running_job.id, &result_value).await?;
@@ -462,7 +479,7 @@ async fn execute_job(
                     Some(running_job.id),
                     None,
                     workflow_state.as_str(),
-                    transition_reason,
+                    &transition_reason,
                 )
                 .await?;
 
@@ -842,6 +859,7 @@ async fn execute_developer_job(
         return Ok(());
     }
 
+    let policy_routing_reason = policy.apply_result_routing(&mut result);
     let issue_num = issue_number(&running_job.input).unwrap_or(0);
     let branch_name = developer_branch_name(issue_num, running_job.id);
     let commit_title = conventional_commit_title(&running_job.input, &changed_files);
@@ -912,19 +930,22 @@ async fn execute_developer_job(
     let _ = cleanup_repository_context(running_job.id, repo_context_config);
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_item_state(pool, workflow_item_id, WorkflowState::PrOpen.as_str()).await?;
+        let workflow_state = workflow_state_for_outcome(result.outcome);
+        update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
         record_state_transition(
             pool,
             workflow_item_id,
             Some(running_job.id),
             Some(WorkflowState::InProgress.as_str()),
-            WorkflowState::PrOpen.as_str(),
-            "developer agent opened pull request",
+            workflow_state.as_str(),
+            policy_routing_reason
+                .as_deref()
+                .unwrap_or("developer agent opened pull request"),
         )
         .await?;
 
         for action in
-            triage_github_issue_actions(policy, &running_job.input, &result, WorkflowState::PrOpen)
+            triage_github_issue_actions(policy, &running_job.input, &result, workflow_state)
         {
             create_outbound_action(
                 pool,
