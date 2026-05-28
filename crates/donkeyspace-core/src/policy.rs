@@ -1,3 +1,4 @@
+use crate::{Outcome, Risk, RunResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -24,6 +25,14 @@ impl Policy {
     pub fn from_yaml(input: &str) -> Result<Self, PolicyError> {
         Ok(serde_yaml::from_str(input)?)
     }
+
+    pub fn automation_decision_for_labels(&self, labels: &[String]) -> AutomationDecision {
+        self.workflow.automation_decision_for_labels(labels)
+    }
+
+    pub fn apply_result_routing(&self, result: &mut RunResult) -> Option<String> {
+        self.risk.apply_result_routing(result)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -33,6 +42,56 @@ pub struct WorkflowPolicy {
     pub block_labels: Vec<String>,
     #[serde(default)]
     pub allow_labels: Vec<String>,
+}
+
+impl WorkflowPolicy {
+    pub fn automation_decision_for_labels(&self, labels: &[String]) -> AutomationDecision {
+        if let Some(label) = labels
+            .iter()
+            .find(|label| self.block_labels.iter().any(|blocked| blocked == *label))
+        {
+            return AutomationDecision::BlockedByLabel(label.clone());
+        }
+
+        if !self.allow_labels.is_empty()
+            && !labels
+                .iter()
+                .any(|label| self.allow_labels.iter().any(|allowed| allowed == label))
+        {
+            return AutomationDecision::MissingAllowLabel(self.allow_labels.clone());
+        }
+
+        AutomationDecision::Allowed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutomationDecision {
+    Allowed,
+    BlockedByLabel(String),
+    MissingAllowLabel(Vec<String>),
+}
+
+impl AutomationDecision {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Allowed => "policy allows automation".to_string(),
+            Self::BlockedByLabel(label) => format!("blocked by policy label `{label}`"),
+            Self::MissingAllowLabel(labels) if labels.len() == 1 => {
+                format!("missing required policy allow label `{}`", labels[0])
+            }
+            Self::MissingAllowLabel(labels) => {
+                format!(
+                    "missing one of required policy allow labels: {}",
+                    labels.join(", ")
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -83,6 +142,64 @@ pub struct RiskPolicy {
     pub human_review_paths: Vec<String>,
 }
 
+impl RiskPolicy {
+    pub fn apply_result_routing(&self, result: &mut RunResult) -> Option<String> {
+        if result.outcome != Outcome::Ready && result.outcome != Outcome::Implemented {
+            return None;
+        }
+
+        let reason = if self.route_high_to_human && result.risk == Risk::High {
+            Some("policy routes high-risk work to human review".to_string())
+        } else if self.route_unknown_to_human && result.risk == Risk::Unknown {
+            Some("policy routes unknown-risk work to human review".to_string())
+        } else if let Some(pattern) = self.human_review_paths.iter().find(|pattern| {
+            result
+                .changed_files
+                .iter()
+                .any(|path| path_matches(pattern, path))
+        }) {
+            Some(format!(
+                "policy requires human review for `{pattern}` changes"
+            ))
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            result.outcome = Outcome::NeedsHuman;
+            result.human_review_reason = Some(reason.clone());
+            Some(reason)
+        } else {
+            None
+        }
+    }
+}
+
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim_matches('/');
+    let path = path.trim_matches('/');
+
+    if pattern == path {
+        return true;
+    }
+
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        if let Some(directory) = suffix.strip_suffix("/**") {
+            return path == directory
+                || path.starts_with(&format!("{directory}/"))
+                || path.contains(&format!("/{directory}/"));
+        }
+
+        return path.ends_with(suffix);
+    }
+
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+
+    false
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AutomationPolicy {
     pub max_concurrent_jobs: u32,
@@ -103,6 +220,7 @@ pub struct DashboardPolicy {
 #[cfg(test)]
 mod tests {
     use super::Policy;
+    use crate::{Confidence, Outcome, Risk, RunResult};
 
     #[test]
     fn parses_example_policy() {
@@ -148,5 +266,94 @@ automation:
 
         assert!(!policy.agents.repair.enabled);
         assert!(policy.agents.repair.command.is_empty());
+    }
+
+    #[test]
+    fn automation_requires_allow_label_when_configured() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+
+        assert!(
+            !policy
+                .automation_decision_for_labels(&["bug".to_string()])
+                .is_allowed()
+        );
+        assert!(
+            policy
+                .automation_decision_for_labels(&["bug".to_string(), "ai".to_string()])
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn block_label_wins_over_allow_label() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let decision =
+            policy.automation_decision_for_labels(&["ai".to_string(), "ai:disabled".to_string()]);
+
+        assert!(!decision.is_allowed());
+        assert!(decision.reason().contains("ai:disabled"));
+    }
+
+    #[test]
+    fn unknown_ready_result_routes_to_human_when_enabled() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let mut result = RunResult {
+            outcome: Outcome::Ready,
+            summary: "ready".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Unknown,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+
+        let reason = policy.apply_result_routing(&mut result).unwrap();
+
+        assert_eq!(result.outcome, Outcome::NeedsHuman);
+        assert!(reason.contains("unknown-risk"));
+    }
+
+    #[test]
+    fn human_review_path_routes_implemented_result_to_human() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let mut result = RunResult {
+            outcome: Outcome::Implemented,
+            summary: "implemented".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: vec!["migrations/0002_add_column.sql".to_string()],
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+
+        let reason = policy.apply_result_routing(&mut result).unwrap();
+
+        assert_eq!(result.outcome, Outcome::NeedsHuman);
+        assert!(reason.contains("migrations/**"));
+    }
+
+    #[test]
+    fn nested_human_review_path_routes_implemented_result_to_human() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let mut result = RunResult {
+            outcome: Outcome::Implemented,
+            summary: "implemented".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: vec!["crates/api/src/security/token.rs".to_string()],
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+
+        let reason = policy.apply_result_routing(&mut result).unwrap();
+
+        assert_eq!(result.outcome, Outcome::NeedsHuman);
+        assert!(reason.contains("**/security/**"));
     }
 }

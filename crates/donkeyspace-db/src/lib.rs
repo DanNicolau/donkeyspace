@@ -108,6 +108,7 @@ pub struct JobRecord {
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ReadyDeveloperCandidate {
     pub workflow_item_id: i64,
+    pub current_labels: Value,
     pub input: Value,
 }
 
@@ -553,6 +554,7 @@ pub async fn list_ready_developer_candidates(
         r#"
         SELECT
             workflow_items.id AS workflow_item_id,
+            workflow_items.current_labels AS current_labels,
             latest_triage.input AS input
         FROM workflow_items
         JOIN LATERAL (
