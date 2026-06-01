@@ -75,6 +75,18 @@ impl GitHubClient {
         Ok(())
     }
 
+    pub async fn ensure_labels(
+        &self,
+        owner: &str,
+        repo: &str,
+        labels: &[String],
+    ) -> Result<(), GitHubClientError> {
+        for label in labels {
+            self.ensure_label(owner, repo, label).await?;
+        }
+        Ok(())
+    }
+
     pub async fn remove_issue_label(
         &self,
         owner: &str,
@@ -150,20 +162,23 @@ impl GitHubClient {
         repo: &str,
         label: &str,
     ) -> Result<(), GitHubClientError> {
-        if self
-            .client
-            .issues(owner, repo)
-            .get_label(label)
-            .await
-            .is_ok()
-        {
-            return Ok(());
+        match self.client.issues(owner, repo).get_label(label).await {
+            Ok(_) => return Ok(()),
+            Err(error) if github_error_status(&error) == Some(404) => {}
+            Err(error) => return Err(error.into()),
         }
 
-        self.client
+        if let Err(error) = self
+            .client
             .issues(owner, repo)
             .create_label(label, workflow_label_color(label), "Managed by donkeyspace")
-            .await?;
+            .await
+        {
+            if github_error_status(&error) == Some(422) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 }

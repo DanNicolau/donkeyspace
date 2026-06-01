@@ -7,16 +7,17 @@ use donkeyspace_core::{
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
     acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
-    create_job, create_outbound_action, fail_job, list_pending_outbound_actions,
-    list_ready_developer_candidates, list_repair_candidates, mark_job_running,
-    mark_outbound_action_completed, mark_outbound_action_failed, record_state_transition,
-    update_workflow_item_state,
+    create_job, create_outbound_action, fail_job, list_github_repositories,
+    list_pending_outbound_actions, list_ready_developer_candidates, list_repair_candidates,
+    mark_job_running, mark_outbound_action_completed, mark_outbound_action_failed,
+    record_state_transition, update_workflow_item_state,
 };
 use donkeyspace_github::GitHubClient;
 use donkeyspace_runner::{AgentCommand, AgentCommandStatus, read_run_result, run_agent_command};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeSet, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -132,6 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("donkeyspace worker started");
 
+    let mut label_synced_repositories = HashSet::new();
+
     if args.once {
         if let Some(pool) = &pool {
             poll_once(
@@ -141,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 triage_client.as_ref(),
                 &repo_context_config,
                 args.github_token.as_deref(),
+                &mut label_synced_repositories,
                 &args.worker_id,
                 args.lease_seconds,
                 args.ready_reconcile_limit,
@@ -161,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 triage_client.as_ref(),
                 &repo_context_config,
                 args.github_token.as_deref(),
+                &mut label_synced_repositories,
                 &args.worker_id,
                 args.lease_seconds,
                 args.ready_reconcile_limit,
@@ -180,6 +185,7 @@ async fn poll_once(
     triage_client: Option<&OpenAiTriageClient>,
     repo_context_config: &RepoContextConfig,
     github_token: Option<&str>,
+    label_synced_repositories: &mut HashSet<String>,
     worker_id: &str,
     lease_seconds: i32,
     ready_reconcile_limit: i64,
@@ -211,12 +217,58 @@ async fn poll_once(
 
     if let Some(github_token) = github_token.filter(|token| !token.trim().is_empty()) {
         let client = GitHubClient::new(github_token)?;
+        ensure_policy_labels(pool, policy, &client, label_synced_repositories).await?;
         process_outbound_actions(pool, &client).await?;
     } else {
         tracing::debug!("DONKEYSPACE_GITHUB_TOKEN is unset; outbound actions remain pending");
     }
 
     Ok(())
+}
+
+async fn ensure_policy_labels(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    client: &GitHubClient,
+    label_synced_repositories: &mut HashSet<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let labels = policy_managed_labels(policy);
+    if labels.is_empty() {
+        return Ok(());
+    }
+
+    for repository in list_github_repositories(pool).await? {
+        let sync_key = format!("{}/{}", repository.owner, repository.name);
+        if label_synced_repositories.contains(&sync_key) {
+            continue;
+        }
+
+        client
+            .ensure_labels(&repository.owner, &repository.name, &labels)
+            .await?;
+        label_synced_repositories.insert(sync_key.clone());
+        tracing::info!(
+            repository = sync_key,
+            label_count = labels.len(),
+            "ensured donkeyspace github labels"
+        );
+    }
+
+    Ok(())
+}
+
+fn policy_managed_labels(policy: &Policy) -> Vec<String> {
+    policy
+        .workflow
+        .state_labels
+        .values()
+        .chain(policy.workflow.allow_labels.iter())
+        .chain(policy.workflow.block_labels.iter())
+        .filter(|label| !label.trim().is_empty())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 async fn reconcile_ready_developer_jobs(
@@ -2937,10 +2989,11 @@ mod tests {
     use super::{
         agent_run_input, command_summary, conventional_commit_title, input_is_donkeyspace_comment,
         input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
-        normalize_reviewer_result, parse_porcelain_status, required_check_failure_summary,
-        reviewer_changed_files, reviewer_comment_body, token_usage_exceeded_triage_result,
+        normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
+        required_check_failure_summary, reviewer_changed_files, reviewer_comment_body,
+        token_usage_exceeded_triage_result,
     };
-    use donkeyspace_core::{Confidence, Outcome, Risk, RunResult, TestResult, TestStatus};
+    use donkeyspace_core::{Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -2972,6 +3025,20 @@ mod tests {
         assert!(!input_issue_is_closed(&json!({
             "issue": {"state": "open"}
         })));
+    }
+
+    #[test]
+    fn policy_managed_labels_include_state_allow_and_block_labels() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let labels = policy_managed_labels(&policy);
+
+        assert!(labels.contains(&"ai".to_string()));
+        assert!(labels.contains(&"ai:disabled".to_string()));
+        assert!(labels.contains(&"ai:ready".to_string()));
+        assert_eq!(
+            labels.iter().filter(|label| *label == "ai:ready").count(),
+            1
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ Start the local API, worker, PostgreSQL, and dashboard services:
 docker compose up --build
 ```
 
-To let the worker clone private repos, push branches, open PRs, and apply pending GitHub labels/comments, set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. Compose automatically reads `.env` from the donkeyspace project directory:
+To let the worker clone private repos, push branches, open PRs, create missing donkeyspace labels, and apply pending GitHub labels/comments, set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. Compose automatically reads `.env` from the donkeyspace project directory:
 
 ```sh
 cp .env.example .env
@@ -70,6 +70,8 @@ docker compose --env-file ../donkeyspace-test-repo/.env up -d --force-recreate w
 ```
 
 Without the token, GitHub writes remain pending and private-repo checkout fails.
+
+When the token is configured, the worker ensures every configured workflow, allow, and block label exists in GitHub repositories already seen by donkeyspace webhooks.
 
 Triage defaults to `DONKEYSPACE_TRIAGE_PROVIDER=agent` in Docker Compose. Set `DONKEYSPACE_TRIAGE_PROVIDER=auto` to use an OpenAI-compatible chat endpoint when `DONKEYSPACE_LLM_API_KEY` or `OPENROUTER_API_KEY` is present. The default test configuration for that path is:
 
