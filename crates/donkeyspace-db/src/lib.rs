@@ -65,6 +65,15 @@ pub struct RepositoryInput {
     pub default_branch: String,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RepositoryRecord {
+    pub id: i64,
+    pub provider: String,
+    pub owner: String,
+    pub name: String,
+    pub default_branch: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowItemInput {
     pub repository_id: i64,
@@ -219,6 +228,21 @@ pub async fn upsert_repository(pool: &PgPool, input: &RepositoryInput) -> Result
     .await?;
 
     Ok(id)
+}
+
+pub async fn list_github_repositories(pool: &PgPool) -> Result<Vec<RepositoryRecord>, DbError> {
+    let repositories = sqlx::query_as::<_, RepositoryRecord>(
+        r#"
+        SELECT id, provider, owner, name, default_branch
+        FROM repositories
+        WHERE provider = 'github'
+        ORDER BY owner ASC, name ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(repositories)
 }
 
 pub async fn upsert_workflow_item(
