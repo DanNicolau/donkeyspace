@@ -104,6 +104,7 @@ pub struct PullRequestInput {
 pub struct JobRecord {
     pub id: Uuid,
     pub workflow_item_id: Option<i64>,
+    pub retry_of_job_id: Option<Uuid>,
     pub role: String,
     pub status: String,
     pub lease_owner: Option<String>,
@@ -552,16 +553,37 @@ pub async fn create_job(
     role: &str,
     input: &Value,
 ) -> Result<JobRecord, DbError> {
+    create_job_with_retry_of(pool, workflow_item_id, None, role, input).await
+}
+
+pub async fn create_retry_job(
+    pool: &PgPool,
+    workflow_item_id: Option<i64>,
+    retry_of_job_id: Uuid,
+    role: &str,
+    input: &Value,
+) -> Result<JobRecord, DbError> {
+    create_job_with_retry_of(pool, workflow_item_id, Some(retry_of_job_id), role, input).await
+}
+
+async fn create_job_with_retry_of(
+    pool: &PgPool,
+    workflow_item_id: Option<i64>,
+    retry_of_job_id: Option<Uuid>,
+    role: &str,
+    input: &Value,
+) -> Result<JobRecord, DbError> {
     let id = Uuid::now_v7();
     let job = sqlx::query_as::<_, JobRecord>(
         r#"
-        INSERT INTO jobs (id, workflow_item_id, role, status, input)
-        VALUES ($1, $2, $3, 'queued', $4)
+        INSERT INTO jobs (id, workflow_item_id, retry_of_job_id, role, status, input)
+        VALUES ($1, $2, $3, $4, 'queued', $5)
         RETURNING *
         "#,
     )
     .bind(id)
     .bind(workflow_item_id)
+    .bind(retry_of_job_id)
     .bind(role)
     .bind(input)
     .fetch_one(pool)
