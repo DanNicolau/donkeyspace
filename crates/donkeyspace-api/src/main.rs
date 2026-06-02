@@ -9,7 +9,7 @@ use axum::{
 use donkeyspace_core::{AgentRole, LabelState, Policy, WorkflowState, normalize_workflow_labels};
 use donkeyspace_db::{
     DbConfig, JobRecord, PgPool, PullRequestInput, RepositoryInput, WorkflowItemInput,
-    acquire_job_lease, apply_migrations, connect, create_job, get_job,
+    acquire_job_lease, apply_migrations, connect, create_job, create_retry_job, get_job,
     get_workflow_item_by_issue_number, get_workflow_item_state, latest_workflow_job_input,
     list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
     list_open_managed_pull_requests_for_base, list_recent_outbound_actions,
@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/runs/{id}", get(api_run))
         .route("/api/runs/{id}/transitions", get(api_run_transitions))
         .route("/api/runs/{id}/lease", post(api_lease_run))
+        .route("/api/runs/{id}/retry", post(api_retry_run))
         .route("/webhooks/github", post(github_webhook))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -249,6 +250,70 @@ async fn api_lease_run(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError::new("failed to lease run")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_retry_run(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+
+    if !state.policy.dashboard.allow_retry {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new("run retries are disabled by policy")),
+        )
+            .into_response();
+    }
+
+    let job = match get_job(pool, id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(ApiError::new("run not found"))).into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, %id, "failed to fetch run before retry");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to retry run")),
+            )
+                .into_response();
+        }
+    };
+
+    if !can_retry_job(&job) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiError::new("run is not eligible for retry")),
+        )
+            .into_response();
+    }
+
+    let Some(workflow_item_id) = job.workflow_item_id else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiError::new("run is not linked to a workflow item")),
+        )
+            .into_response();
+    };
+
+    match create_retry_job(pool, Some(workflow_item_id), job.id, &job.role, &job.input).await {
+        Ok(retry_job) => Json(retry_job).into_response(),
+        Err(error) => {
+            tracing::error!(%error, %id, "failed to create retry job");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to retry run")),
             )
                 .into_response()
         }
@@ -761,6 +826,19 @@ fn should_queue_reviewer(
         )
 }
 
+fn can_retry_job(job: &JobRecord) -> bool {
+    if job.status != "failed" {
+        return false;
+    }
+
+    !matches!(
+        job.result
+            .as_ref()
+            .and_then(|result| result.get("outcome").and_then(Value::as_str)),
+        Some("blocked" | "needs_human")
+    )
+}
+
 fn is_human_comment(comment: &GitHubComment) -> bool {
     !comment_is_from_donkeyspace(comment)
 }
@@ -920,9 +998,13 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubComment, comment_is_from_donkeyspace, extract_linked_issue_number,
-        issue_number_from_donkeyspace_branch, should_queue_reviewer, should_queue_triage,
+        GitHubComment, JobRecord, can_retry_job, comment_is_from_donkeyspace,
+        extract_linked_issue_number, issue_number_from_donkeyspace_branch,
+        should_queue_reviewer, should_queue_triage,
     };
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
+    use uuid::Uuid;
 
     fn queue_triage(
         event: &str,
@@ -1110,5 +1192,39 @@ mod tests {
             issue_number_from_donkeyspace_branch("donkeyspace/issue-12-019e399e"),
             Some(12)
         );
+    }
+
+    fn job_with_status_and_outcome(status: &str, outcome: Option<&str>) -> JobRecord {
+        JobRecord {
+            id: Uuid::now_v7(),
+            workflow_item_id: Some(1),
+            retry_of_job_id: None,
+            role: "developer".to_string(),
+            status: status.to_string(),
+            lease_owner: None,
+            lease_expires_at: None,
+            input: json!({}),
+            result: outcome.map(|outcome| json!({ "outcome": outcome })),
+            created_at: DateTime::<Utc>::from_timestamp(0, 0).expect("timestamp"),
+            updated_at: DateTime::<Utc>::from_timestamp(0, 0).expect("timestamp"),
+        }
+    }
+
+    #[test]
+    fn failed_jobs_can_be_retried_when_not_blocked_or_needs_human() {
+        assert!(can_retry_job(&job_with_status_and_outcome("failed", Some("failed"))));
+        assert!(can_retry_job(&job_with_status_and_outcome("failed", None)));
+    }
+
+    #[test]
+    fn blocked_or_needs_human_jobs_are_not_retried() {
+        assert!(!can_retry_job(&job_with_status_and_outcome(
+            "failed",
+            Some("blocked")
+        )));
+        assert!(!can_retry_job(&job_with_status_and_outcome(
+            "failed",
+            Some("needs_human")
+        )));
     }
 }

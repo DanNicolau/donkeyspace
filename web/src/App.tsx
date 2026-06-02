@@ -1,8 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 type Run = {
   id: string;
   workflow_item_id: number | null;
+  retry_of_job_id: string | null;
   role: string;
   status: string;
   lease_owner: string | null;
@@ -73,6 +74,7 @@ const placeholderRuns: Run[] = [
   {
     id: "run_queued",
     workflow_item_id: null,
+    retry_of_job_id: null,
     role: "triage",
     status: "queued",
     lease_owner: null,
@@ -107,6 +109,20 @@ async function fetchRunDetail(id: string): Promise<RunDetail> {
 
   if (!response.ok) {
     throw new Error(`Failed to load run detail: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function retryRun(id: string): Promise<Run> {
+  const response = await fetch(`/api/runs/${id}/retry`, {
+    method: "POST"
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    const message = error?.error ?? `Failed to retry run: ${response.status}`;
+    throw new Error(message);
   }
 
   return response.json();
@@ -171,49 +187,7 @@ export function App() {
         </div>
         <div className="run-list">
           {runs.map((run) => (
-            <article className="run-row" key={run.id}>
-              <div>
-                <h3>{runIssueTitle(run)}</h3>
-                <div className="run-meta">
-                  <span>{run.id}</span>
-                  {run.input?.issue?.number ? (
-                    <span>Issue #{run.input.issue.number}</span>
-                  ) : null}
-                </div>
-                <p>
-                  {run.result?.summary ??
-                    (run.workflow_item_id
-                      ? `Workflow item ${run.workflow_item_id}`
-                      : "No workflow item linked yet")}
-                </p>
-                {run.result?.questions.length ? (
-                  <ul className="question-list">
-                    {run.result.questions.map((question) => (
-                      <li key={question}>{question}</li>
-                    ))}
-                  </ul>
-                ) : null}
-                <RunCommandResults runId={run.id} />
-              </div>
-              <dl>
-                <div>
-                  <dt>Role</dt>
-                  <dd>{run.role}</dd>
-                </div>
-                <div>
-                  <dt>Status</dt>
-                  <dd>{run.status}</dd>
-                </div>
-                <div>
-                  <dt>Lease</dt>
-                  <dd>{run.lease_owner ?? "none"}</dd>
-                </div>
-                <div>
-                  <dt>Outcome</dt>
-                  <dd>{run.result?.outcome ?? "pending"}</dd>
-                </div>
-              </dl>
-            </article>
+            <RunRow key={run.id} run={run} />
           ))}
         </div>
       </section>
@@ -288,6 +262,91 @@ function RunCommandResults({ runId }: { runId: string }) {
   );
 }
 
+function RunRow({ run }: { run: Run }) {
+  const queryClient = useQueryClient();
+  const retryMutation = useMutation({
+    mutationFn: retryRun,
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["runs"] }),
+        queryClient.invalidateQueries({ queryKey: ["run-detail", run.id] })
+      ]);
+    }
+  });
+  const canRetry =
+    run.status === "failed" &&
+    run.result?.outcome !== "blocked" &&
+    run.result?.outcome !== "needs_human";
+
+  return (
+    <article className="run-row">
+      <div>
+        <h3>{runIssueTitle(run)}</h3>
+        <div className="run-meta">
+          <span>{run.id}</span>
+          {run.retry_of_job_id ? (
+            <span>Retry of {shortJobId(run.retry_of_job_id)}</span>
+          ) : null}
+          {run.input?.issue?.number ? <span>Issue #{run.input.issue.number}</span> : null}
+        </div>
+        <p>
+          {run.result?.summary ??
+            (run.workflow_item_id
+              ? `Workflow item ${run.workflow_item_id}`
+              : "No workflow item linked yet")}
+        </p>
+        {run.result?.questions.length ? (
+          <ul className="question-list">
+            {run.result.questions.map((question) => (
+              <li key={question}>{question}</li>
+            ))}
+          </ul>
+        ) : null}
+        <RunCommandResults runId={run.id} />
+      </div>
+      <div className="run-sidecar">
+        <dl>
+          <div>
+            <dt>Role</dt>
+            <dd>{run.role}</dd>
+          </div>
+          <div>
+            <dt>Status</dt>
+            <dd>{run.status}</dd>
+          </div>
+          <div>
+            <dt>Lease</dt>
+            <dd>{run.lease_owner ?? "none"}</dd>
+          </div>
+          <div>
+            <dt>Outcome</dt>
+            <dd>{run.result?.outcome ?? "pending"}</dd>
+          </div>
+        </dl>
+        {canRetry ? (
+          <button
+            className="retry-button"
+            disabled={retryMutation.isPending}
+            onClick={() => {
+              retryMutation.mutate(run.id);
+            }}
+            type="button"
+          >
+            {retryMutation.isPending ? "Retrying..." : "Retry failed job"}
+          </button>
+        ) : null}
+        {retryMutation.isError ? (
+          <p className="retry-status" role="status">
+            {retryMutation.error instanceof Error
+              ? retryMutation.error.message
+              : "Failed to retry run"}
+          </p>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
 function describeAction(action: OutboundAction): string {
   if (action.last_error) {
     return action.last_error;
@@ -314,4 +373,8 @@ function runIssueTitle(run: Run): string {
 
 function formatCommand(command: string[]): string {
   return command.length ? command.join(" ") : "<empty>";
+}
+
+function shortJobId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id;
 }

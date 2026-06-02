@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY,
     workflow_item_id BIGINT REFERENCES workflow_items(id),
+    retry_of_job_id UUID REFERENCES jobs(id),
     role TEXT NOT NULL,
     status TEXT NOT NULL,
     lease_owner TEXT,
@@ -55,8 +56,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_of_job_id UUID REFERENCES jobs(id);
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_lease_expires_at_idx ON jobs(lease_expires_at);
+CREATE INDEX IF NOT EXISTS jobs_retry_of_job_id_idx ON jobs(retry_of_job_id);
 
 CREATE TABLE IF NOT EXISTS state_transitions (
     id BIGSERIAL PRIMARY KEY,
