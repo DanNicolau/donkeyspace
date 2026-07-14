@@ -2,9 +2,9 @@
 
 donkeyspace is a self-hosted harness for agentic repository work.
 
-It coordinates issue triage, clarification, agent implementation, automated checks, reviewer-agent feedback, and human approval around the tools teams already use. The first target is a GitHub-first workflow where labels and comments remain the visible collaboration surface, while donkeyspace manages policy, orchestration, sandboxed agent runs, and audit history.
+It coordinates issue triage, clarification, agent implementation, automated checks, reviewer-agent feedback, and human approval around the tools teams already use. The first target is a GitHub-first workflow where labels and comments remain the visible collaboration surface, while donkeyspace manages policy, orchestration, containerized agent execution, and audit history.
 
-## V1 Direction
+## V1 Scope
 
 - GitHub-first: Issues, labels, comments, pull requests, and CI.
 - Self-hosted: Docker Compose deployment for small engineering teams.
@@ -14,22 +14,20 @@ It coordinates issue triage, clarification, agent implementation, automated chec
 
 ## Current Documents
 
-- [Design document](docs/agentic-repo-harness-design.md)
+- [Architecture, scope, and known limitations](docs/agentic-repo-harness-design.md)
 - [V1 readiness checklist](docs/v1-readiness-checklist.md)
-- [V1 decisions](docs/v1-decisions.md)
 - [V1 agent contract](docs/v1-agent-contract.md)
 - [V1 GitHub workflow](docs/v1-github-workflow.md)
-- [V1 architecture stack](docs/v1-architecture-stack.md)
 - [Policy guide](docs/policy.md)
 - [Example policy](docs/policy.example.yml)
 - [Run result JSON Schema](schemas/run-result.schema.json)
 
-## Working Assumptions
+## Current Architecture
 
 - Policy config lives at `.donkeyspace/policy.yml`.
 - GitHub labels drive workflow state in v1.
 - GitHub comments carry human clarification and agent summaries.
-- Agent work runs in ephemeral containers.
+- Agent work runs in ephemeral workspaces inside the worker container.
 - Tool-using agent work runs through external CLIs in a prepared workspace; bounded prompt context is only used for OpenAI-compatible triage.
 - PostgreSQL stores run history, decisions, locks, and audit records.
 - Rust powers the backend and worker; TypeScript React powers the dashboard.
@@ -130,6 +128,7 @@ Useful local endpoints:
 - `GET /api/runs/{id}`
 - `GET /api/runs/{id}/transitions`
 - `POST /api/runs/{id}/lease`
+- `POST /api/runs/{id}/retry`
 - `POST /webhooks/github`
 
 The current workflow supports OpenAI-compatible and external-command triage plus Codex-backed developer, reviewer, and repair paths. A signed `issues.opened` webhook creates a triage run, the worker leases it, records the result, updates workflow state, and applies GitHub label/comment actions. Ready issues can now proceed to an agent-authored PR and Donkeyspace-managed PRs can be reviewed or repaired when needed.

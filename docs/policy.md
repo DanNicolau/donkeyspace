@@ -2,7 +2,9 @@
 
 Donkeyspace reads repository policy from `.donkeyspace/policy.yml`. The API and worker load this file at startup, so restart the services after changing policy.
 
-Policy is currently managed as a repository file. A future dashboard workflow should expose these settings for review and editing, then write or propose the corresponding policy change.
+Policy is managed as a repository file. Missing or invalid policy makes the API
+or worker fail at startup. The dashboard does not currently display or edit the
+active policy.
 
 ## Workflow Labels
 
@@ -60,6 +62,10 @@ Commands must exist in the worker image. The default image includes Git, Node, n
 
 ## Risk Routing
 
+`risk.default` and `risk.agent_classification` are parsed for forward
+compatibility but do not currently alter routing. Agent results must report a
+risk value explicitly.
+
 `risk.route_unknown_to_human` and `risk.route_high_to_human` route `ready` triage results to `needs_human` before developer work is queued.
 
 ```yaml
@@ -82,7 +88,12 @@ Supported path patterns are exact paths, prefix globs ending in `/**`, and neste
 
 ## Automation
 
-`automation.auto_merge` is false by default and v1 keeps humans responsible for merging. `automation.max_concurrent_jobs` and `automation.retry_failed_jobs` are policy declarations for scheduler/retry behavior; full enforcement is future work.
+`automation.auto_merge` is false by default and v1 keeps humans responsible for merging. `automation.max_concurrent_jobs` and `automation.retry_failed_jobs` are reserved declarations; neither is enforced yet.
+
+Failed jobs can be retried manually through `POST /api/runs/{id}/retry` or the
+dashboard when `dashboard.allow_retry` is true. Only failed jobs are eligible;
+results with `blocked` or `needs_human` outcomes must be resolved by a person
+instead. A retry creates a new job linked through `retry_of_job_id`.
 
 ## Dashboard
 
@@ -95,4 +106,6 @@ dashboard:
   allow_cancel: true
 ```
 
-The current dashboard does not edit policy. Future dashboard support should show the active policy, explain which rules affected each run, and provide a controlled way to propose policy changes.
+`dashboard.allow_retry` gates the retry API. `dashboard.expose_policy` and
+`dashboard.allow_cancel` are parsed but not implemented. The dashboard does not
+edit policy.
