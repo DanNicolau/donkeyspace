@@ -7,12 +7,17 @@ use thiserror::Error;
 pub enum PolicyError {
     #[error("failed to parse policy yaml: {0}")]
     Parse(#[from] serde_yaml::Error),
+    #[error("invalid policy: {0}")]
+    Invalid(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Policy {
     pub version: u32,
     pub workflow: WorkflowPolicy,
+    #[serde(default)]
+    pub lifecycle: LifecyclePolicy,
+    #[serde(default)]
     pub agents: AgentConfig,
     pub checks: CheckPolicy,
     pub risk: RiskPolicy,
@@ -23,7 +28,37 @@ pub struct Policy {
 
 impl Policy {
     pub fn from_yaml(input: &str) -> Result<Self, PolicyError> {
-        Ok(serde_yaml::from_str(input)?)
+        let policy: Self = serde_yaml::from_str(input)?;
+        for (name, role) in [
+            ("triage", &policy.agents.triage),
+            ("developer", &policy.agents.developer),
+            ("reviewer", &policy.agents.reviewer),
+            ("repair", &policy.agents.repair),
+        ] {
+            if role.enabled && role.command.is_empty() && role.plugin.is_none() {
+                return Err(PolicyError::Invalid(format!(
+                    "enabled agent `{name}` requires command or plugin"
+                )));
+            }
+            if !role.command.is_empty() && role.plugin.is_some() {
+                return Err(PolicyError::Invalid(format!(
+                    "agent `{name}` cannot specify both command and plugin"
+                )));
+            }
+            if name != "developer" && role.plugin.is_some() {
+                return Err(PolicyError::Invalid(
+                    "plugin flows are currently supported only for developer".to_string(),
+                ));
+            }
+        }
+        if let Some(selection) = &policy.lifecycle.plugin
+            && selection.flow.trim().is_empty()
+        {
+            return Err(PolicyError::Invalid(
+                "lifecycle plugin flow cannot be empty".to_string(),
+            ));
+        }
+        Ok(policy)
     }
 
     pub fn automation_decision_for_labels(&self, labels: &[String]) -> AutomationDecision {
@@ -33,6 +68,14 @@ impl Policy {
     pub fn apply_result_routing(&self, result: &mut RunResult) -> Option<String> {
         self.risk.apply_result_routing(result)
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LifecyclePolicy {
+    /// An optional plugin flow that replaces the built-in
+    /// triage/developer/reviewer/repair lifecycle.
+    #[serde(default)]
+    pub plugin: Option<PluginFlowSelection>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -94,29 +137,49 @@ impl AutomationDecision {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentConfig {
+    #[serde(default)]
     pub triage: AgentRoleConfig,
+    #[serde(default)]
     pub developer: AgentRoleConfig,
+    #[serde(default)]
     pub reviewer: AgentRoleConfig,
     #[serde(default)]
     pub repair: AgentRoleConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentRoleConfig {
     pub enabled: bool,
+    #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub plugin: Option<PluginFlowSelection>,
 }
 
-impl Default for AgentRoleConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            command: Vec::new(),
-        }
-    }
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginFlowSelection {
+    pub manifest_path: String,
+    pub flow: String,
+    #[serde(default)]
+    pub max_handoffs_per_edge: Option<u32>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    #[serde(alias = "stage_access_overrides")]
+    pub task_access_overrides: BTreeMap<String, TaskAccessOverride>,
 }
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TaskAccessOverride {
+    #[serde(default)]
+    pub read: Option<Vec<String>>,
+    #[serde(default)]
+    pub write: Option<Vec<String>>,
+}
+
+pub type StageAccessOverride = TaskAccessOverride;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CheckPolicy {
@@ -282,6 +345,23 @@ automation:
                 .automation_decision_for_labels(&["bug".to_string(), "ai".to_string()])
                 .is_allowed()
         );
+    }
+
+    #[test]
+    fn lifecycle_policy_can_omit_default_agents() {
+        let policy =
+            Policy::from_yaml(include_str!("../../../docs/policy.plugin.example.yml")).unwrap();
+
+        assert_eq!(
+            policy
+                .lifecycle
+                .plugin
+                .as_ref()
+                .map(|plugin| plugin.flow.as_str()),
+            Some("work_items")
+        );
+        assert!(!policy.agents.triage.enabled);
+        assert!(!policy.agents.developer.enabled);
     }
 
     #[test]

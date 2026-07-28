@@ -8,7 +8,9 @@ repository.workspace = true
 [dependencies]
 hex.workspace = true
 hmac.workspace = true
+http.workspace = true
 octocrab.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

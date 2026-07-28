@@ -547,8 +547,10 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "hmac",
+ "http",
  "octocrab",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror",
 ]
@@ -573,9 +575,11 @@ dependencies = [
  "donkeyspace-db",
  "donkeyspace-github",
  "donkeyspace-runner",
+ "futures",
  "octocrab",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",

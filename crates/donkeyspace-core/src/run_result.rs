@@ -31,6 +31,22 @@ pub struct RunResult {
     pub blocked_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentHandoff {
+    pub target: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginTaskResult {
+    #[serde(flatten)]
+    pub result: RunResult,
+    #[serde(default)]
+    pub handoff: Option<AgentHandoff>,
+}
+
+pub type PluginStageResult = PluginTaskResult;
+
 impl RunResult {
     pub fn validate_for_orchestration(&self) -> Result<(), RunResultError> {
         match self.outcome {

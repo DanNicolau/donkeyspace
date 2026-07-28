@@ -1,7 +1,10 @@
 use hmac::{Hmac, Mac};
+use http::header::ACCEPT;
 use octocrab::{Octocrab, models::IssueState};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -46,6 +49,8 @@ pub struct WebhookEnvelope {
 pub enum GitHubClientError {
     #[error("github client error: {0}")]
     Octocrab(#[from] octocrab::Error),
+    #[error("invalid github response: {0}")]
+    InvalidResponse(String),
 }
 
 #[derive(Debug, Clone)]
@@ -53,10 +58,22 @@ pub struct GitHubClient {
     client: Octocrab,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GitHubWorkItem {
+    pub id: String,
+    pub spec: String,
+    pub body: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
 impl GitHubClient {
     pub fn new(token: impl Into<String>) -> Result<Self, GitHubClientError> {
         Ok(Self {
-            client: Octocrab::builder().personal_token(token.into()).build()?,
+            client: Octocrab::builder()
+                .personal_token(token.into())
+                .add_header(ACCEPT, "application/vnd.github+json".into())
+                .build()?,
         })
     }
 
@@ -122,6 +139,78 @@ impl GitHubClient {
         Ok(())
     }
 
+    pub async fn project_work_items(
+        &self,
+        owner: &str,
+        repo: &str,
+        parent_issue_number: i64,
+        work_items: &[GitHubWorkItem],
+    ) -> Result<BTreeMap<String, i64>, GitHubClientError> {
+        let mut projected = BTreeMap::<String, (i64, i64)>::new();
+        for item in work_items {
+            let issue: Value = self
+                .client
+                .post(
+                    format!("/repos/{owner}/{repo}/issues"),
+                    Some(&serde_json::json!({
+                        "title": format!("[block] {}", item.id),
+                        "body": format!(
+                            "<!-- donkeyspace-work-item -->\n\nParent lifecycle issue: #{parent_issue_number}\n\nSpecification path: `{}`\n\n{}",
+                            item.spec, item.body
+                        ),
+                    })),
+                )
+                .await?;
+            let issue_id = issue["id"].as_i64().ok_or_else(|| {
+                GitHubClientError::InvalidResponse("created work-item issue has no id".into())
+            })?;
+            let issue_number = issue["number"].as_i64().ok_or_else(|| {
+                GitHubClientError::InvalidResponse("created work-item issue has no number".into())
+            })?;
+            self.client
+                .post::<_, Value>(
+                    format!("/repos/{owner}/{repo}/issues/{parent_issue_number}/sub_issues"),
+                    Some(&serde_json::json!({"sub_issue_id": issue_id})),
+                )
+                .await?;
+            projected.insert(item.id.clone(), (issue_id, issue_number));
+        }
+
+        for item in work_items {
+            let (_, issue_number) = projected[&item.id];
+            for dependency in &item.depends_on {
+                let (blocking_issue_id, _) = projected[dependency];
+                self.client
+                    .post::<_, Value>(
+                        format!(
+                            "/repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by"
+                        ),
+                        Some(&serde_json::json!({"issue_id": blocking_issue_id})),
+                    )
+                    .await?;
+            }
+        }
+        Ok(projected
+            .into_iter()
+            .map(|(id, (_, number))| (id, number))
+            .collect())
+    }
+
+    pub async fn close_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<(), GitHubClientError> {
+        self.client
+            .issues(owner, repo)
+            .update(issue_number as u64)
+            .state(IssueState::Closed)
+            .send()
+            .await?;
+        Ok(())
+    }
+
     pub async fn issue_is_closed(
         &self,
         owner: &str,
@@ -134,6 +223,49 @@ impl GitHubClient {
             .get(issue_number as u64)
             .await?;
         Ok(issue.state == IssueState::Closed)
+    }
+
+    pub async fn repository(&self, owner: &str, repo: &str) -> Result<Value, GitHubClientError> {
+        Ok(self
+            .client
+            .get(format!("/repos/{owner}/{repo}"), None::<&()>)
+            .await?)
+    }
+
+    pub async fn repository_events(
+        &self,
+        owner: &str,
+        repo: &str,
+        max_pages: usize,
+    ) -> Result<Vec<Value>, GitHubClientError> {
+        let route = format!("/repos/{owner}/{repo}/events?per_page=100");
+        let mut page: octocrab::Page<Value> = self.client.get(route, None::<&()>).await?;
+        let mut events = page.take_items();
+
+        for _ in 1..max_pages.max(1) {
+            let Some(mut next_page) = self.client.get_page(&page.next).await? else {
+                break;
+            };
+            events.append(&mut next_page.take_items());
+            page = next_page;
+        }
+
+        Ok(events)
+    }
+
+    pub async fn pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        pull_request_number: u64,
+    ) -> Result<Value, GitHubClientError> {
+        Ok(self
+            .client
+            .get(
+                format!("/repos/{owner}/{repo}/pulls/{pull_request_number}"),
+                None::<&()>,
+            )
+            .await?)
     }
 
     pub async fn create_pull_request(

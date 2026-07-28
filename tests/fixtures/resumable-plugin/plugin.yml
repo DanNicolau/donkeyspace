@@ -1,0 +1,45 @@
+api_version: 1
+id: donkeyspace.resumable-live-test
+runtime:
+  default_image: donkeyspace-resumable-live-test:dev
+roles:
+  architect: { command: [node, /plugin/run.mjs, architect] }
+  rtl: { command: [node, /plugin/run.mjs, rtl] }
+  dv: { command: [node, /plugin/run.mjs, dv] }
+  syn: { command: [node, /plugin/run.mjs, syn] }
+flows:
+  rtl_blocks:
+    start: architect
+    replaces_default_lifecycle: true
+    work_items_path: docs/design/blocks/index.json
+    project_github_issues: true
+    max_handoffs_per_edge: 1
+    max_parallel_tasks: 4
+    tasks:
+      architect:
+        role: architect
+        write: [docs/design]
+      rtl:
+        role: rtl
+        scope: work_item
+        depends_on_work_items: true
+        read: [docs/design, rtl]
+        write: ["rtl/{work_item}.sv"]
+      dv_prepare:
+        role: dv
+        scope: work_item
+        read: [docs/design]
+        write: ["dv/{work_item}"]
+      dv_verify:
+        role: dv
+        scope: work_item
+        dependencies: [rtl, dv_prepare]
+        read: [docs/design, rtl, "dv/{work_item}"]
+        write: ["dv/{work_item}"]
+      synthesis:
+        role: syn
+        scope: work_item
+        dependencies: [rtl]
+        read: [docs/design, rtl, synth]
+        write: ["synth/{work_item}"]
+        allowed_handoffs: [rtl]

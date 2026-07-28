@@ -11,12 +11,13 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git ripgrep \
+    && apt-get install -y --no-install-recommends ca-certificates docker.io git ripgrep \
     && npm install -g @openai/codex@0.130.0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY .donkeyspace/policy.yml /app/.donkeyspace/policy.yml
+COPY docs/policy.plugin.example.yml /app/docs/policy.plugin.example.yml
 COPY schemas/run-result.schema.json /app/schemas/run-result.schema.json
 COPY schemas/run-result.codex.schema.json /app/schemas/run-result.codex.schema.json
 COPY schemas/run-result.codex-developer.schema.json /app/schemas/run-result.codex-developer.schema.json

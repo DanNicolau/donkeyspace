@@ -556,6 +556,106 @@ pub async fn create_job(
     create_job_with_retry_of(pool, workflow_item_id, None, role, input).await
 }
 
+pub async fn active_job_exists_for_workflow_item(
+    pool: &PgPool,
+    workflow_item_id: i64,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM jobs
+            WHERE workflow_item_id = $1
+              AND status IN ('queued', 'leased', 'running')
+        )
+        "#,
+    )
+    .bind(workflow_item_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Requeue the most recent paused lifecycle coordinator for a workflow item.
+/// The coordinator keeps its UUID so its durable workspace and checkpoint can
+/// be reused. The new webhook payload becomes the run input and is marked as a
+/// resume so the worker does not replace the retained checkout.
+pub async fn resume_latest_paused_job(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    input: &Value,
+) -> Result<Option<JobRecord>, DbError> {
+    let mut resumed_input = input.clone();
+    if let Value::Object(map) = &mut resumed_input {
+        map.insert("donkeyspace_resume".to_string(), Value::Bool(true));
+    }
+
+    Ok(sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET
+            status = 'queued',
+            input = $2,
+            result = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            updated_at = now()
+        WHERE id = (
+            SELECT id
+            FROM jobs
+            WHERE workflow_item_id = $1
+              AND status = 'paused'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(resumed_input)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Create a child task that is durably visible but cannot be leased by the
+/// general worker loop. A lifecycle coordinator starts it once dependencies
+/// are satisfied.
+pub async fn create_waiting_job(
+    pool: &PgPool,
+    workflow_item_id: Option<i64>,
+    role: &str,
+    input: &Value,
+) -> Result<JobRecord, DbError> {
+    let id = Uuid::now_v7();
+    Ok(sqlx::query_as::<_, JobRecord>(
+        r#"
+        INSERT INTO jobs (id, workflow_item_id, role, status, input)
+        VALUES ($1, $2, $3, 'waiting', $4)
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .bind(workflow_item_id)
+    .bind(role)
+    .bind(input)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn start_waiting_job(pool: &PgPool, id: Uuid) -> Result<Option<JobRecord>, DbError> {
+    Ok(sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET status = 'running', updated_at = now()
+        WHERE id = $1 AND status = 'waiting'
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 pub async fn create_retry_job(
     pool: &PgPool,
     workflow_item_id: Option<i64>,
@@ -948,6 +1048,33 @@ pub async fn complete_job(
         UPDATE jobs
         SET
             status = 'completed',
+            result = $2,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            updated_at = now()
+        WHERE id = $1
+          AND status = 'running'
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .bind(result)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(job)
+}
+
+pub async fn pause_job(
+    pool: &PgPool,
+    id: Uuid,
+    result: &Value,
+) -> Result<Option<JobRecord>, DbError> {
+    let job = sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET
+            status = 'paused',
             result = $2,
             lease_owner = NULL,
             lease_expires_at = NULL,

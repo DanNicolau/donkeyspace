@@ -1,0 +1,35 @@
+version: 1
+workflow:
+  state_labels:
+    needs_info: "ai:needs-info"
+    ready: "ai:ready"
+    in_progress: "ai:in-progress"
+    pr_open: "ai:pr-open"
+    needs_human: "ai:needs-human"
+    blocked: "ai:blocked"
+  block_labels: ["ai:disabled"]
+  allow_labels: ["ai"]
+lifecycle:
+  plugin:
+    manifest_path: /live-test-plugin/plugin.yml
+    flow: rtl_blocks
+    max_handoffs_per_edge: 0
+checks:
+  required_commands:
+    - name: "diff whitespace"
+      command: ["git", "diff", "--check"]
+  require_github_checks: false
+risk:
+  default: "unknown"
+  agent_classification: true
+  route_unknown_to_human: false
+  route_high_to_human: false
+  human_review_paths: []
+automation:
+  max_concurrent_jobs: 1
+  retry_failed_jobs: false
+  auto_merge: false
+dashboard:
+  expose_policy: true
+  allow_retry: true
+  allow_cancel: false

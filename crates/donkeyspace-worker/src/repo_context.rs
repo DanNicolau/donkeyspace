@@ -80,6 +80,19 @@ pub async fn build_repository_context(
 
     let workspace_path = workspace_path(job_id, config);
     let repo_path = workspace_path.join("repo");
+    if input
+        .pointer("/donkeyspace_resume")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        if !repo_path.join(".git").is_dir() {
+            return Err(
+                format!("paused lifecycle workspace is missing for resumed job {job_id}").into(),
+            );
+        }
+        let context = summarize_checkout(owner, repo, default_branch, &repo_path, input, config)?;
+        return Ok(serde_json::to_value(context)?);
+    }
     if workspace_path.exists() {
         fs::remove_dir_all(&workspace_path)?;
     }

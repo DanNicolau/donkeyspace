@@ -1,15 +1,15 @@
 use clap::Parser;
 use donkeyspace_core::policy::RequiredCommand;
 use donkeyspace_core::{
-    Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus, WorkflowState,
-    triage_github_issue_actions, workflow_state_for_outcome,
+    Confidence, Outcome, PluginManifest, Policy, Risk, RunResult, TestResult, TestStatus,
+    WorkflowState, triage_github_issue_actions, workflow_state_for_outcome,
 };
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
     acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
     create_job, create_outbound_action, fail_job, list_github_repositories,
     list_pending_outbound_actions, list_ready_developer_candidates, list_repair_candidates,
-    mark_job_running, mark_outbound_action_completed, mark_outbound_action_failed,
+    mark_job_running, mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
     record_state_transition, update_workflow_item_state,
 };
 use donkeyspace_github::GitHubClient;
@@ -28,6 +28,8 @@ use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod llm_triage;
+mod plugin_flow;
+mod plugin_task_graph;
 mod repo_context;
 
 use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
@@ -92,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let args = Args::parse();
     let policy = load_policy()?;
+    let _ = lifecycle_start_role(&policy)?;
 
     let pool = if let Some(database_url) = args.database_url {
         let pool = connect(&DbConfig::from_database_url(database_url)).await?;
@@ -276,6 +279,9 @@ async fn reconcile_ready_developer_jobs(
     policy: &Policy,
     limit: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if policy.lifecycle.plugin.is_some() {
+        return Ok(());
+    }
     if !policy.agents.developer.enabled {
         return Ok(());
     }
@@ -331,6 +337,9 @@ async fn reconcile_pr_repair_jobs(
     policy: &Policy,
     limit: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if policy.lifecycle.plugin.is_some() {
+        return Ok(());
+    }
     if !policy.agents.repair.enabled {
         return Ok(());
     }
@@ -430,6 +439,12 @@ async fn execute_job(
             role = running_job.role,
             "ignored closed issue job"
         );
+        return Ok(());
+    }
+
+    let lifecycle_role = lifecycle_start_role(policy)?;
+    if lifecycle_role.as_deref() == Some(running_job.role.as_str()) {
+        execute_developer_job(pool, policy, repo_context_config, github_token, running_job).await?;
         return Ok(());
     }
 
@@ -690,18 +705,22 @@ async fn execute_developer_job(
     github_token: Option<&str>,
     running_job: JobRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !policy.agents.developer.enabled {
+    let lifecycle_selection = policy.lifecycle.plugin.as_ref();
+    if lifecycle_selection.is_none() && !policy.agents.developer.enabled {
         fail_role_job(
             pool,
             &running_job,
-            "Developer execution failed.",
+            "Implementation execution failed.",
             "developer agent is disabled by policy",
             "developer execution failed",
         )
         .await?;
         return Ok(());
     }
-    if policy.agents.developer.command.is_empty() {
+    if lifecycle_selection.is_none()
+        && policy.agents.developer.command.is_empty()
+        && policy.agents.developer.plugin.is_none()
+    {
         fail_role_job(
             pool,
             &running_job,
@@ -718,7 +737,7 @@ async fn execute_developer_job(
             complete_ignored_closed_issue_job(pool, &running_job).await?;
             tracing::info!(
                 job_id = %running_job.id,
-                "ignored developer job because github issue is closed"
+                "ignored implementation job because github issue is closed"
             );
             return Ok(());
         }
@@ -727,7 +746,7 @@ async fn execute_developer_job(
             tracing::warn!(
                 job_id = %running_job.id,
                 %error,
-                "could not verify github issue state before developer execution"
+                "could not verify github issue state before implementation execution"
             );
         }
     }
@@ -747,11 +766,11 @@ async fn execute_developer_job(
                 &running_job,
                 "Repository checkout context failed.",
                 &error.to_string(),
-                "developer execution failed",
+                "implementation execution failed",
             )
             .await?;
             let _ = cleanup_repository_context(running_job.id, repo_context_config);
-            tracing::warn!(job_id = %running_job.id, "developer repository context failed");
+            tracing::warn!(job_id = %running_job.id, "implementation repository context failed");
             return Ok(());
         }
     };
@@ -763,23 +782,77 @@ async fn execute_developer_job(
             pool,
             workflow_item_id,
             Some(running_job.id),
-            Some(WorkflowState::Ready.as_str()),
+            if lifecycle_selection.is_some() {
+                None
+            } else {
+                Some(WorkflowState::Ready.as_str())
+            },
             WorkflowState::InProgress.as_str(),
-            "developer agent started",
+            "implementation lifecycle started",
         )
         .await?;
+
+        let state_result = RunResult {
+            outcome: Outcome::Implemented,
+            summary: "Implementation lifecycle is running.".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+        for action in triage_github_issue_actions(
+            policy,
+            &running_job.input,
+            &state_result,
+            WorkflowState::InProgress,
+        ) {
+            create_outbound_action(
+                pool,
+                &OutboundActionInput {
+                    workflow_item_id,
+                    job_id: Some(running_job.id),
+                    provider: "github".to_string(),
+                    action_type: action.action_type,
+                    payload: action.payload,
+                },
+            )
+            .await?;
+        }
     }
 
     let enriched_input =
         enrich_input_with_repository_context(&running_job.input, repository_context.clone());
-    let developer_result = run_agent_developer(
-        pool,
-        policy,
-        &running_job,
-        &enriched_input,
-        repo_context_config,
-    )
-    .await;
+    let plugin_github_client = github_token
+        .filter(|token| !token.trim().is_empty())
+        .map(GitHubClient::new)
+        .transpose()?;
+    let developer_result =
+        if let Some(selection) = lifecycle_selection.or(policy.agents.developer.plugin.as_ref()) {
+            plugin_flow::run(
+                selection,
+                &repository_checkout_path(&repository_context)?,
+                &workspace_path(running_job.id, repo_context_config),
+                &enriched_input,
+                Some(plugin_flow::LifecycleTracking {
+                    pool,
+                    coordinator: &running_job,
+                    github: plugin_github_client.as_ref(),
+                }),
+            )
+            .await
+        } else {
+            run_agent_developer(
+                pool,
+                policy,
+                &running_job,
+                &enriched_input,
+                repo_context_config,
+            )
+            .await
+        };
 
     let mut result = match developer_result {
         Ok(result) => result,
@@ -787,13 +860,13 @@ async fn execute_developer_job(
             fail_role_job(
                 pool,
                 &running_job,
-                "Developer execution failed.",
+                "Implementation execution failed.",
                 &error.to_string(),
-                "developer execution failed",
+                "implementation execution failed",
             )
             .await?;
             let _ = cleanup_repository_context(running_job.id, repo_context_config);
-            tracing::warn!(job_id = %running_job.id, "developer job failed");
+            tracing::warn!(job_id = %running_job.id, "implementation job failed");
             return Ok(());
         }
     };
@@ -801,8 +874,13 @@ async fn execute_developer_job(
     if result.outcome != Outcome::Implemented {
         let result_value = serde_json::to_value(&result)?;
         let workflow_state = workflow_state_for_outcome(result.outcome);
-        complete_job(pool, running_job.id, &result_value).await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        let paused = result.outcome == Outcome::NeedsHuman && lifecycle_selection.is_some();
+        if paused {
+            pause_job(pool, running_job.id, &result_value).await?;
+        } else {
+            complete_job(pool, running_job.id, &result_value).await?;
+            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        }
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
             update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
@@ -812,7 +890,7 @@ async fn execute_developer_job(
                 Some(running_job.id),
                 Some(WorkflowState::InProgress.as_str()),
                 workflow_state.as_str(),
-                "developer agent completed without implementation",
+                "implementation lifecycle completed without implementation",
             )
             .await?;
 
@@ -836,7 +914,8 @@ async fn execute_developer_job(
         tracing::info!(
             job_id = %running_job.id,
             outcome = ?result.outcome,
-            "developer job completed without implementation"
+            paused,
+            "implementation job stopped without implementation"
         );
         return Ok(());
     }
@@ -847,9 +926,9 @@ async fn execute_developer_job(
         fail_role_job(
             pool,
             &running_job,
-            "Developer execution failed.",
-            "developer agent returned implemented but did not modify the repository checkout",
-            "developer execution failed",
+            "Implementation execution failed.",
+            "implementation lifecycle returned implemented but did not modify the repository checkout",
+            "implementation execution failed",
         )
         .await?;
         let _ = cleanup_repository_context(running_job.id, repo_context_config);
@@ -865,7 +944,7 @@ async fn execute_developer_job(
     result.tests.extend(required_check_results);
     if required_checks_failed {
         result.outcome = Outcome::Failed;
-        result.summary = "Developer implementation failed required checks.".to_string();
+        result.summary = "Implementation failed required checks.".to_string();
         result.blocked_reason = Some(required_check_failure_summary(&result.tests));
         let result_value = serde_json::to_value(&result)?;
         fail_job(pool, running_job.id, &result_value).await?;
@@ -880,7 +959,7 @@ async fn execute_developer_job(
                 Some(running_job.id),
                 Some(WorkflowState::InProgress.as_str()),
                 WorkflowState::Blocked.as_str(),
-                "developer required checks failed",
+                "implementation required checks failed",
             )
             .await?;
 
@@ -906,7 +985,7 @@ async fn execute_developer_job(
 
         tracing::warn!(
             job_id = %running_job.id,
-            "developer job blocked by required checks"
+            "implementation job blocked by required checks"
         );
         return Ok(());
     }
@@ -931,9 +1010,9 @@ async fn execute_developer_job(
         fail_role_job(
             pool,
             &running_job,
-            "Developer execution failed.",
+            "Implementation execution failed.",
             &error.to_string(),
-            "developer execution failed",
+            "implementation execution failed",
         )
         .await?;
         let _ = cleanup_repository_context(running_job.id, repo_context_config);
@@ -945,7 +1024,7 @@ async fn execute_developer_job(
         let repo = repository_name(&running_job.input)?;
         let pull_request_body = developer_pull_request_body(&running_job, &result, &changed_files);
         let github_token = github_token
-            .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to open developer pull requests")?;
+            .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to open implementation pull requests")?;
         let github_client = GitHubClient::new(github_token)?;
         let pull_request_url = github_client
             .create_pull_request(
@@ -967,9 +1046,9 @@ async fn execute_developer_job(
             fail_role_job(
                 pool,
                 &running_job,
-                "Developer execution failed.",
+                "Implementation execution failed.",
                 &error.to_string(),
-                "developer execution failed",
+                "implementation execution failed",
             )
             .await?;
             let _ = cleanup_repository_context(running_job.id, repo_context_config);
@@ -992,7 +1071,7 @@ async fn execute_developer_job(
             workflow_state.as_str(),
             policy_routing_reason
                 .as_deref()
-                .unwrap_or("developer agent opened pull request"),
+                .unwrap_or("implementation lifecycle opened pull request"),
         )
         .await?;
 
@@ -1024,7 +1103,7 @@ async fn execute_developer_job(
                         "owner": owner,
                         "repo": repo,
                         "issue_number": issue_number,
-                        "body": format!("donkeyspace developer opened a pull request: {pull_request_url}"),
+                        "body": format!("donkeyspace implementation lifecycle opened a pull request: {pull_request_url}"),
                     }),
                 },
             )
@@ -1036,7 +1115,7 @@ async fn execute_developer_job(
         job_id = %running_job.id,
         branch = branch_name,
         pull_request_url,
-        "developer job completed"
+        "implementation job completed"
     );
 
     Ok(())
@@ -2422,7 +2501,7 @@ fn developer_pull_request_body(
     };
 
     format!(
-        "Closes #{}\n\n## Summary\n{}\n\n## Changed Files\n{}\n\n## Tests\n{}\n\nGenerated by donkeyspace developer job `{}`.",
+        "Closes #{}\n\n## Summary\n{}\n\n## Changed Files\n{}\n\n## Tests\n{}\n\nGenerated by donkeyspace implementation job `{}`.",
         issue_number(&running_job.input).unwrap_or(0),
         result.summary,
         changed_files
@@ -3318,4 +3397,23 @@ fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
         env::var("DONKEYSPACE_POLICY_PATH").unwrap_or_else(|_| ".donkeyspace/policy.yml".into());
     let raw = fs::read_to_string(&path)?;
     Ok(Policy::from_yaml(&raw)?)
+}
+
+fn lifecycle_start_role(policy: &Policy) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(selection) = &policy.lifecycle.plugin else {
+        return Ok(None);
+    };
+    let manifest = PluginManifest::from_path(&selection.manifest_path)?;
+    let flow = manifest
+        .flows
+        .get(&selection.flow)
+        .ok_or_else(|| format!("plugin `{}` has no flow `{}`", manifest.id, selection.flow))?;
+    if !flow.replaces_default_lifecycle {
+        return Err(format!(
+            "plugin flow `{}` must declare replaces_default_lifecycle to be selected as a lifecycle",
+            selection.flow
+        )
+        .into());
+    }
+    Ok(Some(flow.tasks[&flow.start].role.clone()))
 }

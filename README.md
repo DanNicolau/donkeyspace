@@ -19,6 +19,8 @@ It coordinates issue triage, clarification, agent implementation, automated chec
 - [V1 agent contract](docs/v1-agent-contract.md)
 - [V1 GitHub workflow](docs/v1-github-workflow.md)
 - [Policy guide](docs/policy.md)
+- [Plugin flow prototype](docs/plugin-flow.md)
+- [Plugin interface reference](docs/plugin-interface.md)
 - [Example policy](docs/policy.example.yml)
 - [Run result JSON Schema](schemas/run-result.schema.json)
 
@@ -70,6 +72,31 @@ docker compose --env-file /path/to/secrets.env up -d --force-recreate worker
 Without the token, GitHub writes remain pending and private-repo checkout fails.
 
 When the token is configured, the worker ensures every configured workflow, allow, and block label exists in GitHub repositories already seen by donkeyspace webhooks.
+
+### Webhook-free GitHub polling
+
+Deployments that cannot expose a public webhook URL can poll GitHub's repository
+event feed instead. Configure one or more repositories in `.env`:
+
+```sh
+DONKEYSPACE_GITHUB_TOKEN=...
+DONKEYSPACE_GITHUB_POLL_REPOSITORIES=example/rtl-project,example/another-project
+DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS=60
+DONKEYSPACE_GITHUB_POLL_MAX_PAGES=2
+```
+
+The API converts `IssuesEvent`, `IssueCommentEvent`, `PullRequestEvent`, and
+`PushEvent` records into the same internal ingestion format used by webhooks.
+GitHub event IDs become delivery IDs, so overlapping polling windows are
+idempotent. Webhooks and polling may be enabled together.
+
+On first startup, the poller ingests the recent events returned by the configured
+page window; normal policy labels still determine whether those events queue work.
+
+Polling is opt-in and requires both `DONKEYSPACE_DATABASE_URL` and
+`DONKEYSPACE_GITHUB_TOKEN`. The event feed is finite, so the interval and page
+count must be sized for the configured repositories' event volume; webhooks
+remain preferable for high-volume or low-latency deployments.
 
 Triage defaults to `DONKEYSPACE_TRIAGE_PROVIDER=agent` in Docker Compose. Set `DONKEYSPACE_TRIAGE_PROVIDER=auto` to use an OpenAI-compatible chat endpoint when `DONKEYSPACE_LLM_API_KEY` or `OPENROUTER_API_KEY` is present. The default test configuration for that path is:
 

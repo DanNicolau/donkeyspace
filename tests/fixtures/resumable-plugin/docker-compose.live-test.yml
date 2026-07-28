@@ -1,0 +1,11 @@
+services:
+  api:
+    environment:
+      DONKEYSPACE_POLICY_PATH: /live-test-plugin/policy.yml
+    volumes:
+      - ./tests/fixtures/resumable-plugin:/live-test-plugin:ro
+  worker:
+    environment:
+      DONKEYSPACE_POLICY_PATH: /live-test-plugin/policy.yml
+    volumes:
+      - ./tests/fixtures/resumable-plugin:/live-test-plugin:ro

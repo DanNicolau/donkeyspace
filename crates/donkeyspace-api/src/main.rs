@@ -6,19 +6,23 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use donkeyspace_core::{AgentRole, LabelState, Policy, WorkflowState, normalize_workflow_labels};
+use donkeyspace_core::{
+    AgentRole, LabelState, PluginManifest, Policy, WorkflowState, normalize_workflow_labels,
+};
 use donkeyspace_db::{
     DbConfig, JobRecord, PgPool, PullRequestInput, RepositoryInput, WorkflowItemInput,
-    acquire_job_lease, apply_migrations, connect, create_job, create_retry_job, get_job,
-    get_workflow_item_by_issue_number, get_workflow_item_state, latest_workflow_job_input,
-    list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
-    list_open_managed_pull_requests_for_base, list_recent_outbound_actions,
-    record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
-    reviewer_job_exists_for_pr_head, upsert_pull_request, upsert_repository, upsert_workflow_item,
+    acquire_job_lease, active_job_exists_for_workflow_item, apply_migrations, connect, create_job,
+    create_retry_job, get_job, get_workflow_item_by_issue_number, get_workflow_item_state,
+    latest_workflow_job_input, list_job_command_results, list_job_outbound_actions,
+    list_job_transitions, list_jobs, list_open_managed_pull_requests_for_base,
+    list_recent_outbound_actions, record_state_transition, record_webhook_delivery,
+    repair_job_exists_for_pr_base, resume_latest_paused_job, reviewer_job_exists_for_pr_head,
+    upsert_pull_request, upsert_repository, upsert_workflow_item,
 };
+use donkeyspace_github::GitHubClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{env, fs, net::SocketAddr, sync::Arc};
+use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -36,11 +40,32 @@ struct HealthResponse {
     service: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolledRepository {
+    owner: String,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubPollConfig {
+    repositories: Vec<PolledRepository>,
+    interval: Duration,
+    max_pages: usize,
+}
+
+#[derive(Debug)]
+struct GitHubIngressEvent {
+    event_name: &'static str,
+    delivery_id: String,
+    payload: Value,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let policy = load_policy()?;
+    let _ = lifecycle_start_role(&policy)?;
     let database_url = env::var("DONKEYSPACE_DATABASE_URL").ok();
     let pool = if let Some(database_url) = database_url {
         let pool = connect(&DbConfig::from_database_url(database_url)).await?;
@@ -57,6 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         policy,
     });
+
+    start_github_poller(state.clone())?;
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -78,6 +105,196 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%addr, "donkeyspace api listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn start_github_poller(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = GitHubPollConfig::from_env()?;
+    if config.repositories.is_empty() {
+        return Ok(());
+    }
+    if state.pool.is_none() {
+        return Err("github polling requires DONKEYSPACE_DATABASE_URL".into());
+    }
+    let token = env::var("DONKEYSPACE_GITHUB_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("github polling requires DONKEYSPACE_GITHUB_TOKEN")?;
+    let client = GitHubClient::new(token)?;
+
+    tracing::info!(
+        repositories = config.repositories.len(),
+        interval_seconds = config.interval.as_secs(),
+        max_pages = config.max_pages,
+        "github event poller enabled"
+    );
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = poll_github_events(&state, &client, &config).await {
+                tracing::error!(%error, "github event poll failed");
+            }
+            tokio::time::sleep(config.interval).await;
+        }
+    });
+    Ok(())
+}
+
+impl GitHubPollConfig {
+    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let repositories = parse_polled_repositories(
+            &env::var("DONKEYSPACE_GITHUB_POLL_REPOSITORIES").unwrap_or_default(),
+        )?;
+        let interval_seconds = env::var("DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse::<u64>()?
+            .max(5);
+        let max_pages = env::var("DONKEYSPACE_GITHUB_POLL_MAX_PAGES")
+            .unwrap_or_else(|_| "2".to_string())
+            .parse::<usize>()?
+            .max(1);
+        Ok(Self {
+            repositories,
+            interval: Duration::from_secs(interval_seconds),
+            max_pages,
+        })
+    }
+}
+
+fn parse_polled_repositories(value: &str) -> Result<Vec<PolledRepository>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (owner, name) = entry.split_once('/').ok_or_else(|| {
+                format!("invalid github polling repository `{entry}`; expected owner/name")
+            })?;
+            if owner.is_empty() || name.is_empty() || name.contains('/') {
+                return Err(format!(
+                    "invalid github polling repository `{entry}`; expected owner/name"
+                ));
+            }
+            Ok(PolledRepository {
+                owner: owner.to_string(),
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn poll_github_events(
+    state: &AppState,
+    client: &GitHubClient,
+    config: &GitHubPollConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = state.pool.as_ref().ok_or("database is not configured")?;
+    for repository in &config.repositories {
+        let repository_payload = client
+            .repository(&repository.owner, &repository.name)
+            .await?;
+        let mut events = client
+            .repository_events(&repository.owner, &repository.name, config.max_pages)
+            .await?;
+        events.reverse();
+
+        for mut event in events {
+            if event.get("type").and_then(Value::as_str) == Some("PullRequestEvent") {
+                let pull_request_number = event
+                    .pointer("/payload/number")
+                    .and_then(Value::as_u64)
+                    .ok_or("github pull request event is missing its number")?;
+                let pull_request = client
+                    .pull_request(&repository.owner, &repository.name, pull_request_number)
+                    .await?;
+                event["payload"]["pull_request"] = pull_request;
+            }
+            let Some(ingress) = github_poll_event_to_ingress(
+                &repository.owner,
+                &repository.name,
+                &repository_payload,
+                &event,
+            ) else {
+                continue;
+            };
+            let body = serde_json::to_vec(&ingress.payload)?;
+            match persist_github_webhook(
+                pool,
+                &state.policy,
+                ingress.event_name,
+                &ingress.delivery_id,
+                &body,
+            )
+            .await?
+            {
+                WebhookPersistOutcome::Queued(job) => tracing::info!(
+                    job_id = %job.id,
+                    event = ingress.event_name,
+                    delivery = ingress.delivery_id,
+                    "queued github polling job"
+                ),
+                WebhookPersistOutcome::Ignored | WebhookPersistOutcome::Duplicate => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn github_poll_event_to_ingress(
+    owner: &str,
+    repo: &str,
+    repository: &Value,
+    event: &Value,
+) -> Option<GitHubIngressEvent> {
+    let event_id = event.get("id")?.as_str()?;
+    let event_type = event.get("type")?.as_str()?;
+    let source = event.get("payload")?;
+    let repository = json!({
+        "name": repository.get("name")?,
+        "default_branch": repository.get("default_branch")?,
+        "owner": {"login": repository.pointer("/owner/login")?},
+    });
+    let (event_name, payload) = match event_type {
+        "IssuesEvent" => (
+            "issues",
+            json!({
+                "action": source.get("action")?,
+                "repository": repository,
+                "issue": source.get("issue")?,
+                "label": source.get("label").cloned().unwrap_or(Value::Null),
+            }),
+        ),
+        "IssueCommentEvent" => (
+            "issue_comment",
+            json!({
+                "action": source.get("action")?,
+                "repository": repository,
+                "issue": source.get("issue")?,
+                "comment": source.get("comment")?,
+            }),
+        ),
+        "PullRequestEvent" => (
+            "pull_request",
+            json!({
+                "action": source.get("action")?,
+                "repository": repository,
+                "pull_request": source.get("pull_request")?,
+            }),
+        ),
+        "PushEvent" => (
+            "push",
+            json!({
+                "ref": source.get("ref")?,
+                "after": source.get("head")?,
+                "repository": repository,
+            }),
+        ),
+        _ => return None,
+    };
+
+    Some(GitHubIngressEvent {
+        event_name,
+        delivery_id: format!("github-poll:{owner}/{repo}:{event_id}"),
+        payload,
+    })
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -386,6 +603,25 @@ fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
     Ok(Policy::from_yaml(&raw)?)
 }
 
+fn lifecycle_start_role(policy: &Policy) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(selection) = &policy.lifecycle.plugin else {
+        return Ok(None);
+    };
+    let manifest = PluginManifest::from_path(&selection.manifest_path)?;
+    let flow = manifest
+        .flows
+        .get(&selection.flow)
+        .ok_or_else(|| format!("plugin `{}` has no flow `{}`", manifest.id, selection.flow))?;
+    if !flow.replaces_default_lifecycle {
+        return Err(format!(
+            "plugin flow `{}` must declare replaces_default_lifecycle to be selected as a lifecycle",
+            selection.flow
+        )
+        .into());
+    }
+    Ok(Some(flow.tasks[&flow.start].role.clone()))
+}
+
 async fn persist_github_webhook(
     pool: &PgPool,
     policy: &Policy,
@@ -398,7 +634,7 @@ async fn persist_github_webhook(
             persist_issue_webhook(pool, policy, event, delivery, body).await
         }
         "pull_request" => persist_pull_request_webhook(pool, policy, event, delivery, body).await,
-        "push" => persist_push_webhook(pool, event, delivery, body).await,
+        "push" => persist_push_webhook(pool, policy, event, delivery, body).await,
         _ => {
             let payload: Value = serde_json::from_slice(body)?;
             let inserted = record_webhook_delivery(pool, None, delivery, event, &payload).await?;
@@ -489,6 +725,14 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
+    if is_projected_work_item(&payload.issue.body) {
+        tracing::info!(
+            issue_number = payload.issue.number,
+            "projected plugin work-item issue did not queue an independent lifecycle"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
     let automation_decision = policy.automation_decision_for_labels(&labels);
     if !automation_decision.is_allowed() {
         tracing::info!(
@@ -520,24 +764,55 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
-    let job = create_job(
-        pool,
-        Some(workflow_item_id),
-        AgentRole::Triage.as_str(),
-        &payload_value,
-    )
-    .await?;
+    if active_job_exists_for_workflow_item(pool, workflow_item_id).await? {
+        tracing::info!(
+            event,
+            action = payload.action,
+            issue_number = payload.issue.number,
+            "active workflow job already exists; duplicate trigger ignored"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
+    if event == "issue_comment"
+        && current_state.as_deref() == Some(WorkflowState::NeedsHuman.as_str())
+        && payload
+            .comment
+            .as_ref()
+            .map(is_human_comment)
+            .unwrap_or(false)
+        && let Some(job) = resume_latest_paused_job(pool, workflow_item_id, &payload_value).await?
+    {
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            Some(job.id),
+            current_state.as_deref(),
+            "lifecycle_resumed",
+            "resumed paused plugin lifecycle from human comment",
+        )
+        .await?;
+        return Ok(WebhookPersistOutcome::Queued(job));
+    }
+
+    let initial_role =
+        lifecycle_start_role(policy)?.unwrap_or_else(|| AgentRole::Triage.as_str().to_string());
+    let job = create_job(pool, Some(workflow_item_id), &initial_role, &payload_value).await?;
     record_state_transition(
         pool,
         workflow_item_id,
         Some(job.id),
         current_state.as_deref(),
-        "triage_queued",
-        "queued triage job from github webhook",
+        &format!("{initial_role}_queued"),
+        &format!("queued {initial_role} job from github webhook"),
     )
     .await?;
 
     Ok(WebhookPersistOutcome::Queued(job))
+}
+
+fn is_projected_work_item(body: &str) -> bool {
+    body.contains("<!-- donkeyspace-work-item -->")
 }
 
 async fn persist_pull_request_webhook(
@@ -608,13 +883,15 @@ async fn persist_pull_request_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     };
 
-    if !should_queue_reviewer(
-        &payload.action,
-        &payload.pull_request.state,
-        payload.pull_request.draft,
-        managed,
-        policy.agents.reviewer.enabled,
-    ) {
+    if policy.lifecycle.plugin.is_some()
+        || !should_queue_reviewer(
+            &payload.action,
+            &payload.pull_request.state,
+            payload.pull_request.draft,
+            managed,
+            policy.agents.reviewer.enabled,
+        )
+    {
         tracing::info!(
             action = payload.action,
             pr_number = payload.pull_request.number,
@@ -671,6 +948,7 @@ async fn persist_pull_request_webhook(
 
 async fn persist_push_webhook(
     pool: &PgPool,
+    policy: &Policy,
     event: &str,
     delivery: &str,
     body: &[u8],
@@ -692,6 +970,9 @@ async fn persist_push_webhook(
         record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
     if !inserted {
         return Ok(WebhookPersistOutcome::Duplicate);
+    }
+    if policy.lifecycle.plugin.is_some() {
+        return Ok(WebhookPersistOutcome::Ignored);
     }
 
     let Some(branch) = payload.git_ref.strip_prefix("refs/heads/") else {
@@ -801,7 +1082,7 @@ fn should_queue_triage(
                 Some(state)
                     if matches!(
                         state,
-                        "needs_info" | "blocked"
+                        "needs_info" | "needs_human" | "blocked"
                     )
             ) && comment.map(is_human_comment).unwrap_or(false)
         }
@@ -934,6 +1215,8 @@ struct GitHubIssue {
     id: i64,
     number: i64,
     state: String,
+    #[serde(default)]
+    body: String,
     labels: Vec<GitHubLabel>,
 }
 
@@ -999,12 +1282,85 @@ impl ApiError {
 mod tests {
     use super::{
         GitHubComment, JobRecord, can_retry_job, comment_is_from_donkeyspace,
-        extract_linked_issue_number, issue_number_from_donkeyspace_branch,
-        should_queue_reviewer, should_queue_triage,
+        extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
+        issue_number_from_donkeyspace_branch, parse_polled_repositories, should_queue_reviewer,
+        should_queue_triage,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use uuid::Uuid;
+
+    #[test]
+    fn parses_polled_repository_list() {
+        let repositories = parse_polled_repositories("acme/rtl, acme/dv").unwrap();
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(repositories[0].owner, "acme");
+        assert_eq!(repositories[0].name, "rtl");
+        assert!(parse_polled_repositories("missing-owner-separator").is_err());
+        assert!(parse_polled_repositories("acme/too/many").is_err());
+    }
+
+    #[test]
+    fn adapts_polled_issue_event_to_webhook_shape() {
+        let repository = json!({
+            "name": "rtl",
+            "default_branch": "main",
+            "owner": {"login": "acme"}
+        });
+        let event = json!({
+            "id": "12345",
+            "type": "IssuesEvent",
+            "payload": {
+                "action": "opened",
+                "issue": {"id": 7, "number": 3, "state": "open", "labels": []}
+            }
+        });
+
+        let ingress = github_poll_event_to_ingress("acme", "rtl", &repository, &event).unwrap();
+        assert_eq!(ingress.event_name, "issues");
+        assert_eq!(ingress.delivery_id, "github-poll:acme/rtl:12345");
+        assert_eq!(ingress.payload["repository"]["default_branch"], "main");
+        assert_eq!(ingress.payload["issue"]["number"], 3);
+    }
+
+    #[test]
+    fn preserves_changed_label_in_polled_issue_event() {
+        let repository = json!({
+            "name": "rtl",
+            "default_branch": "main",
+            "owner": {"login": "acme"}
+        });
+        let event = json!({
+            "id": "12346",
+            "type": "IssuesEvent",
+            "payload": {
+                "action": "labeled",
+                "issue": {"id": 7, "number": 3, "state": "open", "labels": [{"name": "ai"}]},
+                "label": {"name": "ai"}
+            }
+        });
+
+        let ingress = github_poll_event_to_ingress("acme", "rtl", &repository, &event).unwrap();
+        assert_eq!(ingress.payload["label"]["name"], "ai");
+    }
+
+    #[test]
+    fn adapts_polled_push_head_to_webhook_after_sha() {
+        let repository = json!({
+            "name": "rtl",
+            "default_branch": "main",
+            "owner": {"login": "acme"}
+        });
+        let event = json!({
+            "id": "67890",
+            "type": "PushEvent",
+            "payload": {"ref": "refs/heads/main", "head": "abc123"}
+        });
+
+        let ingress = github_poll_event_to_ingress("acme", "rtl", &repository, &event).unwrap();
+        assert_eq!(ingress.event_name, "push");
+        assert_eq!(ingress.payload["after"], "abc123");
+    }
 
     fn queue_triage(
         event: &str,
@@ -1106,6 +1462,19 @@ mod tests {
     }
 
     #[test]
+    fn human_comment_on_needs_human_queues_triage() {
+        assert!(queue_triage(
+            "issue_comment",
+            "created",
+            "open",
+            Some("needs_human"),
+            Some(&GitHubComment {
+                body: "N+2 is acceptable and makes sense.".to_string(),
+            }),
+        ));
+    }
+
+    #[test]
     fn edited_human_comment_on_blocked_queues_triage() {
         assert!(queue_triage(
             "issue_comment",
@@ -1163,6 +1532,14 @@ mod tests {
     }
 
     #[test]
+    fn projected_work_item_marker_prevents_recursive_lifecycle() {
+        assert!(is_projected_work_item(
+            "<!-- donkeyspace-work-item -->\n\nBlock specification"
+        ));
+        assert!(!is_projected_work_item("ordinary issue body"));
+    }
+
+    #[test]
     fn pull_request_webhook_queues_reviewer_for_managed_open_pr() {
         assert!(should_queue_reviewer(
             "synchronize",
@@ -1212,7 +1589,10 @@ mod tests {
 
     #[test]
     fn failed_jobs_can_be_retried_when_not_blocked_or_needs_human() {
-        assert!(can_retry_job(&job_with_status_and_outcome("failed", Some("failed"))));
+        assert!(can_retry_job(&job_with_status_and_outcome(
+            "failed",
+            Some("failed")
+        )));
         assert!(can_retry_job(&job_with_status_and_outcome("failed", None)));
     }
 

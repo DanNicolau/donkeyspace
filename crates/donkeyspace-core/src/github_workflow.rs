@@ -100,6 +100,35 @@ pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> O
             result.summary,
             workflow_label_text(target_state)
         )),
+        Outcome::NeedsHuman => {
+            let reason = result
+                .human_review_reason
+                .as_deref()
+                .unwrap_or("The workflow requires a human decision before it can continue.");
+            let failed_checks = result
+                .tests
+                .iter()
+                .filter(|test| test.status == crate::TestStatus::Failed)
+                .map(|test| {
+                    format!(
+                        "- `{}`: {}",
+                        test.name,
+                        test.summary.as_deref().unwrap_or("No details reported.")
+                    )
+                })
+                .collect::<Vec<_>>();
+            let evidence = if failed_checks.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nFailed verification:\n{}", failed_checks.join("\n"))
+            };
+
+            Some(format!(
+                "donkeyspace needs human input before this workflow can continue.\n\nWhat needs attention:\n{reason}\n\nLatest result:\n{}{evidence}\n\nWhat to do:\nReview the reason and failed verification above, then comment on this issue with the decision, clarification, or correction. A human comment will requeue the workflow.\n\nCurrent state: `{}`",
+                result.summary,
+                workflow_label_text(target_state)
+            ))
+        }
         _ => None,
     }
 }
@@ -239,5 +268,39 @@ mod tests {
 
         assert!(body.contains("- How should this be verified?"));
         assert!(body.contains("Current state: `ai:needs-info`"));
+    }
+
+    #[test]
+    fn needs_human_comment_explains_required_action_and_failed_checks() {
+        let body = triage_comment_body(
+            &RunResult {
+                outcome: Outcome::NeedsHuman,
+                summary: "DV and RTL disagree about output latency.".to_string(),
+                confidence: Confidence::High,
+                risk: Risk::High,
+                questions: Vec::new(),
+                tests: vec![crate::TestResult {
+                    name: "top-level simulation".to_string(),
+                    command: vec!["make".to_string(), "test".to_string()],
+                    status: crate::TestStatus::Failed,
+                    exit_code: Some(1),
+                    summary: Some("31 cycle-alignment mismatches.".to_string()),
+                }],
+                changed_files: Vec::new(),
+                human_review_reason: Some(
+                    "The DV-to-RTL handoff exceeded the policy limit.".to_string(),
+                ),
+                blocked_reason: None,
+            },
+            WorkflowState::NeedsHuman,
+        )
+        .unwrap();
+
+        assert!(body.contains("What needs attention:"));
+        assert!(body.contains("handoff exceeded the policy limit"));
+        assert!(body.contains("Failed verification:"));
+        assert!(body.contains("`top-level simulation`: 31 cycle-alignment mismatches."));
+        assert!(body.contains("comment on this issue"));
+        assert!(body.contains("Current state: `ai:needs-human`"));
     }
 }
