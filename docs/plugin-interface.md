@@ -242,3 +242,29 @@ pauses are resumable from their durable checkpoint, but an unplanned
 coordinator crash between checkpoints does not yet resume the graph from the
 last completed task. Parallelism is wave-based, and publication occurs after
 the complete graph succeeds.
+
+## Deployment
+
+Build the plugin image according to the plugin's instructions. The base Compose
+stack exposes a generic `/plugins` mount; each plugin owns its source mount,
+runtime variables, Compose overlay, and ready-to-use policy. A typical local
+deployment looks like this:
+
+```sh
+cd ../example-plugin
+docker build -t example-plugin:dev .
+cp donkeyspace.env.example .env
+
+cd ../donkeyspace
+docker compose \
+  --env-file .env \
+  --env-file ../example-plugin/.env \
+  -f docker-compose.yml \
+  -f ../example-plugin/docker-compose.donkeyspace.yml \
+  up -d --build
+```
+
+Plugin-specific mount paths and runtime variables belong in the plugin-owned
+overlay and environment file. Donkeyspace itself only requires the generic
+`DONKEYSPACE_PLUGINS_DIR` installation root. Restart the API and worker after
+changing the selected policy or plugin manifest.

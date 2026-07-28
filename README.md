@@ -4,31 +4,32 @@ donkeyspace is a self-hosted harness for agentic repository work.
 
 It coordinates issue triage, clarification, agent implementation, automated checks, reviewer-agent feedback, and human approval around the tools teams already use. The first target is a GitHub-first workflow where labels and comments remain the visible collaboration surface, while donkeyspace manages policy, orchestration, containerized agent execution, and audit history.
 
-## V1 Scope
+## Scope
 
 - GitHub-first: Issues, labels, comments, pull requests, and CI.
 - Self-hosted: Docker Compose deployment for small engineering teams.
 - Agent-runtime agnostic: orchestrates external agent CLIs instead of building a new coding agent.
-- Human-gated by default: agents can prepare, implement, and review, but humans merge v1 PRs.
+- Human-gated by default: agents can prepare, implement, and review, but humans merge pull requests.
 - Policy driven: repository config defines allowed automation, required checks, risk gates, and escalation behavior.
 
-## Current Documents
+## Documentation
 
-- [Architecture, scope, and known limitations](docs/agentic-repo-harness-design.md)
-- [V1 readiness checklist](docs/v1-readiness-checklist.md)
-- [V1 agent contract](docs/v1-agent-contract.md)
-- [V1 GitHub workflow](docs/v1-github-workflow.md)
+- [Architecture, scope, and known limitations](docs/architecture.md)
+- [Default-lifecycle agent contract](docs/agent-contract.md)
+- [Default GitHub workflow](docs/github-workflow.md)
 - [Policy guide](docs/policy.md)
-- [Plugin flow prototype](docs/plugin-flow.md)
 - [Plugin interface reference](docs/plugin-interface.md)
-- [Example policy](docs/policy.example.yml)
+- [Default-lifecycle example policy](docs/policy.example.yml)
+- [Lifecycle-plugin example policy](docs/policy.plugin.example.yml)
 - [Run result JSON Schema](schemas/run-result.schema.json)
 
 ## Current Architecture
 
 - Policy config lives at `.donkeyspace/policy.yml`.
-- GitHub labels drive workflow state in v1.
+- GitHub labels drive visible workflow state.
 - GitHub comments carry human clarification and agent summaries.
+- Repository policy selects either the built-in lifecycle or an opt-in plugin
+  that replaces it with its own roles and task graph.
 - Agent work runs in ephemeral workspaces inside the worker container.
 - Tool-using agent work runs through external CLIs in a prepared workspace; bounded prompt context is only used for OpenAI-compatible triage.
 - PostgreSQL stores run history, decisions, locks, and audit records.
@@ -127,7 +128,7 @@ The default local policy runs `git diff --check`, `cargo test --workspace`, and 
 
 Policy lives in `.donkeyspace/policy.yml`. It gates automation with allow/block labels, defines agent commands, runs required local checks, and routes high-risk, unknown-risk, or sensitive-path work to humans. See [the policy guide](docs/policy.md) for the supported fields and current limitations.
 
-When GitHub sends a `pull_request` webhook for a donkeyspace-managed PR, the API links it back to the source issue and queues a reviewer job. The default reviewer command is `donkeyspace-codex-reviewer`. Reviewer jobs fetch the PR head into the ephemeral checkout, receive PR metadata plus changed-file and diff context, and post their result as a PR conversation comment. V1 reviewer findings do not automatically start another developer job.
+When GitHub sends a `pull_request` webhook for a donkeyspace-managed PR, the API links it back to the source issue and queues a reviewer job. The default reviewer command is `donkeyspace-codex-reviewer`. Reviewer jobs fetch the PR head into the ephemeral checkout, receive PR metadata plus changed-file and diff context, and post their result as a PR conversation comment. In the default lifecycle, reviewer findings do not automatically start another developer job; lifecycle plugins can define bounded feedback edges between their own tasks.
 
 When GitHub sends a `push` webhook for a repository's default branch, donkeyspace queues repair checks for open donkeyspace-managed PRs targeting that branch. The repair worker locally attempts to merge the updated base branch into the PR branch. If the merge is clean, it records that no repair was needed. If Git reports conflicts, the default repair command `donkeyspace-codex-repair` resolves the merge conflict in the checkout, then donkeyspace commits and pushes the repair to the existing PR branch.
 

@@ -88,12 +88,14 @@ Supported path patterns are exact paths, prefix globs ending in `/**`, and neste
 
 ## Automation
 
-`automation.auto_merge` is false by default and v1 keeps humans responsible for merging. `automation.max_concurrent_jobs` and `automation.retry_failed_jobs` are reserved declarations; neither is enforced yet.
+`automation.auto_merge` is false by default and humans remain responsible for merging. `automation.max_concurrent_jobs` and `automation.retry_failed_jobs` are reserved declarations; neither is enforced yet.
 
 Failed jobs can be retried manually through `POST /api/runs/{id}/retry` or the
 dashboard when `dashboard.allow_retry` is true. Only failed jobs are eligible;
 results with `blocked` or `needs_human` outcomes must be resolved by a person
-instead. A retry creates a new job linked through `retry_of_job_id`.
+instead. For a paused lifecycle plugin, a human comment on the parent issue
+resumes the saved coordinator checkpoint. A retry creates a new job linked
+through `retry_of_job_id`.
 
 ## Dashboard
 
