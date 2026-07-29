@@ -81,7 +81,7 @@ pub fn triage_github_issue_actions(
 }
 
 pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> Option<String> {
-    match result.outcome {
+    let body = match result.outcome {
         Outcome::NeedsInfo => {
             let questions = result
                 .questions
@@ -130,7 +130,8 @@ pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> O
             ))
         }
         _ => None,
-    }
+    }?;
+    Some(format!("{body}\n\n<!-- donkeyspace-generated -->"))
 }
 
 fn workflow_label_text(state: WorkflowState) -> &'static str {

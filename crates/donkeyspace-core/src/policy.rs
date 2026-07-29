@@ -85,6 +85,73 @@ pub struct WorkflowPolicy {
     pub block_labels: Vec<String>,
     #[serde(default)]
     pub allow_labels: Vec<String>,
+    #[serde(default)]
+    pub engagement: EngagementPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EngagementPolicy {
+    #[serde(default = "EngagementRule::token_owner")]
+    pub initial: EngagementRule,
+    #[serde(default = "EngagementRule::token_owner")]
+    pub clarification: EngagementRule,
+    #[serde(default = "EngagementRule::token_owner")]
+    pub blocked_resume: EngagementRule,
+    #[serde(default = "EngagementRule::token_owner")]
+    pub human_authorization: EngagementRule,
+}
+
+impl Default for EngagementPolicy {
+    fn default() -> Self {
+        Self {
+            initial: EngagementRule::token_owner(),
+            clarification: EngagementRule::token_owner(),
+            blocked_resume: EngagementRule::token_owner(),
+            human_authorization: EngagementRule::token_owner(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EngagementRule {
+    #[serde(default)]
+    pub any: bool,
+    #[serde(default)]
+    pub token_owner: bool,
+    #[serde(default)]
+    pub issue_author: bool,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(default)]
+    pub author_associations: Vec<String>,
+    #[serde(default)]
+    pub trusted_bots: Vec<String>,
+}
+
+impl EngagementRule {
+    fn token_owner() -> Self {
+        Self {
+            token_owner: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn requires_token_owner(&self) -> bool {
+        self.token_owner
+    }
+}
+
+impl EngagementPolicy {
+    pub fn requires_token_owner(&self) -> bool {
+        [
+            &self.initial,
+            &self.clarification,
+            &self.blocked_resume,
+            &self.human_authorization,
+        ]
+        .iter()
+        .any(|rule| rule.requires_token_owner())
+    }
 }
 
 impl WorkflowPolicy {
@@ -293,6 +360,8 @@ mod tests {
         assert!(policy.agents.triage.enabled);
         assert!(policy.agents.repair.enabled);
         assert_eq!(policy.workflow.state_labels["ready"], "ai:ready");
+        assert!(policy.workflow.engagement.initial.token_owner);
+        assert!(policy.workflow.engagement.human_authorization.token_owner);
     }
 
     #[test]

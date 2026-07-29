@@ -12,6 +12,11 @@ workflow:
     - "ai:disabled"
   allow_labels:
     - "ai"
+  engagement:
+    initial: { token_owner: true }
+    clarification: { token_owner: true }
+    blocked_resume: { token_owner: true }
+    human_authorization: { token_owner: true }
 
 agents:
   triage:

@@ -77,6 +77,16 @@ impl GitHubClient {
         })
     }
 
+    pub async fn authenticated_login(&self) -> Result<String, GitHubClientError> {
+        let user: Value = self.client.get("/user", None::<&()>).await?;
+        user["login"]
+            .as_str()
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                GitHubClientError::InvalidResponse("authenticated GitHub user has no login".into())
+            })
+    }
+
     pub async fn add_issue_label(
         &self,
         owner: &str,

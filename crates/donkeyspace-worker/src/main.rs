@@ -1103,7 +1103,7 @@ async fn execute_developer_job(
                         "owner": owner,
                         "repo": repo,
                         "issue_number": issue_number,
-                        "body": format!("donkeyspace implementation lifecycle opened a pull request: {pull_request_url}"),
+                        "body": format!("donkeyspace implementation lifecycle opened a pull request: {pull_request_url}\n\n<!-- donkeyspace-generated -->"),
                     }),
                 },
             )
@@ -2949,7 +2949,7 @@ fn input_is_donkeyspace_comment(input: &serde_json::Value) -> bool {
         && input
             .pointer("/comment/body")
             .and_then(serde_json::Value::as_str)
-            .map(|body| body.trim_start().starts_with("donkeyspace "))
+            .map(|body| body.contains("<!-- donkeyspace-generated -->"))
             .unwrap_or(false)
 }
 
@@ -3081,7 +3081,7 @@ mod tests {
         assert!(input_is_donkeyspace_comment(&json!({
             "action": "created",
             "comment": {
-                "body": "donkeyspace triage needs clarification before this issue can move to implementation."
+                "body": "donkeyspace triage needs clarification.\n\n<!-- donkeyspace-generated -->"
             }
         })));
     }

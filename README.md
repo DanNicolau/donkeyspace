@@ -58,7 +58,7 @@ Start the local API, worker, PostgreSQL, and dashboard services:
 docker compose up --build
 ```
 
-To let the worker clone private repos, push branches, open PRs, create missing donkeyspace labels, and apply pending GitHub labels/comments, set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. Compose automatically reads `.env` from the donkeyspace project directory:
+Set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. The default engagement policy resolves this token's GitHub user and permits only that user to trigger AI work; the worker also uses it for GitHub writes and private-repository checkout. Compose automatically reads `.env` from the donkeyspace project directory:
 
 ```sh
 cp .env.example .env
@@ -70,7 +70,7 @@ If your credentials live elsewhere, pass them explicitly:
 docker compose --env-file /path/to/secrets.env up -d --force-recreate worker
 ```
 
-Without the token, GitHub writes remain pending and private-repo checkout fails.
+Without the token, the API fails startup under the default `token_owner` engagement policy. A deployment using an explicit allowlist can omit it, though GitHub writes then remain pending and private-repository checkout fails.
 
 When the token is configured, the worker ensures every configured workflow, allow, and block label exists in GitHub repositories already seen by donkeyspace webhooks.
 

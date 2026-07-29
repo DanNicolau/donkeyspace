@@ -7,7 +7,8 @@ use axum::{
     routing::{get, post},
 };
 use donkeyspace_core::{
-    AgentRole, LabelState, PluginManifest, Policy, WorkflowState, normalize_workflow_labels,
+    AgentRole, EngagementRule, LabelState, PluginManifest, Policy, WorkflowState,
+    normalize_workflow_labels,
 };
 use donkeyspace_db::{
     DbConfig, JobRecord, PgPool, PullRequestInput, RepositoryInput, WorkflowItemInput,
@@ -32,6 +33,7 @@ struct AppState {
     webhook_secret: Option<String>,
     pool: Option<PgPool>,
     policy: Policy,
+    github_token_owner: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy = load_policy()?;
     let _ = lifecycle_start_role(&policy)?;
+    let github_token_owner = resolve_github_token_owner(&policy).await?;
     let database_url = env::var("DONKEYSPACE_DATABASE_URL").ok();
     let pool = if let Some(database_url) = database_url {
         let pool = connect(&DbConfig::from_database_url(database_url)).await?;
@@ -81,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webhook_secret: env::var("DONKEYSPACE_WEBHOOK_SECRET").ok(),
         pool,
         policy,
+        github_token_owner,
     });
 
     start_github_poller(state.clone())?;
@@ -105,6 +109,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%addr, "donkeyspace api listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn resolve_github_token_owner(
+    policy: &Policy,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !policy.workflow.engagement.requires_token_owner() {
+        return Ok(None);
+    }
+    let token = env::var("DONKEYSPACE_GITHUB_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(
+            "workflow engagement policy uses token_owner but DONKEYSPACE_GITHUB_TOKEN is unset",
+        )?;
+    let login = GitHubClient::new(token)?
+        .authenticated_login()
+        .await
+        .map_err(|error| {
+            format!("workflow engagement policy could not resolve token_owner: {error}")
+        })?;
+    tracing::info!(
+        github_login = login,
+        "resolved authorized GitHub token owner"
+    );
+    Ok(Some(login))
 }
 
 fn start_github_poller(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
@@ -219,6 +248,7 @@ async fn poll_github_events(
             match persist_github_webhook(
                 pool,
                 &state.policy,
+                state.github_token_owner.as_deref(),
                 ingress.event_name,
                 &ingress.delivery_id,
                 &body,
@@ -260,6 +290,7 @@ fn github_poll_event_to_ingress(
                 "repository": repository,
                 "issue": source.get("issue")?,
                 "label": source.get("label").cloned().unwrap_or(Value::Null),
+                "sender": event.get("actor")?,
             }),
         ),
         "IssueCommentEvent" => (
@@ -269,6 +300,7 @@ fn github_poll_event_to_ingress(
                 "repository": repository,
                 "issue": source.get("issue")?,
                 "comment": source.get("comment")?,
+                "sender": event.get("actor")?,
             }),
         ),
         "PullRequestEvent" => (
@@ -572,7 +604,16 @@ async fn github_webhook(
         return StatusCode::ACCEPTED;
     };
 
-    match persist_github_webhook(pool, &state.policy, event, delivery, &body).await {
+    match persist_github_webhook(
+        pool,
+        &state.policy,
+        state.github_token_owner.as_deref(),
+        event,
+        delivery,
+        &body,
+    )
+    .await
+    {
         Ok(WebhookPersistOutcome::Ignored) => StatusCode::ACCEPTED,
         Ok(WebhookPersistOutcome::Duplicate) => StatusCode::OK,
         Ok(WebhookPersistOutcome::Queued(job)) => {
@@ -625,13 +666,14 @@ fn lifecycle_start_role(policy: &Policy) -> Result<Option<String>, Box<dyn std::
 async fn persist_github_webhook(
     pool: &PgPool,
     policy: &Policy,
+    token_owner: Option<&str>,
     event: &str,
     delivery: &str,
     body: &[u8],
 ) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
     match event {
         "issues" | "issue_comment" => {
-            persist_issue_webhook(pool, policy, event, delivery, body).await
+            persist_issue_webhook(pool, policy, token_owner, event, delivery, body).await
         }
         "pull_request" => persist_pull_request_webhook(pool, policy, event, delivery, body).await,
         "push" => persist_push_webhook(pool, policy, event, delivery, body).await,
@@ -650,6 +692,7 @@ async fn persist_github_webhook(
 async fn persist_issue_webhook(
     pool: &PgPool,
     policy: &Policy,
+    token_owner: Option<&str>,
     event: &str,
     delivery: &str,
     body: &[u8],
@@ -660,9 +703,9 @@ async fn persist_issue_webhook(
         pool,
         &RepositoryInput {
             provider: "github".to_string(),
-            owner: payload.repository.owner.login,
-            name: payload.repository.name,
-            default_branch: payload.repository.default_branch,
+            owner: payload.repository.owner.login.clone(),
+            name: payload.repository.name.clone(),
+            default_branch: payload.repository.default_branch.clone(),
         },
     )
     .await?;
@@ -676,8 +719,8 @@ async fn persist_issue_webhook(
     let labels = payload
         .issue
         .labels
-        .into_iter()
-        .map(|label| label.name)
+        .iter()
+        .map(|label| label.name.clone())
         .collect::<Vec<_>>();
     let label_state = normalize_workflow_labels(&labels, &policy.workflow.state_labels);
     let label_state_name = match &label_state {
@@ -764,6 +807,29 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
+    let authorization =
+        engagement_authorization(policy, current_state.as_deref(), &payload, token_owner);
+    if !authorization.allowed {
+        let audit_state = current_state.as_deref().unwrap_or("unstarted");
+        record_state_transition(
+            pool,
+            workflow_item_id,
+            None,
+            current_state.as_deref(),
+            audit_state,
+            &format!("AI engagement denied: {}", authorization.reason),
+        )
+        .await?;
+        tracing::info!(
+            event,
+            action = payload.action,
+            issue_number = payload.issue.number,
+            reason = authorization.reason,
+            "actor was not authorized to trigger agent work"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
     if active_job_exists_for_workflow_item(pool, workflow_item_id).await? {
         tracing::info!(
             event,
@@ -789,7 +855,10 @@ async fn persist_issue_webhook(
             Some(job.id),
             current_state.as_deref(),
             "lifecycle_resumed",
-            "resumed paused plugin lifecycle from human comment",
+            &format!(
+                "resumed paused plugin lifecycle from human comment; {}",
+                authorization.reason
+            ),
         )
         .await?;
         return Ok(WebhookPersistOutcome::Queued(job));
@@ -804,7 +873,10 @@ async fn persist_issue_webhook(
         Some(job.id),
         current_state.as_deref(),
         &format!("{initial_role}_queued"),
-        &format!("queued {initial_role} job from github webhook"),
+        &format!(
+            "queued {initial_role} job from github webhook; {}",
+            authorization.reason
+        ),
     )
     .await?;
 
@@ -1090,6 +1162,84 @@ fn should_queue_triage(
     }
 }
 
+struct EngagementAuthorization {
+    allowed: bool,
+    reason: String,
+}
+
+fn engagement_authorization(
+    policy: &Policy,
+    current_state: Option<&str>,
+    payload: &GitHubIssueWebhook,
+    token_owner: Option<&str>,
+) -> EngagementAuthorization {
+    let (path, rule) = match current_state {
+        Some("needs_info") => ("clarification", &policy.workflow.engagement.clarification),
+        Some("blocked") => ("blocked_resume", &policy.workflow.engagement.blocked_resume),
+        Some("needs_human") => (
+            "human_authorization",
+            &policy.workflow.engagement.human_authorization,
+        ),
+        _ => ("initial", &policy.workflow.engagement.initial),
+    };
+    authorize_actor(path, rule, payload, token_owner)
+}
+
+fn authorize_actor(
+    path: &str,
+    rule: &EngagementRule,
+    payload: &GitHubIssueWebhook,
+    token_owner: Option<&str>,
+) -> EngagementAuthorization {
+    let Some(actor) = payload.sender.as_ref() else {
+        return EngagementAuthorization {
+            allowed: false,
+            reason: format!("{path} policy requires actor metadata, but sender is missing"),
+        };
+    };
+    let association = payload
+        .comment
+        .as_ref()
+        .and_then(|comment| comment.author_association.as_deref())
+        .or(payload.issue.author_association.as_deref());
+    let is_bot = matches!(actor.actor_type.as_str(), "Bot" | "App");
+    let matches = (rule.any && !is_bot)
+        || (rule.token_owner
+            && token_owner.is_some_and(|login| login.eq_ignore_ascii_case(&actor.login)))
+        || (!is_bot
+            && rule.issue_author
+            && payload
+                .issue
+                .user
+                .as_ref()
+                .is_some_and(|author| author.login.eq_ignore_ascii_case(&actor.login)))
+        || (!is_bot
+            && rule
+                .users
+                .iter()
+                .any(|login| login.eq_ignore_ascii_case(&actor.login)))
+        || (is_bot
+            && rule
+                .trusted_bots
+                .iter()
+                .any(|login| login.eq_ignore_ascii_case(&actor.login)))
+        || (!is_bot
+            && association.is_some_and(|value| {
+                rule.author_associations
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(value))
+            }));
+
+    EngagementAuthorization {
+        allowed: matches,
+        reason: if matches {
+            format!("{path} engagement authorized actor `{}`", actor.login)
+        } else {
+            format!("{path} policy does not authorize actor `{}`", actor.login)
+        },
+    }
+}
+
 fn should_queue_reviewer(
     action: &str,
     pr_state: &str,
@@ -1125,7 +1275,7 @@ fn is_human_comment(comment: &GitHubComment) -> bool {
 }
 
 fn comment_is_from_donkeyspace(comment: &GitHubComment) -> bool {
-    comment.body.trim_start().starts_with("donkeyspace ")
+    comment.body.contains("<!-- donkeyspace-generated -->")
 }
 
 fn pull_request_is_managed(pull_request: &GitHubPullRequest) -> bool {
@@ -1181,6 +1331,8 @@ struct GitHubIssueWebhook {
     comment: Option<GitHubComment>,
     #[serde(default)]
     label: Option<GitHubLabel>,
+    #[serde(default)]
+    sender: Option<GitHubActor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1218,6 +1370,10 @@ struct GitHubIssue {
     #[serde(default)]
     body: String,
     labels: Vec<GitHubLabel>,
+    #[serde(default)]
+    user: Option<GitHubActor>,
+    #[serde(default)]
+    author_association: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1225,9 +1381,18 @@ struct GitHubLabel {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct GitHubComment {
     body: String,
+    #[serde(default)]
+    author_association: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubActor {
+    login: String,
+    #[serde(default, rename = "type")]
+    actor_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1281,10 +1446,10 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubComment, JobRecord, can_retry_job, comment_is_from_donkeyspace,
-        extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
-        issue_number_from_donkeyspace_branch, parse_polled_repositories, should_queue_reviewer,
-        should_queue_triage,
+        GitHubComment, GitHubIssueWebhook, JobRecord, can_retry_job, comment_is_from_donkeyspace,
+        engagement_authorization, extract_linked_issue_number, github_poll_event_to_ingress,
+        is_projected_work_item, issue_number_from_donkeyspace_branch, parse_polled_repositories,
+        should_queue_reviewer, should_queue_triage,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -1310,6 +1475,7 @@ mod tests {
         let event = json!({
             "id": "12345",
             "type": "IssuesEvent",
+            "actor": {"login": "octocat", "type": "User"},
             "payload": {
                 "action": "opened",
                 "issue": {"id": 7, "number": 3, "state": "open", "labels": []}
@@ -1321,6 +1487,38 @@ mod tests {
         assert_eq!(ingress.delivery_id, "github-poll:acme/rtl:12345");
         assert_eq!(ingress.payload["repository"]["default_branch"], "main");
         assert_eq!(ingress.payload["issue"]["number"], 3);
+        assert_eq!(ingress.payload["sender"]["login"], "octocat");
+    }
+
+    #[test]
+    fn token_owner_is_the_default_authorized_actor() {
+        let policy =
+            donkeyspace_core::Policy::from_yaml(include_str!("../../../docs/policy.example.yml"))
+                .unwrap();
+        let payload: GitHubIssueWebhook = serde_json::from_value(json!({
+            "action": "labeled",
+            "repository": {"name": "repo", "default_branch": "main", "owner": {"login": "owner"}},
+            "issue": {"id": 1, "number": 1, "state": "open", "body": "", "labels": [], "user": {"login": "author", "type": "User"}},
+            "sender": {"login": "octocat", "type": "User"}
+        }))
+        .unwrap();
+
+        assert!(engagement_authorization(&policy, None, &payload, Some("octocat")).allowed);
+        assert!(!engagement_authorization(&policy, None, &payload, Some("someone-else")).allowed);
+    }
+
+    #[test]
+    fn missing_actor_metadata_fails_closed() {
+        let policy =
+            donkeyspace_core::Policy::from_yaml(include_str!("../../../docs/policy.example.yml"))
+                .unwrap();
+        let payload: GitHubIssueWebhook = serde_json::from_value(json!({
+            "action": "opened",
+            "repository": {"name": "repo", "default_branch": "main", "owner": {"login": "owner"}},
+            "issue": {"id": 1, "number": 1, "state": "open", "body": "", "labels": []}
+        }))
+        .unwrap();
+        assert!(!engagement_authorization(&policy, None, &payload, Some("octocat")).allowed);
     }
 
     #[test]
@@ -1333,6 +1531,7 @@ mod tests {
         let event = json!({
             "id": "12346",
             "type": "IssuesEvent",
+            "actor": {"login": "octocat", "type": "User"},
             "payload": {
                 "action": "labeled",
                 "issue": {"id": 7, "number": 3, "state": "open", "labels": [{"name": "ai"}]},
@@ -1444,6 +1643,7 @@ mod tests {
             Some("needs_info"),
             Some(&GitHubComment {
                 body: "Here are the reproduction steps.".to_string(),
+                ..Default::default()
             }),
         ));
     }
@@ -1457,6 +1657,7 @@ mod tests {
             Some("blocked"),
             Some(&GitHubComment {
                 body: "I added the missing detail.".to_string(),
+                ..Default::default()
             }),
         ));
     }
@@ -1470,6 +1671,7 @@ mod tests {
             Some("needs_human"),
             Some(&GitHubComment {
                 body: "N+2 is acceptable and makes sense.".to_string(),
+                ..Default::default()
             }),
         ));
     }
@@ -1483,6 +1685,7 @@ mod tests {
             Some("blocked"),
             Some(&GitHubComment {
                 body: "Updated with more details.".to_string(),
+                ..Default::default()
             }),
         ));
     }
@@ -1496,6 +1699,7 @@ mod tests {
             Some("ready"),
             Some(&GitHubComment {
                 body: "Looks good.".to_string(),
+                ..Default::default()
             }),
         ));
     }
@@ -1519,7 +1723,9 @@ mod tests {
             "open",
             Some("blocked"),
             Some(&GitHubComment {
-                body: "donkeyspace triage needs clarification before this issue can move to implementation.".to_string(),
+                body: "donkeyspace triage needs clarification.\n\n<!-- donkeyspace-generated -->"
+                    .to_string(),
+                ..Default::default()
             }),
         ));
     }
@@ -1527,7 +1733,9 @@ mod tests {
     #[test]
     fn detects_donkeyspace_generated_comment_after_whitespace() {
         assert!(comment_is_from_donkeyspace(&GitHubComment {
-            body: "\n  donkeyspace marked this issue ready for agent implementation.".to_string(),
+            body: "\n  donkeyspace marked this issue ready.\n\n<!-- donkeyspace-generated -->"
+                .to_string(),
+            ..Default::default()
         }));
     }
 
