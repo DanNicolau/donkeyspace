@@ -116,6 +116,142 @@ expands every `scope: work_item` task. Work-item write roots must contain the
 `{work_item}` placeholder so parallel attempts cannot replace one another's
 files.
 
+## Resources
+
+Plugins can supply ordinary files or recursively snapshotted directories to a
+role without embedding their meaning in Donkeyspace:
+
+```yaml
+resources:
+  project-standards:
+    source: plugin
+    path: resources/project-standards.md
+  reference-library:
+    source: repository
+    path: .project/references
+
+roles:
+  developer:
+    command: [/plugin/run, developer]
+    resources:
+      - id: project-standards
+        required: true
+
+flows:
+  implementation:
+    start: develop
+    tasks:
+      develop:
+        role: developer
+        resources:
+          - id: reference-library
+            required: false
+```
+
+`source: plugin` paths are relative to the manifest directory;
+`source: repository` paths are relative to the repository checkout. A path may
+name one regular file or one directory. Directories include every regular file
+beneath them recursively, so a newly added file is visible on the next task
+attempt without a manifest change. Empty required directories are valid.
+
+Role and task assignments are unioned. If either assignment marks the same ID
+required, it is required. `required` controls missing-source failure only; an
+available optional resource is still supplied. Missing optional resources are
+recorded as unavailable.
+
+Each attempt materializes an independent snapshot at
+`.donkeyspace/resources/<id>/`. A file snapshot contains the source basename;
+a directory snapshot preserves its relative tree. Run input records the source,
+declared source path, materialized root, availability, sorted relative
+inventory, and a SHA-256 tree digest. The digest covers both sorted paths and
+contents and is verified after every publishable execution. Resource mutation
+therefore prevents publication.
+
+Resource IDs and paths must be relative and traversal-safe. Symlinks and
+special files are rejected, as are snapshots over 1,024 files or 32 MiB. These
+rules apply to both plugin- and repository-sourced material.
+
+## Typed parameters
+
+A manifest can expose deployment-selected values while retaining defaults:
+
+```yaml
+parameters:
+  source_root:
+    type: path
+    default: src
+  source_extension:
+    type: enum
+    values: [rs, txt]
+    default: rs
+  project_name:
+    type: string
+    default: example
+  retry_count:
+    type: integer
+    default: 2
+  strict:
+    type: boolean
+    default: true
+
+flows:
+  implementation:
+    start: develop
+    tasks:
+      develop:
+        role: developer
+        read: ["{source_root}"]
+        write: ["{source_root}/{work_item}.{source_extension}"]
+```
+
+Policy selects values for the flow:
+
+```yaml
+lifecycle:
+  plugin:
+    manifest_path: /plugins/example/donkeyspace-plugin.yml
+    flow: implementation
+    parameters:
+      source_root: lib
+      source_extension: txt
+```
+
+All resolved values are included under `parameters` in task input. Only `path`
+and filesystem-safe `enum` parameters may appear in resource paths, work-item
+registry paths, task read/write roots, and artifact paths. Donkeyspace rejects
+missing or unknown parameters, wrong types, invalid enum values, unknown
+placeholders, absolute paths, and traversal. Parameters are never expanded in
+commands, image names, or environment-variable names.
+
+## Artifact contracts and validators
+
+Tasks can declare exact output paths and commands that mechanically validate a
+publishable result:
+
+```yaml
+tasks:
+  develop:
+    role: developer
+    write: ["{source_root}"]
+    artifacts:
+      - path: "{source_root}/{work_item}.{source_extension}"
+        type: file
+        required: true
+    validators:
+      - name: source validation
+        command: [/plugin/checks/validate-source]
+```
+
+Artifact types are behavioral and limited to `file` and `directory`; paths are
+exact and must remain within the task's write roots. For an `implemented`
+result, Donkeyspace validates reported changed paths, verifies the resource
+snapshot, validates artifacts, and runs validators before copying any changes
+back. Validators run in the task's image with the same workspace, allowed
+environment, and resources. Their exit codes and summaries are appended to the
+standard test results. A missing or wrong-type artifact, modified resource, or
+failed validator publishes nothing. Artifact and validator checks are skipped
+for non-publishable outcomes such as `needs_changes`.
+
 ## Work-item registry
 
 The planner writes the JSON file configured by `work_items_path`:
@@ -213,13 +349,29 @@ Lifecycle task input includes the actual role, graph task, and work item:
     "read": ["docs/design", "rtl", "dv/fifo"],
     "write": ["dv/fifo"]
   },
+  "parameters": {
+    "source_root": "src",
+    "source_extension": "rs"
+  },
+  "resources": [
+    {
+      "id": "project-standards",
+      "source": "plugin",
+      "source_path": "resources/project-standards.md",
+      "root": ".donkeyspace/resources/project-standards",
+      "available": true,
+      "inventory": ["project-standards.md"],
+      "digest": "sha256:..."
+    }
+  ],
   "previous_tasks": []
 }
 ```
 
 Each task writes `.donkeyspace/run-result.json`, using the standard `RunResult`
-plus an optional handoff. Roles must not commit, push, apply labels, open pull
-requests, or edit outside the filtered workspace.
+plus an optional handoff and optional `resources_used` array. Every reported
+resource ID must have been available to that attempt. Roles must not commit,
+push, apply labels, open pull requests, or edit outside the filtered workspace.
 
 ## GitHub relationship projection
 

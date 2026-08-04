@@ -167,6 +167,8 @@ pub struct PluginFlowSelection {
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
+    pub parameters: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
     #[serde(alias = "stage_access_overrides")]
     pub task_access_overrides: BTreeMap<String, TaskAccessOverride>,
 }

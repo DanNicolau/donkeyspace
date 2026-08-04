@@ -1,6 +1,8 @@
 use donkeyspace_core::{
-    Confidence, Outcome, PluginFlow, PluginFlowSelection, PluginManifest, PluginTask,
-    PluginTaskResult, PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult, TestResult,
+    Confidence, Outcome, PluginArtifact, PluginArtifactType, PluginFlow, PluginFlowSelection,
+    PluginManifest, PluginParameter, PluginResourceAssignment, PluginResourceSource, PluginTask,
+    PluginTaskResult, PluginValidator, PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult,
+    TestResult, TestStatus,
 };
 use donkeyspace_db::{
     JobRecord, PgPool, complete_job, create_waiting_job, fail_job, start_waiting_job,
@@ -9,10 +11,11 @@ use donkeyspace_github::{GitHubClient, GitHubWorkItem};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     process::Stdio,
 };
 use tokio::process::Command;
@@ -27,6 +30,19 @@ pub struct LifecycleTracking<'a> {
 }
 
 const CHECKPOINT_VERSION: u32 = 1;
+const MAX_RESOURCE_FILES: usize = 1_024;
+const MAX_RESOURCE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct MaterializedResource {
+    id: String,
+    source: PluginResourceSource,
+    source_path: String,
+    root: String,
+    available: bool,
+    inventory: Vec<String>,
+    digest: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct TrackedJobCheckpoint {
@@ -67,6 +83,10 @@ pub async fn run(
     tracking: Option<LifecycleTracking<'_>>,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     let manifest = PluginManifest::from_path(&selection.manifest_path)?;
+    let parameters = resolve_parameters(&manifest, selection)?;
+    let plugin_root = Path::new(&selection.manifest_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
     let flow = manifest
         .flows
         .get(&selection.flow)
@@ -80,6 +100,8 @@ pub async fn run(
             workspace_path,
             issue_input,
             tracking,
+            &parameters,
+            plugin_root,
         )
         .await;
     }
@@ -110,8 +132,16 @@ pub async fn run(
             .join(format!("{attempt:02}-{stage_name}"));
         let stage_repo = stage_root.join("repo");
         fs::create_dir_all(&stage_repo)?;
-        let (read_roots, write_roots) =
-            resolve_access(selection, &stage_name, &stage.read, &stage.write)?;
+        let declared_read = expand_templates(&stage.read, &parameters, None)?;
+        let declared_write = expand_templates(&stage.write, &parameters, None)?;
+        let (read_roots, write_roots) = resolve_access(
+            selection,
+            &stage_name,
+            &declared_read,
+            &declared_write,
+            &parameters,
+            &manifest.parameters,
+        )?;
         for root in read_roots.iter().chain(&write_roots) {
             copy_root(repo_path, &stage_repo, root)?;
         }
@@ -120,6 +150,15 @@ pub async fn run(
         fs::create_dir_all(&donkeyspace)?;
         let input_path = donkeyspace.join("run-input.json");
         let result_path = donkeyspace.join("run-result.json");
+        let resources = materialize_resources(
+            &manifest,
+            &stage.role,
+            stage,
+            plugin_root,
+            repo_path,
+            &stage_root,
+            &parameters,
+        )?;
         let selected_mcp = agent
             .mcp_servers
             .iter()
@@ -134,6 +173,8 @@ pub async fn run(
                 "issue": issue_input.pointer("/issue").unwrap_or(issue_input),
                 "repository": issue_input.pointer("/repository"),
                 "workspace": {"repo_path": "repo", "result_path": ".donkeyspace/run-result.json", "read": read_roots, "write": write_roots},
+                "parameters": parameters,
+                "resources": resources,
                 "previous_stages": previous,
                 "mcp_servers": selected_mcp,
             }))?,
@@ -160,14 +201,29 @@ pub async fn run(
             .into());
         }
         let raw = fs::read_to_string(&result_path)?;
-        let stage_result: PluginTaskResult = serde_json::from_str(&raw)?;
-        stage_result.result.validate_for_orchestration()?;
+        let mut stage_result: PluginTaskResult = serde_json::from_str(&raw)?;
+        validate_resources_used(&stage_result.resources_used, &resources)?;
         validate_changed_files(&stage_result.result.changed_files, &write_roots)?;
-        let publish_changes = matches!(
-            stage_result.result.outcome,
-            Outcome::Implemented | Outcome::NeedsChanges
-        );
+        let publish_changes = is_publishable(stage_result.result.outcome);
         if publish_changes {
+            verify_resources(&stage_root, &resources)?;
+            validate_artifacts(
+                &stage_repo,
+                &expand_artifacts(&stage.artifacts, &parameters, None)?,
+                &write_roots,
+            )?;
+            let validator_results = run_validators(
+                &stage.validators,
+                image,
+                &stage_root,
+                &selection.environment,
+                &agent.environment,
+            )
+            .await?;
+            apply_validator_results(&mut stage_result.result, validator_results);
+        }
+        stage_result.result.validate_for_orchestration()?;
+        if is_publishable(stage_result.result.outcome) {
             for root in &write_roots {
                 replace_root(&stage_repo, repo_path, root)?;
             }
@@ -230,6 +286,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_work_item_lifecycle(
     selection: &PluginFlowSelection,
     manifest: &PluginManifest,
@@ -238,6 +295,8 @@ async fn run_work_item_lifecycle(
     workspace_path: &Path,
     issue_input: &Value,
     tracking: Option<LifecycleTracking<'_>>,
+    parameters: &BTreeMap<String, Value>,
+    plugin_root: &Path,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     let checkpoint_path = workspace_path
         .join(".donkeyspace")
@@ -310,6 +369,8 @@ async fn run_work_item_lifecycle(
             workspace_path,
             issue_input,
             &previous,
+            parameters,
+            plugin_root,
         )
         .await?;
         accumulated_tests.extend(planner.result.tests.clone());
@@ -329,12 +390,13 @@ async fn run_work_item_lifecycle(
         )
     };
 
-    let registry_path = flow
+    let registry_template = flow
         .work_items_path
         .as_deref()
         .ok_or("lifecycle flow is missing work_items_path")?;
+    let registry_path = expand_template(registry_template, parameters)?;
     let registry: PluginWorkItemRegistry =
-        serde_json::from_str(&fs::read_to_string(repo_path.join(registry_path))?)?;
+        serde_json::from_str(&fs::read_to_string(repo_path.join(&registry_path))?)?;
     validate_work_items(&registry.work_items)?;
     if let Some(item) = registry
         .work_items
@@ -502,6 +564,8 @@ async fn run_work_item_lifecycle(
                 workspace_path,
                 issue_input,
                 &previous,
+                parameters,
+                plugin_root,
             )
         }))
         .await;
@@ -971,6 +1035,8 @@ async fn execute_task(
     workspace_path: &Path,
     issue_input: &Value,
     previous: &[Value],
+    parameters: &BTreeMap<String, Value>,
+    plugin_root: &Path,
 ) -> Result<PluginTaskResult, Box<dyn std::error::Error>> {
     let role = &manifest.roles[&task.role];
     let item_suffix = work_item
@@ -981,16 +1047,31 @@ async fn execute_task(
         .join(format!("{attempt:04}-{task_name}{item_suffix}"));
     let task_repo = task_root.join("repo");
     fs::create_dir_all(&task_repo)?;
-    let declared_read = expand_roots(&task.read, work_item);
-    let declared_write = expand_roots(&task.write, work_item);
-    let (read_roots, write_roots) =
-        resolve_access(selection, task_name, &declared_read, &declared_write)?;
+    let declared_read = expand_templates(&task.read, parameters, work_item)?;
+    let declared_write = expand_templates(&task.write, parameters, work_item)?;
+    let (read_roots, write_roots) = resolve_access(
+        selection,
+        task_name,
+        &declared_read,
+        &declared_write,
+        parameters,
+        &manifest.parameters,
+    )?;
     for root in read_roots.iter().chain(&write_roots) {
         copy_root(repo_path, &task_repo, root)?;
     }
     let donkeyspace = task_root.join(".donkeyspace");
     fs::create_dir_all(&donkeyspace)?;
     let result_path = donkeyspace.join("run-result.json");
+    let resources = materialize_resources(
+        manifest,
+        &task.role,
+        task,
+        plugin_root,
+        repo_path,
+        &task_root,
+        parameters,
+    )?;
     let selected_mcp = role
         .mcp_servers
         .iter()
@@ -1006,6 +1087,8 @@ async fn execute_task(
             "issue": issue_input.pointer("/issue").unwrap_or(issue_input),
             "repository": issue_input.pointer("/repository"),
             "workspace": {"repo_path": "repo", "result_path": ".donkeyspace/run-result.json", "read": read_roots, "write": write_roots},
+            "parameters": parameters,
+            "resources": resources,
             "previous_tasks": previous.iter().rev().take(64).rev().collect::<Vec<_>>(),
             "mcp_servers": selected_mcp,
         }))?,
@@ -1030,13 +1113,26 @@ async fn execute_task(
         )
         .into());
     }
-    let task_result: PluginTaskResult = serde_json::from_str(&fs::read_to_string(result_path)?)?;
-    task_result.result.validate_for_orchestration()?;
+    let mut task_result: PluginTaskResult =
+        serde_json::from_str(&fs::read_to_string(result_path)?)?;
+    validate_resources_used(&task_result.resources_used, &resources)?;
     validate_changed_files(&task_result.result.changed_files, &write_roots)?;
-    if matches!(
-        task_result.result.outcome,
-        Outcome::Implemented | Outcome::NeedsChanges
-    ) {
+    if is_publishable(task_result.result.outcome) {
+        verify_resources(&task_root, &resources)?;
+        let artifacts = expand_artifacts(&task.artifacts, parameters, work_item)?;
+        validate_artifacts(&task_repo, &artifacts, &write_roots)?;
+        let validator_results = run_validators(
+            &task.validators,
+            image,
+            &task_root,
+            &selection.environment,
+            &role.environment,
+        )
+        .await?;
+        apply_validator_results(&mut task_result.result, validator_results);
+    }
+    task_result.result.validate_for_orchestration()?;
+    if is_publishable(task_result.result.outcome) {
         for root in &write_roots {
             replace_root(&task_repo, repo_path, root)?;
         }
@@ -1044,12 +1140,19 @@ async fn execute_task(
     Ok(task_result)
 }
 
-fn expand_roots(roots: &[String], work_item: Option<&PluginWorkItem>) -> Vec<String> {
-    roots
+fn expand_templates(
+    values: &[String],
+    parameters: &BTreeMap<String, Value>,
+    work_item: Option<&PluginWorkItem>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    values
         .iter()
-        .map(|root| match work_item {
-            Some(item) => root.replace("{work_item}", &item.id),
-            None => root.clone(),
+        .map(|value| {
+            let expanded = expand_template(value, parameters)?;
+            Ok(match work_item {
+                Some(item) => expanded.replace("{work_item}", &item.id),
+                None => expanded,
+            })
         })
         .collect()
 }
@@ -1163,6 +1266,416 @@ fn flow_summary(previous: &[Value], final_summary: &str) -> String {
     lines.join("\n")
 }
 
+fn resolve_parameters(
+    manifest: &PluginManifest,
+    selection: &PluginFlowSelection,
+) -> Result<BTreeMap<String, Value>, Box<dyn std::error::Error>> {
+    if let Some(name) = selection
+        .parameters
+        .keys()
+        .find(|name| !manifest.parameters.contains_key(*name))
+    {
+        return Err(format!("unknown plugin parameter `{name}`").into());
+    }
+    let mut resolved = BTreeMap::new();
+    for (name, definition) in &manifest.parameters {
+        let selected = selection.parameters.get(name);
+        if let Some(selected) = selected {
+            let valid = match definition {
+                PluginParameter::Path { .. }
+                | PluginParameter::Enum { .. }
+                | PluginParameter::String { .. } => selected.is_string(),
+                PluginParameter::Integer { .. } => selected.is_i64(),
+                PluginParameter::Boolean { .. } => selected.is_boolean(),
+            };
+            if !valid {
+                return Err(format!("invalid type for plugin parameter `{name}`").into());
+            }
+        }
+        let value = match definition {
+            PluginParameter::Path { default } => {
+                let value = selected
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| default.clone())
+                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?;
+                validate_runtime_path(&value)?;
+                Value::String(value)
+            }
+            PluginParameter::Enum { values, default } => {
+                let value = selected
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| default.clone())
+                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?;
+                if !values.contains(&value) {
+                    return Err(format!("invalid value for enum parameter `{name}`").into());
+                }
+                Value::String(value)
+            }
+            PluginParameter::String { default } => Value::String(
+                selected
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| default.clone())
+                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?,
+            ),
+            PluginParameter::Integer { default } => Value::Number(
+                selected
+                    .and_then(Value::as_i64)
+                    .or(*default)
+                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?
+                    .into(),
+            ),
+            PluginParameter::Boolean { default } => Value::Bool(
+                selected
+                    .and_then(Value::as_bool)
+                    .or(*default)
+                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?,
+            ),
+        };
+        resolved.insert(name.clone(), value);
+    }
+    Ok(resolved)
+}
+
+fn expand_template(
+    template: &str,
+    parameters: &BTreeMap<String, Value>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut expanded = template.to_string();
+    for (name, value) in parameters {
+        if let Some(value) = value.as_str() {
+            expanded = expanded.replace(&format!("{{{name}}}"), value);
+        }
+    }
+    let remainder = expanded.replace("{work_item}", "item");
+    if remainder.contains('{') || remainder.contains('}') {
+        return Err(format!("unknown placeholder in filesystem field `{template}`").into());
+    }
+    validate_runtime_path(&remainder)?;
+    Ok(expanded)
+}
+
+fn validate_runtime_path(value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || value.contains(['{', '}'])
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("unsafe plugin path `{value}`").into());
+    }
+    Ok(())
+}
+
+fn merged_resource_assignments(
+    role: &[PluginResourceAssignment],
+    task: &[PluginResourceAssignment],
+) -> BTreeMap<String, bool> {
+    let mut merged = BTreeMap::new();
+    for assignment in role.iter().chain(task) {
+        merged
+            .entry(assignment.id.clone())
+            .and_modify(|required| *required |= assignment.required)
+            .or_insert(assignment.required);
+    }
+    merged
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_resources(
+    manifest: &PluginManifest,
+    role_name: &str,
+    task: &PluginTask,
+    plugin_root: &Path,
+    repo_root: &Path,
+    attempt_root: &Path,
+    parameters: &BTreeMap<String, Value>,
+) -> Result<Vec<MaterializedResource>, Box<dyn std::error::Error>> {
+    let assignments =
+        merged_resource_assignments(&manifest.roles[role_name].resources, &task.resources);
+    let mut result = Vec::new();
+    for (id, required) in assignments {
+        let definition = &manifest.resources[&id];
+        let source_path = expand_template(&definition.path, parameters)?;
+        let source_root = match definition.source {
+            PluginResourceSource::Plugin => plugin_root,
+            PluginResourceSource::Repository => repo_root,
+        };
+        let source = source_root.join(&source_path);
+        let relative_root = format!(".donkeyspace/resources/{id}");
+        let target = attempt_root.join(&relative_root);
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(metadata) = metadata else {
+            if required {
+                return Err(
+                    format!("required resource `{id}` is missing at `{source_path}`").into(),
+                );
+            }
+            result.push(MaterializedResource {
+                id,
+                source: definition.source,
+                source_path,
+                root: relative_root,
+                available: false,
+                inventory: Vec::new(),
+                digest: None,
+            });
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!("resource `{id}` may not be a symlink").into());
+        }
+        fs::create_dir_all(&target)?;
+        if metadata.is_file() {
+            let basename = source
+                .file_name()
+                .ok_or_else(|| format!("resource `{id}` has no basename"))?;
+            copy_resource_entry(&source, &target.join(basename))?;
+        } else if metadata.is_dir() {
+            copy_resource_directory(&source, &target)?;
+        } else {
+            return Err(format!("resource `{id}` is not a regular file or directory").into());
+        }
+        let (inventory, digest) = digest_resource_tree(&target)?;
+        result.push(MaterializedResource {
+            id,
+            source: definition.source,
+            source_path,
+            root: relative_root,
+            available: true,
+            inventory,
+            digest: Some(digest),
+        });
+    }
+    Ok(result)
+}
+
+fn copy_resource_directory(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("resource contains symlink `{}`", entry.path().display()).into());
+        }
+        let destination = target.join(entry.file_name());
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination)?;
+            copy_resource_directory(&entry.path(), &destination)?;
+        } else if metadata.is_file() {
+            copy_resource_entry(&entry.path(), &destination)?;
+        } else {
+            return Err(format!(
+                "resource contains special file `{}`",
+                entry.path().display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn copy_resource_entry(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, target)?;
+    Ok(())
+}
+
+fn digest_resource_tree(root: &Path) -> Result<(Vec<String>, String), Box<dyn std::error::Error>> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("materialized resource root is not a regular directory".into());
+    }
+    fn visit(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() {
+                return Err("materialized resource contains a symlink".into());
+            }
+            if metadata.is_dir() {
+                visit(&entry.path(), files)?;
+            } else if metadata.is_file() {
+                files.push(entry.path());
+            } else {
+                return Err("materialized resource contains a special file".into());
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(root, &mut files)?;
+    if files.len() > MAX_RESOURCE_FILES {
+        return Err(format!("resource exceeds {MAX_RESOURCE_FILES} files").into());
+    }
+    let mut inventory = Vec::with_capacity(files.len());
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    for file in files {
+        let relative = file
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = fs::read(&file)?;
+        total = total.saturating_add(contents.len() as u64);
+        if total > MAX_RESOURCE_BYTES {
+            return Err(format!("resource exceeds {MAX_RESOURCE_BYTES} bytes").into());
+        }
+        hasher.update((relative.len() as u64).to_be_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update((contents.len() as u64).to_be_bytes());
+        hasher.update(&contents);
+        inventory.push(relative);
+    }
+    Ok((inventory, format!("sha256:{:x}", hasher.finalize())))
+}
+
+fn verify_resources(
+    attempt_root: &Path,
+    resources: &[MaterializedResource],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for resource in resources.iter().filter(|resource| resource.available) {
+        let (inventory, digest) = digest_resource_tree(&attempt_root.join(&resource.root))?;
+        if inventory != resource.inventory || Some(digest) != resource.digest {
+            return Err(format!("resource `{}` was modified during execution", resource.id).into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_resources_used(
+    used: &[String],
+    resources: &[MaterializedResource],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let supplied = resources
+        .iter()
+        .filter(|resource| resource.available)
+        .map(|resource| resource.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if let Some(id) = used.iter().find(|id| !supplied.contains(id.as_str())) {
+        return Err(format!("plugin reported unsupplied resource `{id}`").into());
+    }
+    Ok(())
+}
+
+fn expand_artifacts(
+    artifacts: &[PluginArtifact],
+    parameters: &BTreeMap<String, Value>,
+    work_item: Option<&PluginWorkItem>,
+) -> Result<Vec<PluginArtifact>, Box<dyn std::error::Error>> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            let mut artifact = artifact.clone();
+            artifact.path = expand_template(&artifact.path, parameters)?;
+            if let Some(item) = work_item {
+                artifact.path = artifact.path.replace("{work_item}", &item.id);
+            }
+            Ok(artifact)
+        })
+        .collect()
+}
+
+fn validate_artifacts(
+    repo: &Path,
+    artifacts: &[PluginArtifact],
+    write_roots: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for artifact in artifacts {
+        if !covered(&artifact.path, write_roots) {
+            return Err(format!("artifact `{}` is outside task write roots", artifact.path).into());
+        }
+        let path = repo.join(&artifact.path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(metadata) = metadata else {
+            if artifact.required {
+                return Err(format!("required artifact `{}` is missing", artifact.path).into());
+            }
+            continue;
+        };
+        if metadata.file_type().is_symlink()
+            || match artifact.kind {
+                PluginArtifactType::File => !metadata.is_file(),
+                PluginArtifactType::Directory => !metadata.is_dir(),
+            }
+        {
+            return Err(format!("artifact `{}` has the wrong type", artifact.path).into());
+        }
+    }
+    Ok(())
+}
+
+fn is_publishable(outcome: Outcome) -> bool {
+    outcome == Outcome::Implemented
+}
+
+fn apply_validator_results(result: &mut RunResult, validator_results: Vec<TestResult>) {
+    let validators_passed = validator_results
+        .iter()
+        .all(|result| result.status == TestStatus::Passed);
+    result.tests.extend(validator_results);
+    if !validators_passed {
+        result.outcome = Outcome::Failed;
+        result.blocked_reason = Some("plugin validator failed".into());
+    }
+}
+
+async fn run_validators(
+    validators: &[PluginValidator],
+    image: &str,
+    task_root: &Path,
+    configured: &BTreeMap<String, String>,
+    allowed: &[String],
+) -> Result<Vec<TestResult>, Box<dyn std::error::Error>> {
+    let mut results = Vec::new();
+    for validator in validators {
+        let output =
+            run_container(image, &validator.command, task_root, configured, allowed).await?;
+        results.push(TestResult {
+            name: validator.name.clone(),
+            command: validator.command.clone(),
+            status: if output.status.success() {
+                TestStatus::Passed
+            } else {
+                TestStatus::Failed
+            },
+            exit_code: output.status.code(),
+            summary: Some(if output.status.success() {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .chars()
+                    .take(2_000)
+                    .collect()
+            } else {
+                String::from_utf8_lossy(&output.stderr)
+                    .trim()
+                    .chars()
+                    .take(2_000)
+                    .collect()
+            }),
+        });
+    }
+    Ok(results)
+}
+
 async fn run_container(
     image: &str,
     command: &[String],
@@ -1213,6 +1726,8 @@ fn resolve_access(
     stage: &str,
     declared_read: &[String],
     declared_write: &[String],
+    parameters: &BTreeMap<String, Value>,
+    parameter_definitions: &BTreeMap<String, PluginParameter>,
 ) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
     let Some(overrides) = selection.task_access_overrides.get(stage) else {
         return Ok((declared_read.to_vec(), declared_write.to_vec()));
@@ -1220,10 +1735,14 @@ fn resolve_access(
     let read = overrides
         .read
         .clone()
+        .map(|values| expand_policy_roots(&values, parameters, parameter_definitions))
+        .transpose()?
         .unwrap_or_else(|| declared_read.to_vec());
     let write = overrides
         .write
         .clone()
+        .map(|values| expand_policy_roots(&values, parameters, parameter_definitions))
+        .transpose()?
         .unwrap_or_else(|| declared_write.to_vec());
     if !read.iter().all(|path| covered(path, declared_read))
         || !write.iter().all(|path| covered(path, declared_write))
@@ -1233,6 +1752,31 @@ fn resolve_access(
         );
     }
     Ok((read, write))
+}
+
+fn expand_policy_roots(
+    values: &[String],
+    parameters: &BTreeMap<String, Value>,
+    definitions: &BTreeMap<String, PluginParameter>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    for value in values {
+        for segment in value.split('{').skip(1) {
+            let name = segment
+                .split_once('}')
+                .map(|(name, _)| name)
+                .ok_or_else(|| format!("unclosed placeholder in policy path `{value}`"))?;
+            if !matches!(
+                definitions.get(name),
+                Some(PluginParameter::Path { .. } | PluginParameter::Enum { .. })
+            ) {
+                return Err(format!(
+                    "parameter `{name}` cannot be used in a policy filesystem field"
+                )
+                .into());
+            }
+        }
+    }
+    expand_templates(values, parameters, None)
 }
 
 fn covered(path: &str, roots: &[String]) -> bool {
@@ -1248,7 +1792,10 @@ fn validate_changed_files(
     files: &[String],
     roots: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(path) = files.iter().find(|path| !covered(path, roots)) {
+    if let Some(path) = files
+        .iter()
+        .find(|path| validate_runtime_path(path).is_err() || !covered(path, roots))
+    {
         return Err(format!("plugin reported change outside task write roots: `{path}`").into());
     }
     Ok(())
@@ -1303,6 +1850,21 @@ fn replace_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_manifest(input: &str) -> PluginManifest {
+        let manifest: PluginManifest = serde_yaml::from_str(input).unwrap();
+        manifest.validate().unwrap();
+        manifest
+    }
+
+    fn test_selection(input: &str) -> PluginFlowSelection {
+        serde_yaml::from_str(input).unwrap()
+    }
+
+    fn temporary_root() -> PathBuf {
+        env::temp_dir().join(format!("donkeyspace-plugin-test-{}", uuid::Uuid::now_v7()))
+    }
+
     #[test]
     fn path_coverage_is_segment_aware() {
         assert!(covered("rtl/core.sv", &["rtl".into()]));
@@ -1345,8 +1907,7 @@ mod tests {
 
     #[test]
     fn filtered_view_does_not_copy_hidden_dv_files() {
-        let root =
-            env::temp_dir().join(format!("donkeyspace-plugin-test-{}", uuid::Uuid::now_v7()));
+        let root = temporary_root();
         let source = root.join("source");
         let target = root.join("target");
         fs::create_dir_all(source.join("rtl")).unwrap();
@@ -1363,5 +1924,387 @@ mod tests {
         assert!(target.join("rtl/design.sv").exists());
         assert!(!target.join("dv/hidden_tb.sv").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolves_typed_parameters_and_rejects_invalid_values() {
+        let manifest = test_manifest(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+parameters:
+  root: { type: path, default: src }
+  extension: { type: enum, values: [rs, txt], default: rs }
+  label: { type: string, default: default }
+  count: { type: integer, default: 2 }
+  enabled: { type: boolean, default: true }
+roles: { developer: { command: [run] } }
+flows:
+  default:
+    start: develop
+    tasks: { develop: { role: developer } }
+"#,
+        );
+        let selection = test_selection(
+            r#"
+manifest_path: plugin.yml
+flow: default
+parameters: { root: lib, extension: txt, label: selected, count: 3, enabled: false }
+"#,
+        );
+        let resolved = resolve_parameters(&manifest, &selection).unwrap();
+        assert_eq!(resolved["root"], json!("lib"));
+        assert_eq!(resolved["count"], json!(3));
+        assert_eq!(resolved["enabled"], json!(false));
+
+        let traversal = test_selection(
+            r#"
+manifest_path: plugin.yml
+flow: default
+parameters: { root: ../secret }
+"#,
+        );
+        assert!(resolve_parameters(&manifest, &traversal).is_err());
+        let wrong_type = test_selection(
+            r#"
+manifest_path: plugin.yml
+flow: default
+parameters: { count: "3" }
+"#,
+        );
+        assert!(resolve_parameters(&manifest, &wrong_type).is_err());
+        let unknown = test_selection(
+            r#"
+manifest_path: plugin.yml
+flow: default
+parameters: { surprise: true }
+"#,
+        );
+        assert!(resolve_parameters(&manifest, &unknown).is_err());
+    }
+
+    #[test]
+    fn materializes_files_directories_and_optional_missing_resources() {
+        let root = temporary_root();
+        let plugin = root.join("plugin");
+        let repo = root.join("repo");
+        let attempt = root.join("attempt");
+        fs::create_dir_all(plugin.join("resources/library/nested")).unwrap();
+        fs::create_dir_all(plugin.join("resources/empty")).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(plugin.join("resources/standards.md"), "standards").unwrap();
+        fs::write(
+            plugin.join("resources/library/nested/reference.txt"),
+            "reference",
+        )
+        .unwrap();
+        let manifest = test_manifest(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+resources:
+  standards: { source: plugin, path: resources/standards.md }
+  library: { source: plugin, path: resources/library }
+  empty: { source: plugin, path: resources/empty }
+  absent: { source: repository, path: missing }
+roles:
+  developer:
+    command: [run]
+    resources:
+      - { id: standards, required: true }
+      - { id: library, required: false }
+      - { id: empty, required: true }
+flows:
+  default:
+    start: develop
+    tasks:
+      develop:
+        role: developer
+        resources: [{ id: absent, required: false }]
+"#,
+        );
+        let task = &manifest.flows["default"].tasks["develop"];
+        let resources = materialize_resources(
+            &manifest,
+            "developer",
+            task,
+            &plugin,
+            &repo,
+            &attempt,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            attempt
+                .join(".donkeyspace/resources/standards/standards.md")
+                .is_file()
+        );
+        assert!(
+            attempt
+                .join(".donkeyspace/resources/library/nested/reference.txt")
+                .is_file()
+        );
+        assert!(attempt.join(".donkeyspace/resources/empty").is_dir());
+        assert_eq!(
+            resources
+                .iter()
+                .find(|item| item.id == "empty")
+                .unwrap()
+                .inventory,
+            Vec::<String>::new()
+        );
+        assert!(
+            !resources
+                .iter()
+                .find(|item| item.id == "absent")
+                .unwrap()
+                .available
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .find(|item| item.id == "library")
+                .unwrap()
+                .inventory,
+            vec!["nested/reference.txt"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshots_new_directory_files_and_detects_mutation() {
+        let root = temporary_root();
+        let plugin = root.join("plugin");
+        let repo = root.join("repo");
+        fs::create_dir_all(plugin.join("resources/library")).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(plugin.join("resources/library/a.txt"), "a").unwrap();
+        let manifest = test_manifest(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+resources: { library: { source: plugin, path: resources/library } }
+roles: { developer: { command: [run], resources: [{ id: library, required: true }] } }
+flows:
+  default:
+    start: develop
+    tasks: { develop: { role: developer } }
+"#,
+        );
+        let task = &manifest.flows["default"].tasks["develop"];
+        let first_attempt = root.join("first");
+        let first = materialize_resources(
+            &manifest,
+            "developer",
+            task,
+            &plugin,
+            &repo,
+            &first_attempt,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        fs::write(plugin.join("resources/library/b.txt"), "b").unwrap();
+        let second_attempt = root.join("second");
+        let second = materialize_resources(
+            &manifest,
+            "developer",
+            task,
+            &plugin,
+            &repo,
+            &second_attempt,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(second[0].inventory, vec!["a.txt", "b.txt"]);
+        assert_ne!(first[0].digest, second[0].digest);
+
+        fs::write(
+            second_attempt.join(".donkeyspace/resources/library/a.txt"),
+            "changed",
+        )
+        .unwrap();
+        assert!(verify_resources(&second_attempt, &second).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tree_digest_is_deterministic_and_enforces_limits() {
+        let root = temporary_root();
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("b"), "two").unwrap();
+        fs::write(first.join("a"), "one").unwrap();
+        fs::write(second.join("a"), "one").unwrap();
+        fs::write(second.join("b"), "two").unwrap();
+        assert_eq!(
+            digest_resource_tree(&first).unwrap(),
+            digest_resource_tree(&second).unwrap()
+        );
+
+        let too_many = root.join("too-many");
+        fs::create_dir_all(&too_many).unwrap();
+        for index in 0..=MAX_RESOURCE_FILES {
+            fs::write(too_many.join(format!("{index:04}")), []).unwrap();
+        }
+        assert!(
+            digest_resource_tree(&too_many)
+                .unwrap_err()
+                .to_string()
+                .contains("files")
+        );
+
+        let too_large = root.join("too-large");
+        fs::create_dir_all(&too_large).unwrap();
+        let file = fs::File::create(too_large.join("large")).unwrap();
+        file.set_len(MAX_RESOURCE_BYTES + 1).unwrap();
+        assert!(
+            digest_resource_tree(&too_large)
+                .unwrap_err()
+                .to_string()
+                .contains("bytes")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_resource_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("regular"), "contents").unwrap();
+        symlink(source.join("regular"), source.join("link")).unwrap();
+        assert!(copy_resource_directory(&source, &target).is_err());
+        fs::remove_file(source.join("link")).unwrap();
+
+        let manifest = test_manifest(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+resources: { special: { source: plugin, path: dev/null } }
+roles: { developer: { command: [run], resources: [{ id: special, required: true }] } }
+flows:
+  default:
+    start: develop
+    tasks: { develop: { role: developer } }
+"#,
+        );
+        let task = &manifest.flows["default"].tasks["develop"];
+        assert!(
+            materialize_resources(
+                &manifest,
+                "developer",
+                task,
+                Path::new("/"),
+                &source,
+                &root.join("attempt"),
+                &BTreeMap::new(),
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validates_artifact_presence_type_and_write_scope() {
+        let root = temporary_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/output.txt"), "output").unwrap();
+        let file = PluginArtifact {
+            path: "src/output.txt".into(),
+            kind: PluginArtifactType::File,
+            required: true,
+        };
+        assert!(validate_artifacts(&root, std::slice::from_ref(&file), &["src".into()]).is_ok());
+        let wrong_type = PluginArtifact {
+            kind: PluginArtifactType::Directory,
+            ..file.clone()
+        };
+        assert!(validate_artifacts(&root, &[wrong_type], &["src".into()]).is_err());
+        let missing = PluginArtifact {
+            path: "src/missing".into(),
+            ..file.clone()
+        };
+        assert!(validate_artifacts(&root, &[missing], &["src".into()]).is_err());
+        assert!(validate_artifacts(&root, &[file], &["other".into()]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validator_failure_is_persisted_and_gates_publication() {
+        assert!(is_publishable(Outcome::Implemented));
+        assert!(!is_publishable(Outcome::NeedsChanges));
+
+        let mut result = RunResult {
+            outcome: Outcome::Implemented,
+            summary: "generated output".into(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: vec!["src/output.txt".into()],
+            human_review_reason: None,
+            blocked_reason: None,
+        };
+        apply_validator_results(
+            &mut result,
+            vec![TestResult {
+                name: "source validation".into(),
+                command: vec!["validate".into()],
+                status: TestStatus::Failed,
+                exit_code: Some(1),
+                summary: Some("invalid output".into()),
+            }],
+        );
+
+        assert_eq!(result.outcome, Outcome::Failed);
+        assert!(!is_publishable(result.outcome));
+        assert_eq!(result.tests[0].status, TestStatus::Failed);
+        let persisted = serde_json::to_value(PluginTaskResult {
+            result,
+            handoff: None,
+            resources_used: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            persisted.pointer("/tests/0/name"),
+            Some(&json!("source validation"))
+        );
+    }
+
+    #[test]
+    fn required_assignment_wins_and_usage_must_be_supplied() {
+        let merged = merged_resource_assignments(
+            &[PluginResourceAssignment {
+                id: "guide".into(),
+                required: false,
+            }],
+            &[PluginResourceAssignment {
+                id: "guide".into(),
+                required: true,
+            }],
+        );
+        assert!(merged["guide"]);
+        let resources = vec![MaterializedResource {
+            id: "guide".into(),
+            source: PluginResourceSource::Plugin,
+            source_path: "guide.md".into(),
+            root: ".donkeyspace/resources/guide".into(),
+            available: true,
+            inventory: vec!["guide.md".into()],
+            digest: Some("sha256:test".into()),
+        }];
+        assert!(validate_resources_used(&["guide".into()], &resources).is_ok());
+        assert!(validate_resources_used(&["missing".into()], &resources).is_err());
     }
 }

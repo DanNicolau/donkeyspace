@@ -121,6 +121,35 @@
         "string",
         "null"
       ]
+    },
+    "resources_used": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "handoff": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "target",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     }
   },
   "allOf": [

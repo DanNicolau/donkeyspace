@@ -43,6 +43,8 @@ pub struct PluginTaskResult {
     pub result: RunResult,
     #[serde(default)]
     pub handoff: Option<AgentHandoff>,
+    #[serde(default)]
+    pub resources_used: Vec<String>,
 }
 
 pub type PluginStageResult = PluginTaskResult;

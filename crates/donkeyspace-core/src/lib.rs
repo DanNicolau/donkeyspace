@@ -8,9 +8,10 @@ pub mod state;
 pub use fake_agent::{fake_triage_issue, workflow_state_for_outcome};
 pub use github_workflow::{GitHubIssueAction, triage_comment_body, triage_github_issue_actions};
 pub use plugin::{
-    McpServerDefinition, PluginAgent, PluginError, PluginFlow, PluginManifest, PluginRole,
-    PluginRuntime, PluginStage, PluginTask, PluginTaskScope, PluginWorkItem,
-    PluginWorkItemRegistry,
+    McpServerDefinition, PluginAgent, PluginArtifact, PluginArtifactType, PluginError, PluginFlow,
+    PluginManifest, PluginParameter, PluginResource, PluginResourceAssignment,
+    PluginResourceSource, PluginRole, PluginRuntime, PluginStage, PluginTask, PluginTaskScope,
+    PluginValidator, PluginWorkItem, PluginWorkItemRegistry,
 };
 pub use policy::{
     AgentConfig, AgentRoleConfig, AutomationDecision, LifecyclePolicy, PluginFlowSelection, Policy,

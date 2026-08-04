@@ -18,6 +18,10 @@ pub struct PluginManifest {
     pub id: String,
     pub runtime: PluginRuntime,
     #[serde(default)]
+    pub parameters: BTreeMap<String, PluginParameter>,
+    #[serde(default)]
+    pub resources: BTreeMap<String, PluginResource>,
+    #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerDefinition>,
     #[serde(alias = "agents")]
     pub roles: BTreeMap<String, PluginRole>,
@@ -38,6 +42,56 @@ pub struct PluginRole {
     pub environment: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub resources: Vec<PluginResourceAssignment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginParameter {
+    Path {
+        #[serde(default)]
+        default: Option<String>,
+    },
+    Enum {
+        values: Vec<String>,
+        #[serde(default)]
+        default: Option<String>,
+    },
+    String {
+        #[serde(default)]
+        default: Option<String>,
+    },
+    Integer {
+        #[serde(default)]
+        default: Option<i64>,
+    },
+    Boolean {
+        #[serde(default)]
+        default: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginResource {
+    pub source: PluginResourceSource,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginResourceSource {
+    Plugin,
+    Repository,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginResourceAssignment {
+    pub id: String,
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// Backward-compatible Rust name for integrations built against the serial
@@ -86,11 +140,41 @@ pub struct PluginTask {
     #[serde(default)]
     pub write: Vec<String>,
     #[serde(default)]
+    pub resources: Vec<PluginResourceAssignment>,
+    #[serde(default)]
+    pub artifacts: Vec<PluginArtifact>,
+    #[serde(default)]
+    pub validators: Vec<PluginValidator>,
+    #[serde(default)]
     pub allowed_handoffs: Vec<String>,
     #[serde(default)]
     pub transitions: BTreeMap<String, String>,
     #[serde(default)]
     pub terminal: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginArtifact {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: PluginArtifactType,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginArtifactType {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginValidator {
+    pub name: String,
+    pub command: Vec<String>,
 }
 
 /// Backward-compatible Rust name for the former stage abstraction.
@@ -151,6 +235,34 @@ impl PluginManifest {
                 "id and runtime.default_image are required".into(),
             ));
         }
+        for (name, parameter) in &self.parameters {
+            validate_safe_id("parameter", name)?;
+            match parameter {
+                PluginParameter::Path {
+                    default: Some(value),
+                } => validate_relative_path(value)?,
+                PluginParameter::Enum { values, default } => {
+                    if values.is_empty() || values.iter().any(|value| !is_safe_enum(value)) {
+                        return Err(PluginError::Invalid(format!(
+                            "parameter `{name}` has no safe enum values"
+                        )));
+                    }
+                    if default
+                        .as_ref()
+                        .is_some_and(|value| !values.contains(value))
+                    {
+                        return Err(PluginError::Invalid(format!(
+                            "parameter `{name}` default is not an allowed value"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (id, resource) in &self.resources {
+            validate_safe_id("resource", id)?;
+            validate_filesystem_template(&resource.path, &self.parameters, false)?;
+        }
         for (name, role) in &self.roles {
             if role.command.is_empty() {
                 return Err(PluginError::Invalid(format!(
@@ -164,6 +276,7 @@ impl PluginManifest {
                     )));
                 }
             }
+            validate_resource_assignments(&role.resources, &self.resources, name)?;
         }
         for (flow_name, flow) in &self.flows {
             if !flow.tasks.contains_key(&flow.start) {
@@ -194,7 +307,7 @@ impl PluginManifest {
                 )));
             }
             if let Some(path) = &flow.work_items_path {
-                validate_relative_path(path)?;
+                validate_filesystem_template(path, &self.parameters, false)?;
             }
             for (task_name, task) in &flow.tasks {
                 if !self.roles.contains_key(&task.role) {
@@ -204,7 +317,7 @@ impl PluginManifest {
                     )));
                 }
                 for path in task.read.iter().chain(&task.write) {
-                    validate_relative_path(path)?;
+                    validate_filesystem_template(path, &self.parameters, true)?;
                 }
                 if task.scope == PluginTaskScope::WorkItem
                     && task.write.iter().any(|path| !path.contains("{work_item}"))
@@ -212,6 +325,22 @@ impl PluginManifest {
                     return Err(PluginError::Invalid(format!(
                         "work-item task `{task_name}` write paths must contain `{{work_item}}`"
                     )));
+                }
+                validate_resource_assignments(&task.resources, &self.resources, task_name)?;
+                for artifact in &task.artifacts {
+                    if artifact.path.contains(['*', '?', '[', ']']) {
+                        return Err(PluginError::Invalid(format!(
+                            "task `{task_name}` artifact paths must be exact"
+                        )));
+                    }
+                    validate_filesystem_template(&artifact.path, &self.parameters, true)?;
+                }
+                for validator in &task.validators {
+                    if validator.name.trim().is_empty() || validator.command.is_empty() {
+                        return Err(PluginError::Invalid(format!(
+                            "task `{task_name}` has an invalid validator"
+                        )));
+                    }
                 }
                 for dependency in &task.dependencies {
                     if !flow.tasks.contains_key(dependency) || dependency == task_name {
@@ -232,6 +361,96 @@ impl PluginManifest {
         }
         Ok(())
     }
+}
+
+fn validate_resource_assignments(
+    assignments: &[PluginResourceAssignment],
+    resources: &BTreeMap<String, PluginResource>,
+    owner: &str,
+) -> Result<(), PluginError> {
+    for assignment in assignments {
+        if !resources.contains_key(&assignment.id) {
+            return Err(PluginError::Invalid(format!(
+                "`{owner}` references unknown resource `{}`",
+                assignment.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_safe_id(kind: &str, value: &str) -> Result<(), PluginError> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(PluginError::Invalid(format!("unsafe {kind} id `{value}`")));
+    }
+    Ok(())
+}
+
+fn is_safe_enum(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn validate_filesystem_template(
+    value: &str,
+    parameters: &BTreeMap<String, PluginParameter>,
+    allow_work_item: bool,
+) -> Result<(), PluginError> {
+    let mut expanded = value.to_string();
+    for placeholder in placeholders(value)? {
+        if allow_work_item && placeholder == "work_item" {
+            expanded = expanded.replace("{work_item}", "item");
+            continue;
+        }
+        let Some(parameter) = parameters.get(&placeholder) else {
+            return Err(PluginError::Invalid(format!(
+                "unknown filesystem placeholder `{{{placeholder}}}`"
+            )));
+        };
+        if !matches!(
+            parameter,
+            PluginParameter::Path { .. } | PluginParameter::Enum { .. }
+        ) {
+            return Err(PluginError::Invalid(format!(
+                "parameter `{placeholder}` cannot be used in a filesystem field"
+            )));
+        }
+        expanded = expanded.replace(&format!("{{{placeholder}}}"), "value");
+    }
+    validate_relative_path(&expanded)
+}
+
+fn placeholders(value: &str) -> Result<Vec<String>, PluginError> {
+    let mut result = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            return Err(PluginError::Invalid(format!(
+                "unclosed placeholder in `{value}`"
+            )));
+        };
+        let name = &after[..end];
+        if name.is_empty() || name.contains('{') {
+            return Err(PluginError::Invalid(format!(
+                "invalid placeholder in `{value}`"
+            )));
+        }
+        result.push(name.to_string());
+        rest = &after[end + 1..];
+    }
+    if rest.contains('}') {
+        return Err(PluginError::Invalid(format!(
+            "unmatched placeholder in `{value}`"
+        )));
+    }
+    Ok(result)
 }
 
 fn validate_task_graph(flow_name: &str, flow: &PluginFlow) -> Result<(), PluginError> {
@@ -274,6 +493,7 @@ fn validate_task_graph(flow_name: &str, flow: &PluginFlow) -> Result<(), PluginE
 fn validate_relative_path(value: &str) -> Result<(), PluginError> {
     let path = Path::new(value);
     if value.trim().is_empty()
+        || value.contains(['{', '}'])
         || path.is_absolute()
         || path
             .components()
@@ -359,5 +579,138 @@ flows:
         .unwrap();
         manifest.validate().unwrap();
         assert!(manifest.flows["blocks"].replaces_default_lifecycle);
+    }
+
+    #[test]
+    fn validates_resources_parameters_artifacts_and_validators() {
+        let manifest: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example.generic
+runtime: { default_image: example:dev }
+parameters:
+  source_root: { type: path, default: src }
+  extension: { type: enum, values: [rs, txt], default: rs }
+  label: { type: string, default: example }
+  retries: { type: integer, default: 2 }
+  enabled: { type: boolean, default: true }
+resources:
+  standards: { source: plugin, path: resources/standards.md }
+  references: { source: repository, path: "{source_root}/references" }
+roles:
+  developer:
+    command: [run]
+    resources: [{ id: standards, required: true }]
+flows:
+  implementation:
+    start: develop
+    tasks:
+      develop:
+        role: developer
+        resources: [{ id: references, required: false }]
+        read: ["{source_root}"]
+        write: ["{source_root}/{work_item}.{extension}"]
+        artifacts:
+          - { path: "{source_root}/{work_item}.{extension}", type: file, required: true }
+        validators:
+          - { name: source validation, command: [/plugin/validate] }
+        terminal: true
+"#,
+        )
+        .unwrap();
+
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_or_non_path_filesystem_placeholders() {
+        let unknown: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+roles: { developer: { command: [run] } }
+flows:
+  default:
+    start: develop
+    tasks:
+      develop: { role: developer, read: ["{missing}"] }
+"#,
+        )
+        .unwrap();
+        assert!(unknown.validate().is_err());
+
+        let string_path: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+parameters: { location: { type: string, default: src } }
+roles: { developer: { command: [run] } }
+flows:
+  default:
+    start: develop
+    tasks:
+      develop: { role: developer, read: ["{location}"] }
+"#,
+        )
+        .unwrap();
+        assert!(string_path.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_resource_ids_and_unknown_assignments() {
+        let unsafe_id: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+resources: { "../secret": { source: plugin, path: resource.txt } }
+roles: { developer: { command: [run] } }
+flows:
+  default:
+    start: develop
+    tasks: { develop: { role: developer } }
+"#,
+        )
+        .unwrap();
+        assert!(unsafe_id.validate().is_err());
+
+        let unknown: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+roles:
+  developer: { command: [run], resources: [{ id: missing }] }
+flows:
+  default:
+    start: develop
+    tasks: { develop: { role: developer } }
+"#,
+        )
+        .unwrap();
+        assert!(unknown.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_glob_artifact_paths() {
+        let manifest: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+roles: { developer: { command: [run] } }
+flows:
+  default:
+    start: develop
+    tasks:
+      develop:
+        role: developer
+        artifacts: [{ path: "build/*.txt", type: file, required: true }]
+"#,
+        )
+        .unwrap();
+        assert!(manifest.validate().is_err());
     }
 }
