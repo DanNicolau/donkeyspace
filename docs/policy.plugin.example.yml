@@ -11,6 +11,17 @@ workflow:
   block_labels: ["ai:disabled"]
   allow_labels: ["ai"]
 
+  engagement:
+    default:
+      allow:
+        - type: token_owner
+    needs_human_resume:
+      required_labels: ["ai"]
+      allow:
+        - type: token_owner
+        - type: collaborator_permission
+          minimum: "write"
+
 lifecycle:
   plugin:
     manifest_path: /plugins/example/donkeyspace-plugin.yml

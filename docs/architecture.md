@@ -109,7 +109,7 @@ Compose-managed `codex-home` volume for local use.
 - No GitHub App authentication; local operation uses a token.
 - No token accounting, retention policy, or systematic secret redaction.
 - The dashboard does not yet show GitHub links, transitions, policy snapshots,
-  or policy decisions, although some of that data is available from the API.
+  or engagement decisions, although decision records are available from the API.
 - The Compose dashboard uses the Vite development server rather than production
   static assets served by the API.
 - Test coverage is primarily unit-level; PostgreSQL, live GitHub, and complete

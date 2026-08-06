@@ -42,6 +42,33 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     received_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS engagement_decisions (
+    id BIGSERIAL PRIMARY KEY,
+    webhook_delivery_id BIGINT NOT NULL UNIQUE REFERENCES webhook_deliveries(id),
+    workflow_item_id BIGINT REFERENCES workflow_items(id),
+    gate TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    actor JSONB,
+    matched_selector JSONB,
+    reason TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS engagement_decisions_workflow_item_id_idx
+    ON engagement_decisions(workflow_item_id);
+
+CREATE TABLE IF NOT EXISTS github_managed_resources (
+    id BIGSERIAL PRIMARY KEY,
+    repository_id BIGINT NOT NULL REFERENCES repositories(id),
+    workflow_item_id BIGINT REFERENCES workflow_items(id),
+    outbound_action_id BIGINT,
+    resource_kind TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (repository_id, resource_kind, provider_id)
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY,
     workflow_item_id BIGINT REFERENCES workflow_items(id),
@@ -127,6 +154,18 @@ CREATE TABLE IF NOT EXISTS outbound_actions (
 );
 
 ALTER TABLE outbound_actions ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE outbound_actions ADD COLUMN IF NOT EXISTS provider_resource_id TEXT;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'github_managed_resources_outbound_action_id_fkey'
+    ) THEN
+        ALTER TABLE github_managed_resources
+            ADD CONSTRAINT github_managed_resources_outbound_action_id_fkey
+            FOREIGN KEY (outbound_action_id) REFERENCES outbound_actions(id);
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS outbound_actions_status_idx ON outbound_actions(status);
 CREATE INDEX IF NOT EXISTS outbound_actions_job_id_idx ON outbound_actions(job_id);

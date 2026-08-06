@@ -70,7 +70,9 @@ If your credentials live elsewhere, pass them explicitly:
 docker compose --env-file /path/to/secrets.env up -d --force-recreate worker
 ```
 
-Without the token, GitHub writes remain pending and private-repo checkout fails.
+Without the token, GitHub writes remain pending, private-repo checkout fails,
+and the secure default engagement policy denies new AI work. The API validates
+a configured token by resolving its authenticated user at startup.
 
 When the token is configured, the worker ensures every configured workflow, allow, and block label exists in GitHub repositories already seen by donkeyspace webhooks.
 

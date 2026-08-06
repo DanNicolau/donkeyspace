@@ -29,6 +29,50 @@ workflow:
 
 Block labels win over allow labels. For example, an issue with both `ai` and `ai:disabled` will not queue triage.
 
+## Engagement Authorization
+
+`workflow.engagement` controls which GitHub actors may start or resume AI work. Separate
+rules cover initial issue events, clarification after `ai:needs-info`, blocked
+work, and `ai:needs-human` resumption, including plugin checkpoints.
+
+When `engagement` is omitted, every gate allows only the user authenticated by
+`DONKEYSPACE_GITHUB_TOKEN`. If the token is absent, that default denies all
+engagement. A configured but invalid token makes the API fail at startup.
+
+```yaml
+workflow:
+  engagement:
+    default:
+      required_labels: ["ai"]
+      allow:
+        - type: token_owner
+        - type: collaborator_permission
+          minimum: write
+    needs_human_resume:
+      allow:
+        - type: token_owner
+        - type: team_member
+          organization: example
+          team_slug: maintainers
+```
+
+An omitted gate inherits `default`. Required labels are all required; identity
+selectors are alternatives. An explicit empty `allow` list denies everyone.
+Supported selectors are `token_owner`, `any_user`, `user`, `issue_author`,
+`repository_owner`, `repository_organization_member`, `organization_member`,
+`team_member`, `author_association`, `collaborator_permission`, `bot`, and
+`github_app`. GitHub App selectors accept exactly one numeric `id` or `slug`.
+
+API-backed selectors require adequate PAT repository and organization
+visibility. Missing actor metadata, insufficient scope, lookup errors, and
+unknown permissions fail closed. Decisions are available from
+`GET /api/engagement-decisions`.
+
+For public repositories, prefer the token owner, explicit maintainers/teams,
+or collaborators with at least `write`; `any_user` and `issue_author` allow
+arbitrary public issue content to reach the agent. Private repositories may use
+`read` collaborator access when repository access is the trust boundary.
+
 ## Agents
 
 `agents` controls which roles can run and which command Donkeyspace invokes inside the prepared workspace.
@@ -94,7 +138,7 @@ Failed jobs can be retried manually through `POST /api/runs/{id}/retry` or the
 dashboard when `dashboard.allow_retry` is true. Only failed jobs are eligible;
 results with `blocked` or `needs_human` outcomes must be resolved by a person
 instead. For a paused lifecycle plugin, a human comment on the parent issue
-resumes the saved coordinator checkpoint. A retry creates a new job linked
+resumes the checkpoint only after `needs_human_resume` authorizes the actor. A retry creates a new job linked
 through `retry_of_job_id`.
 
 ## Dashboard

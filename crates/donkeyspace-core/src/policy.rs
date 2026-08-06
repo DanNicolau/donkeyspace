@@ -58,6 +58,7 @@ impl Policy {
                 "lifecycle plugin flow cannot be empty".to_string(),
             ));
         }
+        policy.workflow.engagement.validate()?;
         Ok(policy)
     }
 
@@ -67,6 +68,197 @@ impl Policy {
 
     pub fn apply_result_routing(&self, result: &mut RunResult) -> Option<String> {
         self.risk.apply_result_routing(result)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EngagementPolicy {
+    #[serde(default = "EngagementRule::token_owner")]
+    pub default: EngagementRule,
+    #[serde(default)]
+    pub initial: Option<EngagementRule>,
+    #[serde(default)]
+    pub needs_info_resume: Option<EngagementRule>,
+    #[serde(default)]
+    pub blocked_resume: Option<EngagementRule>,
+    #[serde(default)]
+    pub needs_human_resume: Option<EngagementRule>,
+}
+
+impl Default for EngagementPolicy {
+    fn default() -> Self {
+        Self {
+            default: EngagementRule::token_owner(),
+            initial: None,
+            needs_info_resume: None,
+            blocked_resume: None,
+            needs_human_resume: None,
+        }
+    }
+}
+
+impl EngagementPolicy {
+    pub fn rule(&self, gate: EngagementGate) -> &EngagementRule {
+        match gate {
+            EngagementGate::Initial => self.initial.as_ref(),
+            EngagementGate::NeedsInfoResume => self.needs_info_resume.as_ref(),
+            EngagementGate::BlockedResume => self.blocked_resume.as_ref(),
+            EngagementGate::NeedsHumanResume => self.needs_human_resume.as_ref(),
+        }
+        .unwrap_or(&self.default)
+    }
+
+    fn validate(&self) -> Result<(), PolicyError> {
+        for rule in [
+            Some(&self.default),
+            self.initial.as_ref(),
+            self.needs_info_resume.as_ref(),
+            self.blocked_resume.as_ref(),
+            self.needs_human_resume.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for selector in &rule.allow {
+                selector.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngagementGate {
+    Initial,
+    NeedsInfoResume,
+    BlockedResume,
+    NeedsHumanResume,
+}
+
+impl EngagementGate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::NeedsInfoResume => "needs_info_resume",
+            Self::BlockedResume => "blocked_resume",
+            Self::NeedsHumanResume => "needs_human_resume",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EngagementRule {
+    #[serde(default)]
+    pub required_labels: Vec<String>,
+    #[serde(default)]
+    pub allow: Vec<EngagementSelector>,
+}
+
+impl EngagementRule {
+    fn token_owner() -> Self {
+        Self {
+            required_labels: Vec::new(),
+            allow: vec![EngagementSelector::TokenOwner],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EngagementSelector {
+    TokenOwner,
+    AnyUser,
+    User {
+        login: String,
+    },
+    IssueAuthor,
+    RepositoryOwner,
+    RepositoryOrganizationMember,
+    OrganizationMember {
+        organization: String,
+    },
+    TeamMember {
+        organization: String,
+        team_slug: String,
+    },
+    AuthorAssociation {
+        association: String,
+    },
+    CollaboratorPermission {
+        minimum: String,
+    },
+    Bot {
+        login: String,
+    },
+    #[serde(rename = "github_app")]
+    GitHubApp {
+        id: Option<u64>,
+        slug: Option<String>,
+    },
+}
+
+impl EngagementSelector {
+    fn validate(&self) -> Result<(), PolicyError> {
+        let nonempty = |name: &str, value: &str| {
+            if value.trim().is_empty() {
+                Err(PolicyError::Invalid(format!(
+                    "engagement selector `{name}` cannot be empty"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            Self::User { login } | Self::Bot { login } => nonempty("login", login),
+            Self::OrganizationMember { organization } => nonempty("organization", organization),
+            Self::TeamMember {
+                organization,
+                team_slug,
+            } => {
+                nonempty("organization", organization)?;
+                nonempty("team_slug", team_slug)
+            }
+            Self::AuthorAssociation { association } => {
+                const ASSOCIATIONS: &[&str] = &[
+                    "COLLABORATOR",
+                    "CONTRIBUTOR",
+                    "FIRST_TIMER",
+                    "FIRST_TIME_CONTRIBUTOR",
+                    "MANNEQUIN",
+                    "MEMBER",
+                    "NONE",
+                    "OWNER",
+                ];
+                if ASSOCIATIONS.contains(&association.as_str()) {
+                    Ok(())
+                } else {
+                    Err(PolicyError::Invalid(format!(
+                        "unknown GitHub author association `{association}`"
+                    )))
+                }
+            }
+            Self::CollaboratorPermission { minimum } => {
+                if ["read", "triage", "write", "maintain", "admin"].contains(&minimum.as_str()) {
+                    Ok(())
+                } else {
+                    Err(PolicyError::Invalid(format!(
+                        "unknown GitHub collaborator permission `{minimum}`"
+                    )))
+                }
+            }
+            Self::GitHubApp { id, slug } => match (id, slug) {
+                (Some(_), None) => Ok(()),
+                (None, Some(slug)) => nonempty("slug", slug),
+                _ => Err(PolicyError::Invalid(
+                    "github_app selector requires exactly one of `id` or `slug`".into(),
+                )),
+            },
+            Self::TokenOwner
+            | Self::AnyUser
+            | Self::IssueAuthor
+            | Self::RepositoryOwner
+            | Self::RepositoryOrganizationMember => Ok(()),
+        }
     }
 }
 
@@ -85,6 +277,8 @@ pub struct WorkflowPolicy {
     pub block_labels: Vec<String>,
     #[serde(default)]
     pub allow_labels: Vec<String>,
+    #[serde(default)]
+    pub engagement: EngagementPolicy,
 }
 
 impl WorkflowPolicy {
@@ -217,17 +411,16 @@ impl RiskPolicy {
             Some("policy routes high-risk work to human review".to_string())
         } else if self.route_unknown_to_human && result.risk == Risk::Unknown {
             Some("policy routes unknown-risk work to human review".to_string())
-        } else if let Some(pattern) = self.human_review_paths.iter().find(|pattern| {
-            result
-                .changed_files
-                .iter()
-                .any(|path| path_matches(pattern, path))
-        }) {
-            Some(format!(
-                "policy requires human review for `{pattern}` changes"
-            ))
         } else {
-            None
+            self.human_review_paths
+                .iter()
+                .find(|pattern| {
+                    result
+                        .changed_files
+                        .iter()
+                        .any(|path| path_matches(pattern, path))
+                })
+                .map(|pattern| format!("policy requires human review for `{pattern}` changes"))
         };
 
         if let Some(reason) = reason {
@@ -284,7 +477,7 @@ pub struct DashboardPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::Policy;
+    use super::{EngagementGate, EngagementRule, EngagementSelector, Policy};
     use crate::{Confidence, Outcome, Risk, RunResult};
 
     #[test]
@@ -295,6 +488,101 @@ mod tests {
         assert!(policy.agents.triage.enabled);
         assert!(policy.agents.repair.enabled);
         assert_eq!(policy.workflow.state_labels["ready"], "ai:ready");
+    }
+
+    #[test]
+    fn omitted_engagement_defaults_every_gate_to_token_owner() {
+        let policy = Policy::from_yaml(
+            r#"
+version: 1
+workflow: { state_labels: {} }
+checks: {}
+risk:
+  default: unknown
+  agent_classification: true
+  route_unknown_to_human: true
+  route_high_to_human: true
+automation:
+  max_concurrent_jobs: 1
+  retry_failed_jobs: false
+  auto_merge: false
+"#,
+        )
+        .unwrap();
+
+        for gate in [
+            EngagementGate::Initial,
+            EngagementGate::NeedsInfoResume,
+            EngagementGate::BlockedResume,
+            EngagementGate::NeedsHumanResume,
+        ] {
+            assert_eq!(
+                policy.workflow.engagement.rule(gate).allow,
+                vec![EngagementSelector::TokenOwner]
+            );
+        }
+    }
+
+    #[test]
+    fn engagement_gate_override_and_full_selectors_parse() {
+        let mut yaml = include_str!("../../../docs/policy.example.yml").to_string();
+        yaml = yaml.replace(
+            "    needs_human_resume:\n",
+            "    blocked_resume:\n      allow: []\n    needs_human_resume:\n",
+        );
+        let policy = Policy::from_yaml(&yaml).unwrap();
+
+        assert!(
+            policy
+                .workflow
+                .engagement
+                .rule(EngagementGate::BlockedResume)
+                .allow
+                .is_empty()
+        );
+        assert!(matches!(
+            policy
+                .workflow
+                .engagement
+                .rule(EngagementGate::NeedsHumanResume)
+                .allow[1],
+            EngagementSelector::CollaboratorPermission { .. }
+        ));
+    }
+
+    #[test]
+    fn all_engagement_selector_shapes_parse() {
+        let rule: EngagementRule = serde_yaml::from_str(
+            r#"
+allow:
+  - { type: token_owner }
+  - { type: any_user }
+  - { type: user, login: alice }
+  - { type: issue_author }
+  - { type: repository_owner }
+  - { type: repository_organization_member }
+  - { type: organization_member, organization: acme }
+  - { type: team_member, organization: acme, team_slug: maintainers }
+  - { type: author_association, association: OWNER }
+  - { type: collaborator_permission, minimum: maintain }
+  - { type: bot, login: "dependabot[bot]" }
+  - { type: github_app, id: 123 }
+  - { type: github_app, slug: dependabot }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(rule.allow.len(), 13);
+        for selector in &rule.allow {
+            selector.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_engagement_selector_fails_policy_loading() {
+        let yaml = include_str!("../../../docs/policy.example.yml")
+            .replace("minimum: \"write\"", "minimum: \"superuser\"");
+        assert!(Policy::from_yaml(&yaml).is_err());
     }
 
     #[test]

@@ -12,10 +12,9 @@ pub fn fake_triage_issue(input: &Value) -> RunResult {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
-    let latest_human_comment = input
+    let latest_comment = input
         .pointer("/comment/body")
         .and_then(Value::as_str)
-        .filter(|comment| !comment.trim_start().starts_with("donkeyspace "))
         .unwrap_or_default()
         .trim();
     let repository_context = input
@@ -38,7 +37,7 @@ pub fn fake_triage_issue(input: &Value) -> RunResult {
         };
     }
 
-    if title.is_empty() || meaningful_word_count(&format!("{body}\n{latest_human_comment}")) < 8 {
+    if title.is_empty() || meaningful_word_count(&format!("{body}\n{latest_comment}")) < 8 {
         return RunResult {
             outcome: Outcome::NeedsInfo,
             summary: "The issue needs clearer acceptance criteria before implementation."

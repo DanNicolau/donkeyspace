@@ -5,7 +5,8 @@ use donkeyspace_core::{
     TestResult, TestStatus,
 };
 use donkeyspace_db::{
-    JobRecord, PgPool, complete_job, create_waiting_job, fail_job, start_waiting_job,
+    JobRecord, PgPool, complete_job, create_waiting_job, fail_job,
+    record_github_managed_resource_for_workflow_item, start_waiting_job,
 };
 use donkeyspace_github::{GitHubClient, GitHubWorkItem};
 use futures::future::join_all;
@@ -462,7 +463,26 @@ async fn run_work_item_lifecycle(
                 .project_work_items(owner, repo, parent_issue_number, &work_items)
                 .await
             {
-                Ok(issues) => projected_issues = issues,
+                Ok(issues) => {
+                    if let Some(tracking) = &tracking
+                        && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
+                    {
+                        for (work_item, issue) in &issues {
+                            record_github_managed_resource_for_workflow_item(
+                                tracking.pool,
+                                workflow_item_id,
+                                "issue",
+                                &issue.id.to_string(),
+                                &json!({"work_item": work_item, "issue_number": issue.number}),
+                            )
+                            .await?;
+                        }
+                    }
+                    projected_issues = issues
+                        .into_iter()
+                        .map(|(work_item, issue)| (work_item, issue.number))
+                        .collect();
+                }
                 Err(error) => tracing::warn!(%error, "github work-item projection failed"),
             }
         }

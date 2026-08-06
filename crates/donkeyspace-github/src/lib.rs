@@ -67,6 +67,12 @@ pub struct GitHubWorkItem {
     pub depends_on: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubProjectedIssue {
+    pub id: i64,
+    pub number: i64,
+}
+
 impl GitHubClient {
     pub fn new(token: impl Into<String>) -> Result<Self, GitHubClientError> {
         Ok(Self {
@@ -131,12 +137,60 @@ impl GitHubClient {
         repo: &str,
         issue_number: i64,
         body: &str,
-    ) -> Result<(), GitHubClientError> {
-        self.client
+    ) -> Result<String, GitHubClientError> {
+        let comment = self
+            .client
             .issues(owner, repo)
             .create_comment(issue_number as u64, body)
             .await?;
-        Ok(())
+        Ok(comment.id.to_string())
+    }
+
+    pub async fn authenticated_login(&self) -> Result<String, GitHubClientError> {
+        Ok(self.client.current().user().await?.login)
+    }
+
+    pub async fn collaborator_permission(
+        &self,
+        owner: &str,
+        repo: &str,
+        username: &str,
+    ) -> Result<String, GitHubClientError> {
+        let permission = self
+            .client
+            .repos(owner, repo)
+            .get_contributor_permission(username)
+            .send()
+            .await?;
+        Ok(permission.role_name)
+    }
+
+    pub async fn organization_member(
+        &self,
+        organization: &str,
+        username: &str,
+    ) -> Result<bool, GitHubClientError> {
+        Ok(self
+            .client
+            .orgs(organization)
+            .check_membership(username)
+            .await?)
+    }
+
+    pub async fn team_member(
+        &self,
+        organization: &str,
+        team_slug: &str,
+        username: &str,
+    ) -> Result<bool, GitHubClientError> {
+        let membership: Value = self
+            .client
+            .get(
+                format!("/orgs/{organization}/teams/{team_slug}/memberships/{username}"),
+                None::<&()>,
+            )
+            .await?;
+        Ok(membership.get("state").and_then(Value::as_str) == Some("active"))
     }
 
     pub async fn project_work_items(
@@ -145,7 +199,7 @@ impl GitHubClient {
         repo: &str,
         parent_issue_number: i64,
         work_items: &[GitHubWorkItem],
-    ) -> Result<BTreeMap<String, i64>, GitHubClientError> {
+    ) -> Result<BTreeMap<String, GitHubProjectedIssue>, GitHubClientError> {
         let mut projected = BTreeMap::<String, (i64, i64)>::new();
         for item in work_items {
             let issue: Value = self
@@ -192,7 +246,7 @@ impl GitHubClient {
         }
         Ok(projected
             .into_iter()
-            .map(|(id, (_, number))| (id, number))
+            .map(|(key, (id, number))| (key, GitHubProjectedIssue { id, number }))
             .collect())
     }
 

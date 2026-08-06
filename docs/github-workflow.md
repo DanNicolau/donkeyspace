@@ -17,6 +17,10 @@ Only one workflow label should be active on an issue at a time.
 
 ## Event Triggers
 
+Before a trigger creates or resumes a job, Donkeyspace evaluates the engagement
+rule for that event and workflow state. Denied events remain recorded for audit
+but do not reach the built-in lifecycle or a lifecycle plugin.
+
 The current implementation handles these GitHub events:
 
 - `issues.opened`: schedule triage unless blocked by policy.
@@ -89,6 +93,11 @@ conflict comment.
 
 Database job leases prevent two workers from claiming the same queued job.
 Webhook delivery IDs and PR head/base checks suppress duplicate scheduling.
+Donkeyspace-created comment IDs and plugin-projected issue IDs are stored, so
+their events are suppressed without trusting a user-controlled comment prefix.
+Generated comments also carry a `<!-- donkeyspace-generated -->` marker for
+traceability, but the marker is never sufficient to classify an event as
+system-generated.
 
 ## Comment Formats
 
