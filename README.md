@@ -19,6 +19,7 @@ It coordinates issue triage, clarification, agent implementation, automated chec
 - [Default GitHub workflow](docs/github-workflow.md)
 - [Policy guide](docs/policy.md)
 - [Plugin interface reference](docs/plugin-interface.md)
+- [Installation and authentication](docs/installation.md)
 - [Default-lifecycle example policy](docs/policy.example.yml)
 - [Lifecycle-plugin example policy](docs/policy.plugin.example.yml)
 - [Run result JSON Schema](schemas/run-result.schema.json)
@@ -52,25 +53,42 @@ npm install
 npm run build
 ```
 
-Start the local API, worker, PostgreSQL, and dashboard services:
+Initialize and inspect a local deployment:
 
 ```sh
-docker compose up --build
+cargo run -p donkeyspace-cli -- init --source-tree .
+cargo run -p donkeyspace-cli -- connect github --repositories OWNER/REPOSITORY
+cargo run -p donkeyspace-cli -- connect codex
+cargo run -p donkeyspace-cli -- doctor
+cargo run -p donkeyspace-cli -- up
 ```
 
-To let the worker clone private repos, push branches, open PRs, create missing donkeyspace labels, and apply pending GitHub labels/comments, set `DONKEYSPACE_GITHUB_TOKEN` before starting Compose. Compose automatically reads `.env` from the donkeyspace project directory:
+The GitHub connection command creates a private deployment-owned GitHub App
+through GitHub's manifest flow by default. App and installation identifiers are
+stored in the versioned instance configuration; the private key and webhook
+secret are separate mode `0600` files mounted read-only as Compose secrets.
+Setup discovers the installation for the selected repository owner. Installation
+tokens are short-lived and refreshed immediately before authenticated Git
+operations when necessary.
+
+The CLI also supports importing an existing App:
 
 ```sh
-cp .env.example .env
+donkeyspace connect github \
+  --app-id 123 --installation-id 456 \
+  --private-key-file /secure/app.pem \
+  --repositories OWNER/REPOSITORY
 ```
 
-If your credentials live elsewhere, pass them explicitly:
+Fine-grained PAT authentication remains available only as a deprecated
+migration/emergency path:
 
 ```sh
-docker compose --env-file /path/to/secrets.env up -d --force-recreate worker
+donkeyspace connect github --pat --repositories OWNER/REPOSITORY
 ```
 
-Without the token, GitHub writes remain pending and private-repo checkout fails.
+PATs remain user-linked. Do not configure App fields and
+`DONKEYSPACE_GITHUB_TOKEN` together.
 
 When the token is configured, the worker ensures every configured workflow, allow, and block label exists in GitHub repositories already seen by donkeyspace webhooks.
 
@@ -80,7 +98,10 @@ Deployments that cannot expose a public webhook URL can poll GitHub's repository
 event feed instead. Configure one or more repositories in `.env`:
 
 ```sh
-DONKEYSPACE_GITHUB_TOKEN=...
+DONKEYSPACE_GITHUB_AUTH_MODE=app
+DONKEYSPACE_GITHUB_APP_ID=...
+DONKEYSPACE_GITHUB_INSTALLATION_ID=...
+DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE=/run/secrets/github_private_key
 DONKEYSPACE_GITHUB_POLL_REPOSITORIES=example/rtl-project,example/another-project
 DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS=60
 DONKEYSPACE_GITHUB_POLL_MAX_PAGES=2
@@ -94,8 +115,8 @@ idempotent. Webhooks and polling may be enabled together.
 On first startup, the poller ingests the recent events returned by the configured
 page window; normal policy labels still determine whether those events queue work.
 
-Polling is opt-in and requires both `DONKEYSPACE_DATABASE_URL` and
-`DONKEYSPACE_GITHUB_TOKEN`. The event feed is finite, so the interval and page
+Polling is opt-in and requires both `DONKEYSPACE_DATABASE_URL` and configured
+GitHub authentication. The event feed is finite, so the interval and page
 count must be sized for the configured repositories' event volume; webhooks
 remain preferable for high-volume or low-latency deployments.
 
@@ -111,14 +132,15 @@ If the OpenAI-compatible triage path has no usable key, hits provider quota, or 
 
 Set `DONKEYSPACE_TRIAGE_PROVIDER=agent` to run the configured `agents.triage.command` from `.donkeyspace/policy.yml` inside the prepared workspace. In this mode the worker writes `.donkeyspace/run-input.json`, expects `.donkeyspace/run-result.json`, and records the command exit code plus captured stdout/stderr in command results.
 
-The default agent triage command is `donkeyspace-codex-triage`, a small wrapper around Codex CLI. The wrapper uses `schemas/run-result.codex.schema.json` for Codex structured output, then donkeyspace validates the result against the stricter Rust orchestration rules. It disables Codex's inner bubblewrap sandbox because the worker already runs inside Docker and common Docker hosts do not allow the user namespaces bubblewrap needs. For local testing, authenticate Codex once into the Compose-managed `codex-home` volume:
+The default agent triage command is `donkeyspace-codex-triage`, a small wrapper around Codex CLI. The wrapper uses `schemas/run-result.codex.schema.json` for Codex structured output, then donkeyspace validates the result against the stricter Rust orchestration rules. It disables Codex's inner bubblewrap sandbox because the worker already runs inside Docker and common Docker hosts do not allow the user namespaces bubblewrap needs. The setup command delegates authentication to Codex CLI and supports ChatGPT browser login or an API key piped through stdin:
 
 ```sh
-docker compose build worker
-docker compose run --rm --no-deps worker codex login --device-auth
-docker compose run --rm --no-deps worker codex login status
-DONKEYSPACE_TRIAGE_PROVIDER=agent docker compose up -d --build worker
+donkeyspace connect codex --method chatgpt
+donkeyspace connect codex --method api-key
 ```
+
+The installer never stores the API key in instance configuration. See the
+[official Codex authentication documentation](https://learn.chatgpt.com/docs/auth).
 
 When triage returns `ready`, the worker queues a developer job if `agents.developer.enabled` is true. The default developer command is `donkeyspace-codex-developer`, which runs Codex CLI against the cloned checkout. If it returns `implemented`, donkeyspace commits the changed files, pushes a branch named `donkeyspace/issue-{number}-{job-id}`, opens a GitHub PR with a Conventional Commit title, and moves the issue to `ai:pr-open`.
 

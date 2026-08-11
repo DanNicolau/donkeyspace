@@ -44,6 +44,8 @@ Donkeyspace does not merge pull requests.
 - `donkeyspace-core`: workflow state, policy routing, and run-result types.
 - `donkeyspace-db`: PostgreSQL records and lease operations.
 - `donkeyspace-github`: GitHub API helpers and webhook signature verification.
+- `donkeyspace-cli`: reusable installation services and the pre-TUI control
+  plane (`init`, connections, diagnostics, and lifecycle commands).
 - `donkeyspace-runner`: external command execution and structured result
   validation.
 - `web`: React and TanStack Query dashboard served by Vite in the current
@@ -94,10 +96,11 @@ review. Required GitHub checks, automatic merge, automatic retries, cancellation
 and maximum-concurrency enforcement are not implemented even though some fields
 are reserved in the policy schema.
 
-Credentials are supplied through environment variables. The current GitHub
-integration uses a personal access token; GitHub App installation credentials
-are a future deployment requirement. Codex credentials are persisted in the
-Compose-managed `codex-home` volume for local use.
+GitHub App credentials are the default. The API and worker authenticate as one
+configured installation; Octocrab refreshes installation tokens for REST calls
+and the worker obtains a current token for authenticated git operations. App
+webhooks from any other installation are rejected. Fine-grained PATs remain a
+deprecated compatibility mode. Codex authentication is delegated to Codex CLI.
 
 ## Known Limitations
 
@@ -106,12 +109,13 @@ Compose-managed `codex-home` volume for local use.
   lifecycle; plugins may define bounded task-level feedback.
 - No cancellation API, per-command timeout, or provider pause/resume control.
 - No per-job container, VM boundary, or configurable network isolation.
-- No GitHub App authentication; local operation uses a token.
-- No token accounting, retention policy, or systematic secret redaction.
+- V1 supports one GitHub repository owner per Donkeyspace instance; setup
+  discovers that owner's manifest-created App installation automatically.
+- No token accounting or configurable retention policy.
 - The dashboard does not yet show GitHub links, transitions, policy snapshots,
   or policy decisions, although some of that data is available from the API.
-- The Compose dashboard uses the Vite development server rather than production
-  static assets served by the API.
+- Registry images are modeled by setup but intentionally unavailable until a
+  release-image backend exists.
 - Test coverage is primarily unit-level; PostgreSQL, live GitHub, and complete
   end-to-end workflows are not covered by automated tests.
 - Donkeyspace does not coordinate changes across repositories.
