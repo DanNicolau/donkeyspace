@@ -1,0 +1,12 @@
+services:
+  web:
+    image: node:25-bookworm
+    build: !reset null
+    working_dir: /app/web
+    command: ["sh", "-lc", "npm install && npm run dev -- --host 0.0.0.0"]
+    environment:
+      DONKEYSPACE_API_PROXY_TARGET: http://api:8080
+    volumes:
+      - .:/app
+    ports: !override
+      - "127.0.0.1:${DONKEYSPACE_WEB_PORT:-5173}:5173"

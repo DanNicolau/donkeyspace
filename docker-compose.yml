@@ -5,8 +5,6 @@ services:
       POSTGRES_DB: donkeyspace
       POSTGRES_USER: donkeyspace
       POSTGRES_PASSWORD: donkeyspace
-    ports:
-      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -19,18 +17,25 @@ services:
     build:
       context: .
     command: ["donkeyspace-api"]
-    environment:
-      DONKEYSPACE_BIND_ADDR: ${DONKEYSPACE_BIND_ADDR:-0.0.0.0:8080}
-      DONKEYSPACE_DATABASE_URL: ${DONKEYSPACE_DATABASE_URL:-postgres://donkeyspace:donkeyspace@postgres:5432/donkeyspace}
-      DONKEYSPACE_POLICY_PATH: ${DONKEYSPACE_POLICY_PATH:-.donkeyspace/policy.yml}
+    environment: &github-environment
+      DONKEYSPACE_BIND_ADDR: 0.0.0.0:8080
+      DONKEYSPACE_DATABASE_URL: postgres://donkeyspace:donkeyspace@postgres:5432/donkeyspace
+      DONKEYSPACE_POLICY_PATH: .donkeyspace/policy.yml
+      DONKEYSPACE_GITHUB_AUTH_MODE: ${DONKEYSPACE_GITHUB_AUTH_MODE:-}
+      DONKEYSPACE_GITHUB_APP_ID: ${DONKEYSPACE_GITHUB_APP_ID:-}
+      DONKEYSPACE_GITHUB_INSTALLATION_ID: ${DONKEYSPACE_GITHUB_INSTALLATION_ID:-}
+      DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE: ${DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE:-}
       DONKEYSPACE_GITHUB_TOKEN: ${DONKEYSPACE_GITHUB_TOKEN:-}
       DONKEYSPACE_GITHUB_POLL_REPOSITORIES: ${DONKEYSPACE_GITHUB_POLL_REPOSITORIES:-}
       DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS: ${DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS:-60}
       DONKEYSPACE_GITHUB_POLL_MAX_PAGES: ${DONKEYSPACE_GITHUB_POLL_MAX_PAGES:-2}
-      DONKEYSPACE_WEBHOOK_SECRET: ${DONKEYSPACE_WEBHOOK_SECRET:-change-me}
+      DONKEYSPACE_WEBHOOK_SECRET_FILE: ${DONKEYSPACE_WEBHOOK_SECRET_FILE:-}
       RUST_LOG: ${RUST_LOG:-donkeyspace=info,tower_http=info}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${DONKEYSPACE_API_PORT:-8080}:8080"
+    secrets:
+      - github_private_key
+      - github_webhook_secret
     depends_on:
       postgres:
         condition: service_healthy
@@ -40,47 +45,46 @@ services:
       context: .
     command: ["donkeyspace-worker"]
     environment:
-      DONKEYSPACE_DATABASE_URL: ${DONKEYSPACE_DATABASE_URL:-postgres://donkeyspace:donkeyspace@postgres:5432/donkeyspace}
-      DONKEYSPACE_GITHUB_TOKEN: ${DONKEYSPACE_GITHUB_TOKEN:-}
-      DONKEYSPACE_POLICY_PATH: ${DONKEYSPACE_POLICY_PATH:-.donkeyspace/policy.yml}
+      <<: *github-environment
       DONKEYSPACE_WORKER_ID: ${DONKEYSPACE_WORKER_ID:-worker-local}
       DONKEYSPACE_LEASE_SECONDS: ${DONKEYSPACE_LEASE_SECONDS:-300}
       DONKEYSPACE_TRIAGE_PROVIDER: ${DONKEYSPACE_TRIAGE_PROVIDER:-agent}
       DONKEYSPACE_LLM_BASE_URL: ${DONKEYSPACE_LLM_BASE_URL:-https://openrouter.ai/api/v1}
       DONKEYSPACE_LLM_MODEL: ${DONKEYSPACE_LLM_MODEL:-openrouter/free}
       DONKEYSPACE_LLM_API_KEY: ${DONKEYSPACE_LLM_API_KEY:-}
-      DONKEYSPACE_WORKSPACE_ROOT: ${DONKEYSPACE_WORKSPACE_ROOT:-/workspaces}
-      DONKEYSPACE_WORKSPACE_VOLUME: ${DONKEYSPACE_WORKSPACE_VOLUME:-donkeyspace-workspaces}
-      DONKEYSPACE_CODEX_VOLUME: ${DONKEYSPACE_CODEX_VOLUME:-donkeyspace-codex-home}
+      DONKEYSPACE_WORKSPACE_ROOT: /workspaces
+      DONKEYSPACE_WORKSPACE_VOLUME: donkeyspace-workspaces
+      DONKEYSPACE_CODEX_VOLUME: donkeyspace-codex-home
       DONKEYSPACE_REPO_CONTEXT_MAX_BYTES: ${DONKEYSPACE_REPO_CONTEXT_MAX_BYTES:-20000}
       DONKEYSPACE_REPO_CONTEXT_MAX_FILE_BYTES: ${DONKEYSPACE_REPO_CONTEXT_MAX_FILE_BYTES:-4000}
       DONKEYSPACE_REPO_CONTEXT_MAX_FILES: ${DONKEYSPACE_REPO_CONTEXT_MAX_FILES:-12}
       DONKEYSPACE_READY_RECONCILE_LIMIT: ${DONKEYSPACE_READY_RECONCILE_LIMIT:-1}
       DONKEYSPACE_REPAIR_RECONCILE_LIMIT: ${DONKEYSPACE_REPAIR_RECONCILE_LIMIT:-1}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      RUST_LOG: ${RUST_LOG:-donkeyspace=info}
     volumes:
-      - codex-home:/root/.codex
-      - donkeyspace-workspaces:${DONKEYSPACE_WORKSPACE_ROOT:-/workspaces}
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${DONKEYSPACE_PLUGINS_DIR:-../plugins}:/plugins:ro
+      - ${DONKEYSPACE_CODEX_HOME_SOURCE:-codex-home}:/root/.codex
+      - donkeyspace-workspaces:/workspaces
+    secrets:
+      - github_private_key
+      - github_webhook_secret
     depends_on:
       postgres:
         condition: service_healthy
 
   web:
-    image: node:25-bookworm
-    working_dir: /app/web
-    command: ["sh", "-lc", "npm install && npm run dev -- --host 0.0.0.0"]
-    environment:
-      DONKEYSPACE_API_PROXY_TARGET: http://api:8080
+    build:
+      context: ./web
     ports:
-      - "5173:5173"
-    volumes:
-      - .:/app
+      - "127.0.0.1:${DONKEYSPACE_WEB_PORT:-5173}:80"
     depends_on:
       api:
         condition: service_started
+
+secrets:
+  github_private_key:
+    file: ${DONKEYSPACE_GITHUB_PRIVATE_KEY_SOURCE:-.donkeyspace/compose-placeholder}
+  github_webhook_secret:
+    file: ${DONKEYSPACE_WEBHOOK_SECRET_SOURCE:-.donkeyspace/compose-placeholder}
 
 volumes:
   codex-home:

@@ -5,3 +5,8 @@
 *.tsbuildinfo
 .env
 *.log
+
+# Deployment-owned credentials are written here only when an explicit local
+# config directory points into the source tree. Compose defaults use the
+# checked-in non-secret placeholder instead.
+.donkeyspace/secrets/

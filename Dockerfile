@@ -2,7 +2,7 @@ FROM rust:1.95-bookworm AS builder
 
 WORKDIR /app
 COPY . .
-RUN cargo build --release --bin donkeyspace-api --bin donkeyspace-worker
+RUN cargo build --release --bin donkeyspace-api --bin donkeyspace-worker --bin donkeyspace
 
 FROM node:25-bookworm-slim AS runtime
 
@@ -11,7 +11,7 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates docker.io git ripgrep \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates docker.io git ripgrep \
     && npm install -g @openai/codex@0.130.0 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,6 +31,7 @@ COPY --from=builder /usr/local/cargo /usr/local/cargo
 COPY --from=builder /usr/local/rustup /usr/local/rustup
 COPY --from=builder /app/target/release/donkeyspace-api /usr/local/bin/donkeyspace-api
 COPY --from=builder /app/target/release/donkeyspace-worker /usr/local/bin/donkeyspace-worker
+COPY --from=builder /app/target/release/donkeyspace /usr/local/bin/donkeyspace
 
 RUN chmod +x /usr/local/bin/donkeyspace-codex-triage /usr/local/bin/donkeyspace-codex-developer /usr/local/bin/donkeyspace-codex-reviewer /usr/local/bin/donkeyspace-codex-repair
 
