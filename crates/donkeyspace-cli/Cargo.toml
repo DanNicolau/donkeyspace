@@ -1,0 +1,18 @@
+[package]
+name = "donkeyspace-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "donkeyspace"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+donkeyspace-github = { path = "../donkeyspace-github" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

@@ -59,6 +59,8 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryInput {
+    pub installation_external_id: Option<String>,
+    pub installation_account_login: Option<String>,
     pub provider: String,
     pub owner: String,
     pub name: String,
@@ -212,15 +214,41 @@ pub struct ManagedPullRequestRecord {
 }
 
 pub async fn upsert_repository(pool: &PgPool, input: &RepositoryInput) -> Result<i64, DbError> {
+    let installation_id = if let (Some(external_id), Some(account_login)) = (
+        input.installation_external_id.as_deref(),
+        input.installation_account_login.as_deref(),
+    ) {
+        Some(
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                INSERT INTO installations (provider, external_id, account_login)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (provider, external_id)
+                DO UPDATE SET account_login = EXCLUDED.account_login
+                RETURNING id
+                "#,
+            )
+            .bind(&input.provider)
+            .bind(external_id)
+            .bind(account_login)
+            .fetch_one(pool)
+            .await?,
+        )
+    } else {
+        None
+    };
     let id = sqlx::query_scalar::<_, i64>(
         r#"
-        INSERT INTO repositories (provider, owner, name, default_branch)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO repositories (installation_id, provider, owner, name, default_branch)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (provider, owner, name)
-        DO UPDATE SET default_branch = EXCLUDED.default_branch
+        DO UPDATE SET
+            installation_id = COALESCE(EXCLUDED.installation_id, repositories.installation_id),
+            default_branch = EXCLUDED.default_branch
         RETURNING id
         "#,
     )
+    .bind(installation_id)
     .bind(&input.provider)
     .bind(&input.owner)
     .bind(&input.name)

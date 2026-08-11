@@ -19,7 +19,7 @@ use donkeyspace_db::{
     repair_job_exists_for_pr_base, resume_latest_paused_job, reviewer_job_exists_for_pr_head,
     upsert_pull_request, upsert_repository, upsert_workflow_item,
 };
-use donkeyspace_github::GitHubClient;
+use donkeyspace_github::{GitHubClient, GitHubCredentialProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
@@ -30,6 +30,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 struct AppState {
     webhook_secret: Option<String>,
+    github_auth: Option<GitHubCredentialProvider>,
     pool: Option<PgPool>,
     policy: Policy,
 }
@@ -77,8 +78,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let github_auth = GitHubCredentialProvider::from_env()?;
     let state = Arc::new(AppState {
-        webhook_secret: env::var("DONKEYSPACE_WEBHOOK_SECRET").ok(),
+        webhook_secret: load_optional_secret(
+            "DONKEYSPACE_WEBHOOK_SECRET",
+            "DONKEYSPACE_WEBHOOK_SECRET_FILE",
+        )?,
+        github_auth,
         pool,
         policy,
     });
@@ -115,11 +121,11 @@ fn start_github_poller(state: Arc<AppState>) -> Result<(), Box<dyn std::error::E
     if state.pool.is_none() {
         return Err("github polling requires DONKEYSPACE_DATABASE_URL".into());
     }
-    let token = env::var("DONKEYSPACE_GITHUB_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or("github polling requires DONKEYSPACE_GITHUB_TOKEN")?;
-    let client = GitHubClient::new(token)?;
+    let client = state
+        .github_auth
+        .as_ref()
+        .ok_or("github polling requires configured GitHub authentication")?
+        .client();
 
     tracing::info!(
         repositories = config.repositories.len(),
@@ -207,7 +213,7 @@ async fn poll_github_events(
                     .await?;
                 event["payload"]["pull_request"] = pull_request;
             }
-            let Some(ingress) = github_poll_event_to_ingress(
+            let Some(mut ingress) = github_poll_event_to_ingress(
                 &repository.owner,
                 &repository.name,
                 &repository_payload,
@@ -215,6 +221,14 @@ async fn poll_github_events(
             ) else {
                 continue;
             };
+            if let Some(installation_id) = state
+                .github_auth
+                .as_ref()
+                .and_then(GitHubCredentialProvider::installation_id)
+                && let Value::Object(payload) = &mut ingress.payload
+            {
+                payload.insert("installation".into(), json!({"id": installation_id}));
+            }
             let body = serde_json::to_vec(&ingress.payload)?;
             match persist_github_webhook(
                 pool,
@@ -562,6 +576,20 @@ async fn github_webhook(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("unknown");
 
+    if let Some(expected) = state
+        .github_auth
+        .as_ref()
+        .and_then(GitHubCredentialProvider::installation_id)
+    {
+        if !webhook_installation_matches(expected, &body) {
+            let actual = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|payload| payload.pointer("/installation/id").and_then(Value::as_u64));
+            tracing::warn!(expected, ?actual, "github webhook installation rejected");
+            return StatusCode::FORBIDDEN;
+        }
+    }
+
     let Some(pool) = &state.pool else {
         tracing::info!(
             event,
@@ -586,6 +614,13 @@ async fn github_webhook(
     }
 }
 
+fn webhook_installation_matches(expected: u64, body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|payload| payload.pointer("/installation/id").and_then(Value::as_u64))
+        == Some(expected)
+}
+
 fn init_tracing() {
     tracing_subscriber::registry()
         .with(
@@ -594,6 +629,26 @@ fn init_tracing() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+fn load_optional_secret(
+    value_name: &str,
+    file_name: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let value = env::var(value_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let file = env::var(file_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    match (value, file) {
+        (Some(_), Some(_)) => {
+            Err(format!("configure only one of {value_name} and {file_name}").into())
+        }
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(path)) => Ok(Some(fs::read_to_string(path)?.trim_end().to_string())),
+        (None, None) => Ok(None),
+    }
 }
 
 fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
@@ -659,6 +714,14 @@ async fn persist_issue_webhook(
     let repository_id = upsert_repository(
         pool,
         &RepositoryInput {
+            installation_external_id: payload
+                .installation
+                .as_ref()
+                .map(|value| value.id.to_string()),
+            installation_account_login: payload
+                .installation
+                .as_ref()
+                .map(|_| payload.repository.owner.login.clone()),
             provider: "github".to_string(),
             owner: payload.repository.owner.login,
             name: payload.repository.name,
@@ -827,6 +890,14 @@ async fn persist_pull_request_webhook(
     let repository_id = upsert_repository(
         pool,
         &RepositoryInput {
+            installation_external_id: payload
+                .installation
+                .as_ref()
+                .map(|value| value.id.to_string()),
+            installation_account_login: payload
+                .installation
+                .as_ref()
+                .map(|_| payload.repository.owner.login.clone()),
             provider: "github".to_string(),
             owner: payload.repository.owner.login.clone(),
             name: payload.repository.name.clone(),
@@ -958,6 +1029,14 @@ async fn persist_push_webhook(
     let repository_id = upsert_repository(
         pool,
         &RepositoryInput {
+            installation_external_id: payload
+                .installation
+                .as_ref()
+                .map(|value| value.id.to_string()),
+            installation_account_login: payload
+                .installation
+                .as_ref()
+                .map(|_| payload.repository.owner.login.clone()),
             provider: "github".to_string(),
             owner: payload.repository.owner.login,
             name: payload.repository.name,
@@ -1181,6 +1260,8 @@ struct GitHubIssueWebhook {
     comment: Option<GitHubComment>,
     #[serde(default)]
     label: Option<GitHubLabel>,
+    #[serde(default)]
+    installation: Option<GitHubInstallation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1188,6 +1269,8 @@ struct GitHubPullRequestWebhook {
     action: String,
     repository: GitHubRepository,
     pull_request: GitHubPullRequest,
+    #[serde(default)]
+    installation: Option<GitHubInstallation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1196,6 +1279,13 @@ struct GitHubPushWebhook {
     git_ref: String,
     after: String,
     repository: GitHubRepository,
+    #[serde(default)]
+    installation: Option<GitHubInstallation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubInstallation {
+    id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1284,7 +1374,7 @@ mod tests {
         GitHubComment, JobRecord, can_retry_job, comment_is_from_donkeyspace,
         extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
         issue_number_from_donkeyspace_branch, parse_polled_repositories, should_queue_reviewer,
-        should_queue_triage,
+        should_queue_triage, webhook_installation_matches,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -1298,6 +1388,19 @@ mod tests {
         assert_eq!(repositories[0].name, "rtl");
         assert!(parse_polled_repositories("missing-owner-separator").is_err());
         assert!(parse_polled_repositories("acme/too/many").is_err());
+    }
+
+    #[test]
+    fn webhook_installation_must_match_configured_app() {
+        assert!(webhook_installation_matches(
+            42,
+            br#"{"installation":{"id":42}}"#
+        ));
+        assert!(!webhook_installation_matches(
+            42,
+            br#"{"installation":{"id":7}}"#
+        ));
+        assert!(!webhook_installation_matches(42, br#"{}"#));
     }
 
     #[test]

@@ -12,7 +12,9 @@ use donkeyspace_db::{
     mark_job_running, mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
     record_state_transition, update_workflow_item_state,
 };
-use donkeyspace_github::GitHubClient;
+use donkeyspace_github::{
+    GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubCredentialProvider,
+};
 use donkeyspace_runner::{AgentCommand, AgentCommandStatus, read_run_result, run_agent_command};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +23,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::OnceLock,
     time::Duration,
 };
 use tokio::fs as tokio_fs;
@@ -37,6 +40,8 @@ use repo_context::{
     RepoContextConfig, build_repository_context, cleanup_repository_context,
     enrich_input_with_repository_context, workspace_path, write_askpass_script,
 };
+
+static GITHUB_AUTH: OnceLock<GitHubCredentialProvider> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "donkeyspace-worker")]
@@ -136,17 +141,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("donkeyspace worker started");
 
+    let legacy_pat = non_empty_string(args.github_token.clone());
+    let github_auth = match (GitHubCredentialProvider::from_env()?, legacy_pat) {
+        (Some(provider), Some(_)) if provider.mode() == GitHubAuthMode::App => {
+            return Err("App and PAT credentials cannot be configured together".into());
+        }
+        (Some(provider), _) => Some(provider),
+        (None, Some(token)) if !token.trim().is_empty() => {
+            Some(GitHubCredentialProvider::new(GitHubAuthConfig::Pat {
+                token,
+            })?)
+        }
+        _ => None,
+    };
+    if let Some(provider) = &github_auth {
+        let _ = GITHUB_AUTH.set(provider.clone());
+    }
+
     let mut label_synced_repositories = HashSet::new();
 
     if args.once {
         if let Some(pool) = &pool {
+            let github_token = match &github_auth {
+                Some(provider) => Some(provider.token().await?),
+                None => None,
+            };
             poll_once(
                 pool,
                 &policy,
                 &triage_config.provider,
                 triage_client.as_ref(),
                 &repo_context_config,
-                args.github_token.as_deref(),
+                github_token.as_deref(),
                 &mut label_synced_repositories,
                 &args.worker_id,
                 args.lease_seconds,
@@ -161,13 +187,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         if let Some(pool) = &pool {
+            let github_token = match &github_auth {
+                Some(provider) => Some(provider.token().await?),
+                None => None,
+            };
             poll_once(
                 pool,
                 &policy,
                 &triage_config.provider,
                 triage_client.as_ref(),
                 &repo_context_config,
-                args.github_token.as_deref(),
+                github_token.as_deref(),
                 &mut label_synced_repositories,
                 &args.worker_id,
                 args.lease_seconds,
@@ -219,7 +249,7 @@ async fn poll_once(
     }
 
     if let Some(github_token) = github_token.filter(|token| !token.trim().is_empty()) {
-        let client = GitHubClient::new(github_token)?;
+        let client = configured_github_client(github_token)?;
         ensure_policy_labels(pool, policy, &client, label_synced_repositories).await?;
         process_outbound_actions(pool, &client).await?;
     } else {
@@ -827,7 +857,7 @@ async fn execute_developer_job(
         enrich_input_with_repository_context(&running_job.input, repository_context.clone());
     let plugin_github_client = github_token
         .filter(|token| !token.trim().is_empty())
-        .map(GitHubClient::new)
+        .map(configured_github_client)
         .transpose()?;
     let developer_result =
         if let Some(selection) = lifecycle_selection.or(policy.agents.developer.plugin.as_ref()) {
@@ -1001,6 +1031,7 @@ async fn execute_developer_job(
         &repo_path,
         &workspace,
         github_token,
+        &changed_files,
         &branch_name,
         &commit_title,
         &commit_body,
@@ -1023,9 +1054,10 @@ async fn execute_developer_job(
         let owner = repository_owner(&running_job.input)?;
         let repo = repository_name(&running_job.input)?;
         let pull_request_body = developer_pull_request_body(&running_job, &result, &changed_files);
-        let github_token = github_token
-            .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to open implementation pull requests")?;
-        let github_client = GitHubClient::new(github_token)?;
+        let github_token = github_token.ok_or(
+            "configured GitHub authentication is required to open implementation pull requests",
+        )?;
+        let github_client = configured_github_client(github_token)?;
         let pull_request_url = github_client
             .create_pull_request(
                 &owner,
@@ -1132,7 +1164,7 @@ async fn current_github_issue_is_closed(
         return Ok(false);
     };
 
-    let client = GitHubClient::new(token)?;
+    let client = configured_github_client(token)?;
     Ok(client
         .issue_is_closed(
             &repository_owner(input)?,
@@ -1540,6 +1572,7 @@ async fn execute_repair_job(
         &repo_path,
         &repair_input.workspace_path,
         github_token,
+        &changed_files,
         &pull_request_head_ref(&running_job.input)?,
         &commit_title,
         &commit_body,
@@ -1904,7 +1937,10 @@ async fn fetch_base_branch(
     github_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let askpass_path = workspace_path.join("git-askpass.sh");
-    let token = github_token.filter(|token| !token.trim().is_empty());
+    let current_token = current_github_token(github_token).await?;
+    let token = current_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty());
     if token.is_some() {
         write_askpass_script(&askpass_path)?;
     }
@@ -1958,7 +1994,10 @@ async fn checkout_pull_request_head(
         pull_request_number(input).ok_or("reviewer input is missing pull request number")?;
     let workspace = workspace_path(job_id, repo_context_config);
     let askpass_path = workspace.join("git-askpass.sh");
-    let token = github_token.filter(|token| !token.trim().is_empty());
+    let current_token = current_github_token(github_token).await?;
+    let token = current_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty());
     if token.is_some() {
         write_askpass_script(&askpass_path)?;
     }
@@ -1985,7 +2024,10 @@ async fn checkout_pull_request_branch(
     let head_ref = pull_request_head_ref(input)?;
     let workspace = workspace_path(job_id, repo_context_config);
     let askpass_path = workspace.join("git-askpass.sh");
-    let token = github_token.filter(|token| !token.trim().is_empty());
+    let current_token = current_github_token(github_token).await?;
+    let token = current_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty());
     if token.is_some() {
         write_askpass_script(&askpass_path)?;
     }
@@ -2234,19 +2276,21 @@ async fn push_developer_branch(
     repo_path: &Path,
     workspace_path: &Path,
     github_token: Option<&str>,
+    changed_files: &[String],
     branch_name: &str,
     commit_title: &str,
     commit_body: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let token = github_token
-        .filter(|token| !token.trim().is_empty())
-        .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to push developer branches")?;
+    let current_token = current_github_token(github_token).await?;
+    let token = current_token
+        .as_deref()
+        .ok_or("configured GitHub authentication is required to push developer branches")?;
     let askpass_path = workspace_path.join("git-askpass.sh");
     write_askpass_script(&askpass_path)?;
 
     configure_git_author(repo_path).await?;
     run_git(repo_path, &["checkout", "-b", branch_name], None, None).await?;
-    run_git(repo_path, &["add", "-A"], None, None).await?;
+    stage_changed_files(repo_path, changed_files).await?;
     run_git(
         repo_path,
         &["commit", "-m", commit_title, "-m", commit_body],
@@ -2270,18 +2314,20 @@ async fn push_repair_branch(
     repo_path: &Path,
     workspace_path: &Path,
     github_token: Option<&str>,
+    changed_files: &[String],
     branch_name: &str,
     commit_title: &str,
     commit_body: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let token = github_token
-        .filter(|token| !token.trim().is_empty())
-        .ok_or("DONKEYSPACE_GITHUB_TOKEN is required to push repaired branches")?;
+    let current_token = current_github_token(github_token).await?;
+    let token = current_token
+        .as_deref()
+        .ok_or("configured GitHub authentication is required to push repaired branches")?;
     let askpass_path = workspace_path.join("git-askpass.sh");
     write_askpass_script(&askpass_path)?;
 
     configure_git_author(repo_path).await?;
-    run_git(repo_path, &["add", "-A"], None, None).await?;
+    stage_changed_files(repo_path, changed_files).await?;
     run_git(
         repo_path,
         &["commit", "-m", commit_title, "-m", commit_body],
@@ -2298,6 +2344,20 @@ async fn push_repair_branch(
     )
     .await?;
 
+    Ok(())
+}
+
+async fn stage_changed_files(
+    repo_path: &Path,
+    changed_files: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if changed_files.is_empty() {
+        return Err("cannot stage an empty implementation change set".into());
+    }
+
+    let mut args = vec!["add", "-A", "--"];
+    args.extend(changed_files.iter().map(String::as_str));
+    run_git(repo_path, &args, None, None).await?;
     Ok(())
 }
 
@@ -2334,19 +2394,43 @@ async fn run_git(
 async fn configure_git_author(repo_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     run_git(
         repo_path,
-        &["config", "user.name", "donkeyspace"],
+        &["config", "user.name", "donkeyspace[bot]"],
         None,
         None,
     )
     .await?;
     run_git(
         repo_path,
-        &["config", "user.email", "donkeyspace@example.invalid"],
+        &[
+            "config",
+            "user.email",
+            "donkeyspace-bot@users.noreply.github.com",
+        ],
         None,
         None,
     )
     .await?;
     Ok(())
+}
+
+fn configured_github_client(
+    token: &str,
+) -> Result<GitHubClient, donkeyspace_github::GitHubClientError> {
+    match GITHUB_AUTH.get() {
+        Some(provider) => Ok(provider.client()),
+        None => GitHubClient::new(token),
+    }
+}
+
+pub(crate) async fn current_github_token(
+    fallback: Option<&str>,
+) -> Result<Option<String>, donkeyspace_github::GitHubClientError> {
+    match GITHUB_AUTH.get() {
+        Some(provider) => Ok(Some(provider.token().await?)),
+        None => Ok(fallback
+            .filter(|token| !token.trim().is_empty())
+            .map(str::to_string)),
+    }
 }
 
 fn parse_porcelain_status(output: &str) -> Vec<String> {
@@ -3069,8 +3153,8 @@ mod tests {
         agent_run_input, command_summary, conventional_commit_title, input_is_donkeyspace_comment,
         input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
         normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
-        required_check_failure_summary, reviewer_changed_files, reviewer_comment_body,
-        token_usage_exceeded_triage_result,
+        required_check_failure_summary, reviewer_changed_files, reviewer_comment_body, run_git,
+        stage_changed_files, token_usage_exceeded_triage_result,
     };
     use donkeyspace_core::{Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus};
     use serde_json::json;
@@ -3369,6 +3453,53 @@ mod tests {
                 "new.md".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn publication_stages_only_the_pre_validation_change_set() {
+        let repo_path =
+            std::env::temp_dir().join(format!("donkeyspace-stage-changes-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+
+        run_git(&repo_path, &["init"], None, None).await.unwrap();
+        run_git(
+            &repo_path,
+            &["config", "user.name", "Donkeyspace Test"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        run_git(
+            &repo_path,
+            &["config", "user.email", "test@example.invalid"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::write(repo_path.join("README.md"), "before\n").unwrap();
+        run_git(&repo_path, &["add", "README.md"], None, None)
+            .await
+            .unwrap();
+        run_git(&repo_path, &["commit", "-m", "initial"], None, None)
+            .await
+            .unwrap();
+
+        std::fs::write(repo_path.join("README.md"), "after\n").unwrap();
+        std::fs::create_dir_all(repo_path.join("target")).unwrap();
+        std::fs::write(repo_path.join("target/generated"), "validation artifact\n").unwrap();
+        stage_changed_files(&repo_path, &["README.md".to_string()])
+            .await
+            .unwrap();
+
+        let staged = run_git(&repo_path, &["diff", "--cached", "--name-only"], None, None)
+            .await
+            .unwrap();
+        assert_eq!(staged.trim(), "README.md");
+        assert!(repo_path.join("target/generated").exists());
+
+        std::fs::remove_dir_all(repo_path).unwrap();
     }
 
     #[test]

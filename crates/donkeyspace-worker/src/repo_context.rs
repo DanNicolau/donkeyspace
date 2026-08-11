@@ -98,13 +98,14 @@ pub async fn build_repository_context(
     }
     fs::create_dir_all(&workspace_path)?;
 
+    let current_token = crate::current_github_token(github_token).await?;
     clone_repository(
         owner,
         repo,
         default_branch,
         &repo_path,
         &workspace_path,
-        github_token,
+        current_token.as_deref(),
     )
     .await?;
 
@@ -406,8 +407,15 @@ fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{path_matches_reference, referenced_file_tokens, select_files};
+    use super::{
+        path_matches_reference, referenced_file_tokens, select_files, write_askpass_script,
+    };
     use serde_json::json;
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn readme_reference_selects_readme_file() {
@@ -436,5 +444,48 @@ mod tests {
     fn path_matching_supports_basenames() {
         assert!(path_matches_reference("docs/README.md", "README.md"));
         assert!(path_matches_reference("README.md", "README"));
+    }
+
+    #[test]
+    fn askpass_reads_token_from_environment_without_embedding_it() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("donkeyspace-askpass-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let script = directory.join("git-askpass.sh");
+        write_askpass_script(&script).unwrap();
+
+        let contents = fs::read_to_string(&script).unwrap();
+        assert!(!contents.contains("installation-token-value"));
+        let username = Command::new(&script)
+            .arg("Username for 'https://github.com':")
+            .env("DONKEYSPACE_GIT_TOKEN", "installation-token-value")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(username.stdout).unwrap(),
+            "x-access-token"
+        );
+        let password = Command::new(&script)
+            .arg("Password for 'https://github.com':")
+            .env("DONKEYSPACE_GIT_TOKEN", "installation-token-value")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(password.stdout).unwrap(),
+            "installation-token-value"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 }

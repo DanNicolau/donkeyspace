@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/donkeyspace-cli",
     "crates/donkeyspace-api",
     "crates/donkeyspace-core",
     "crates/donkeyspace-db",
@@ -25,6 +26,8 @@ hex = "0.4"
 hmac = "0.12"
 http = "1"
 octocrab = "0.50"
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

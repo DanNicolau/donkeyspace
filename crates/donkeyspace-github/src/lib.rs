@@ -1,10 +1,11 @@
 use hmac::{Hmac, Mac};
 use http::header::ACCEPT;
 use octocrab::{Octocrab, models::IssueState};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, env, fs, path::PathBuf, sync::Arc};
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -51,6 +52,348 @@ pub enum GitHubClientError {
     Octocrab(#[from] octocrab::Error),
     #[error("invalid github response: {0}")]
     InvalidResponse(String),
+    #[error("github authentication configuration is invalid: {0}")]
+    InvalidAuthConfig(String),
+    #[error("failed to read github private key `{path}`: {source}")]
+    PrivateKeyRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("github app private key is invalid: {0}")]
+    InvalidPrivateKey(#[from] jsonwebtoken::errors::Error),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitHubAuthMode {
+    App,
+    Pat,
+}
+
+#[derive(Clone)]
+pub enum GitHubAuthConfig {
+    App {
+        app_id: u64,
+        installation_id: u64,
+        private_key_file: PathBuf,
+    },
+    Pat {
+        token: String,
+    },
+}
+
+impl std::fmt::Debug for GitHubAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::App {
+                app_id,
+                installation_id,
+                private_key_file,
+            } => formatter
+                .debug_struct("App")
+                .field("app_id", app_id)
+                .field("installation_id", installation_id)
+                .field("private_key_file", private_key_file)
+                .finish(),
+            Self::Pat { .. } => formatter
+                .debug_struct("Pat")
+                .field("token", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+impl GitHubAuthConfig {
+    pub fn from_env() -> Result<Option<Self>, GitHubClientError> {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<Self>, GitHubClientError> {
+        let get = |name| {
+            lookup(name)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let mode = get("DONKEYSPACE_GITHUB_AUTH_MODE");
+        let app_id = get("DONKEYSPACE_GITHUB_APP_ID");
+        let installation_id = get("DONKEYSPACE_GITHUB_INSTALLATION_ID");
+        let private_key_file = get("DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE");
+        let pat = get("DONKEYSPACE_GITHUB_TOKEN");
+        let any_app = app_id.is_some() || installation_id.is_some() || private_key_file.is_some();
+
+        let selected = match mode.as_deref() {
+            Some("app") => GitHubAuthMode::App,
+            Some("pat") => GitHubAuthMode::Pat,
+            Some(other) => {
+                return Err(GitHubClientError::InvalidAuthConfig(format!(
+                    "DONKEYSPACE_GITHUB_AUTH_MODE must be `app` or `pat`, got `{other}`"
+                )));
+            }
+            None if any_app => GitHubAuthMode::App,
+            None if pat.is_some() => GitHubAuthMode::Pat,
+            None => return Ok(None),
+        };
+
+        if any_app && pat.is_some() {
+            return Err(GitHubClientError::InvalidAuthConfig(
+                "App and PAT credentials cannot be configured together".into(),
+            ));
+        }
+
+        match selected {
+            GitHubAuthMode::App => {
+                let missing = [
+                    ("DONKEYSPACE_GITHUB_APP_ID", app_id.is_none()),
+                    (
+                        "DONKEYSPACE_GITHUB_INSTALLATION_ID",
+                        installation_id.is_none(),
+                    ),
+                    (
+                        "DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE",
+                        private_key_file.is_none(),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(name, missing)| missing.then_some(name))
+                .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    return Err(GitHubClientError::InvalidAuthConfig(format!(
+                        "partial App configuration; missing {}",
+                        missing.join(", ")
+                    )));
+                }
+                Ok(Some(Self::App {
+                    app_id: parse_id("DONKEYSPACE_GITHUB_APP_ID", app_id.unwrap())?,
+                    installation_id: parse_id(
+                        "DONKEYSPACE_GITHUB_INSTALLATION_ID",
+                        installation_id.unwrap(),
+                    )?,
+                    private_key_file: PathBuf::from(private_key_file.unwrap()),
+                }))
+            }
+            GitHubAuthMode::Pat => Ok(Some(Self::Pat {
+                token: pat.ok_or_else(|| {
+                    GitHubClientError::InvalidAuthConfig(
+                        "PAT mode requires DONKEYSPACE_GITHUB_TOKEN".into(),
+                    )
+                })?,
+            })),
+        }
+    }
+
+    pub fn mode(&self) -> GitHubAuthMode {
+        match self {
+            Self::App { .. } => GitHubAuthMode::App,
+            Self::Pat { .. } => GitHubAuthMode::Pat,
+        }
+    }
+
+    pub fn installation_id(&self) -> Option<u64> {
+        match self {
+            Self::App {
+                installation_id, ..
+            } => Some(*installation_id),
+            Self::Pat { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GitHubCredentialProvider {
+    config: GitHubAuthConfig,
+    client: Arc<Octocrab>,
+    app_client: Option<Arc<Octocrab>>,
+}
+
+impl std::fmt::Debug for GitHubCredentialProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitHubCredentialProvider")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GitHubCredentialProvider {
+    pub fn new(config: GitHubAuthConfig) -> Result<Self, GitHubClientError> {
+        Self::new_with_base_uri(config, None)
+    }
+
+    fn new_with_base_uri(
+        config: GitHubAuthConfig,
+        base_uri: Option<&str>,
+    ) -> Result<Self, GitHubClientError> {
+        let (client, app_client) = match &config {
+            GitHubAuthConfig::App {
+                app_id,
+                installation_id,
+                private_key_file,
+            } => {
+                let pem = fs::read(private_key_file).map_err(|source| {
+                    GitHubClientError::PrivateKeyRead {
+                        path: private_key_file.clone(),
+                        source,
+                    }
+                })?;
+                let key = jsonwebtoken::EncodingKey::from_rsa_pem(&pem)?;
+                let builder = Octocrab::builder()
+                    .app((*app_id).into(), key)
+                    .add_header(ACCEPT, "application/vnd.github+json".into());
+                let builder = match base_uri {
+                    Some(base_uri) => builder.base_uri(base_uri)?,
+                    None => builder,
+                };
+                let app_client = builder.build()?;
+                let client = app_client.installation((*installation_id).into())?;
+                (client, Some(Arc::new(app_client)))
+            }
+            GitHubAuthConfig::Pat { token } => {
+                eprintln!(
+                    "warning: PAT authentication is deprecated; configure a GitHub App installation"
+                );
+                let builder = Octocrab::builder()
+                    .personal_token(token.clone())
+                    .add_header(ACCEPT, "application/vnd.github+json".into());
+                let builder = match base_uri {
+                    Some(base_uri) => builder.base_uri(base_uri)?,
+                    None => builder,
+                };
+                (builder.build()?, None)
+            }
+        };
+        Ok(Self {
+            config,
+            client: Arc::new(client),
+            app_client,
+        })
+    }
+
+    pub fn from_env() -> Result<Option<Self>, GitHubClientError> {
+        GitHubAuthConfig::from_env()?.map(Self::new).transpose()
+    }
+
+    pub fn mode(&self) -> GitHubAuthMode {
+        self.config.mode()
+    }
+
+    pub fn installation_id(&self) -> Option<u64> {
+        self.config.installation_id()
+    }
+
+    pub async fn token(&self) -> Result<String, GitHubClientError> {
+        match &self.config {
+            GitHubAuthConfig::App { .. } => Ok(self
+                .client
+                .installation_token()
+                .await?
+                .expose_secret()
+                .to_string()),
+            GitHubAuthConfig::Pat { token } => Ok(token.clone()),
+        }
+    }
+
+    pub fn client(&self) -> GitHubClient {
+        GitHubClient {
+            client: (*self.client).clone(),
+        }
+    }
+
+    pub async fn validate_installation(&self) -> Result<(), GitHubClientError> {
+        let GitHubAuthConfig::App {
+            installation_id, ..
+        } = &self.config
+        else {
+            return Ok(());
+        };
+        let app_client = self.app_client.as_ref().ok_or_else(|| {
+            GitHubClientError::InvalidResponse("App client is unavailable".into())
+        })?;
+        let installation: Value = app_client
+            .get(format!("/app/installations/{installation_id}"), None::<&()>)
+            .await?;
+        validate_installation_response(&installation)
+    }
+}
+
+pub async fn discover_installation_id(
+    app_id: u64,
+    private_key_file: PathBuf,
+    repository_owner: &str,
+) -> Result<u64, GitHubClientError> {
+    let pem = fs::read(&private_key_file).map_err(|source| GitHubClientError::PrivateKeyRead {
+        path: private_key_file,
+        source,
+    })?;
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(&pem)?;
+    let app_client = Octocrab::builder()
+        .app(app_id.into(), key)
+        .add_header(ACCEPT, "application/vnd.github+json".into())
+        .build()?;
+    let installations: Value = app_client
+        .get(
+            "/app/installations",
+            Some(&serde_json::json!({"per_page": 100})),
+        )
+        .await?;
+    select_installation_id(&installations, repository_owner)
+}
+
+fn select_installation_id(
+    installations: &Value,
+    repository_owner: &str,
+) -> Result<u64, GitHubClientError> {
+    let installations = installations.as_array().ok_or_else(|| {
+        GitHubClientError::InvalidResponse("installation listing is not an array".into())
+    })?;
+    let matching = installations
+        .iter()
+        .filter(|installation| {
+            installation["account"]["login"]
+                .as_str()
+                .is_some_and(|login| login.eq_ignore_ascii_case(repository_owner))
+        })
+        .collect::<Vec<_>>();
+    let [installation] = matching.as_slice() else {
+        return Err(GitHubClientError::InvalidResponse(match matching.len() {
+            0 => {
+                format!("GitHub App has no installation for repository owner `{repository_owner}`")
+            }
+            count => format!(
+                "GitHub App has {count} installations for repository owner `{repository_owner}`"
+            ),
+        }));
+    };
+    validate_installation_response(installation)?;
+    installation["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            GitHubClientError::InvalidResponse("matching installation has no valid id".into())
+        })
+}
+
+fn validate_installation_response(installation: &Value) -> Result<(), GitHubClientError> {
+    if !installation["suspended_at"].is_null() {
+        return Err(GitHubClientError::InvalidResponse(
+            "configured installation is suspended".into(),
+        ));
+    }
+    for permission in ["contents", "issues", "pull_requests"] {
+        if installation["permissions"][permission].as_str() != Some("write") {
+            return Err(GitHubClientError::InvalidResponse(format!(
+                "installation is missing `{permission}: write` permission"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_id(name: &str, value: String) -> Result<u64, GitHubClientError> {
+    value.parse().ok().filter(|id| *id > 0).ok_or_else(|| {
+        GitHubClientError::InvalidAuthConfig(format!("{name} must be a positive integer"))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -336,10 +679,252 @@ fn workflow_label_color(label: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::verify_signature;
+    use super::{
+        GitHubAuthConfig, GitHubAuthMode, SignatureError, select_installation_id,
+        validate_installation_response, verify_signature,
+    };
+    use hmac::{Hmac, Mac};
+    use http_body_util::Full;
+    use jsonwebtoken::EncodingKey;
+    use octocrab::{AuthState, OctocrabBuilder, auth::AppAuth};
+    use serde_json::json;
+    use sha2::Sha256;
+    use std::{
+        collections::HashMap,
+        convert::Infallible,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    use tower::service_fn;
 
     #[test]
     fn rejects_missing_signature() {
         assert!(verify_signature("secret", b"{}", None).is_err());
+    }
+
+    #[test]
+    fn verifies_valid_signature_and_rejects_malformed_or_bad_signatures() {
+        let payload = br#"{"action":"opened"}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
+        mac.update(payload);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(
+            verify_signature("secret", payload, Some(&signature)),
+            Ok(())
+        );
+        assert_eq!(
+            verify_signature("secret", payload, Some("md5=abcd")),
+            Err(SignatureError::InvalidPrefix)
+        );
+        assert_eq!(
+            verify_signature("secret", payload, Some("sha256=not-hex")),
+            Err(SignatureError::InvalidHex)
+        );
+        assert_eq!(
+            verify_signature("different", payload, Some(&signature)),
+            Err(SignatureError::Mismatch)
+        );
+    }
+
+    fn config(
+        values: &[(&str, &str)],
+    ) -> Result<Option<GitHubAuthConfig>, super::GitHubClientError> {
+        let values = values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<_, _>>();
+        GitHubAuthConfig::from_lookup(|name| values.get(name).cloned())
+    }
+
+    #[test]
+    fn app_configuration_requires_every_field() {
+        let error = config(&[("DONKEYSPACE_GITHUB_APP_ID", "7")]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("DONKEYSPACE_GITHUB_INSTALLATION_ID"));
+        assert!(message.contains("DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE"));
+    }
+
+    #[test]
+    fn rejects_mixed_app_and_pat_credentials() {
+        let error = config(&[
+            ("DONKEYSPACE_GITHUB_APP_ID", "7"),
+            ("DONKEYSPACE_GITHUB_INSTALLATION_ID", "8"),
+            ("DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE", "/secret/key.pem"),
+            ("DONKEYSPACE_GITHUB_TOKEN", "sensitive"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be configured together"));
+    }
+
+    #[test]
+    fn pat_debug_output_redacts_token() {
+        let config = config(&[("DONKEYSPACE_GITHUB_TOKEN", "ghp_sensitive")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.mode(), GitHubAuthMode::Pat);
+        let output = format!("{config:?}");
+        assert!(!output.contains("ghp_sensitive"));
+        assert!(output.contains("REDACTED"));
+    }
+
+    #[test]
+    fn explicit_pat_mode_rejects_app_fields() {
+        assert!(
+            config(&[
+                ("DONKEYSPACE_GITHUB_AUTH_MODE", "pat"),
+                ("DONKEYSPACE_GITHUB_APP_ID", "7"),
+                ("DONKEYSPACE_GITHUB_TOKEN", "token"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn app_ids_must_be_positive() {
+        let error = config(&[
+            ("DONKEYSPACE_GITHUB_APP_ID", "0"),
+            ("DONKEYSPACE_GITHUB_INSTALLATION_ID", "8"),
+            ("DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE", "/secret/key.pem"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("positive integer"));
+    }
+
+    fn installation(
+        permissions: serde_json::Value,
+        suspended_at: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "suspended_at": suspended_at,
+            "permissions": permissions,
+        })
+    }
+
+    #[test]
+    fn accepts_installation_with_exact_required_permissions() {
+        let response = installation(
+            json!({
+                "metadata": "read",
+                "contents": "write",
+                "issues": "write",
+                "pull_requests": "write"
+            }),
+            serde_json::Value::Null,
+        );
+        validate_installation_response(&response).unwrap();
+    }
+
+    #[test]
+    fn rejects_suspended_installation() {
+        let response = installation(
+            json!({
+                "contents": "write",
+                "issues": "write",
+                "pull_requests": "write"
+            }),
+            json!("2026-08-11T00:00:00Z"),
+        );
+        let error = validate_installation_response(&response).unwrap_err();
+        assert!(error.to_string().contains("suspended"));
+    }
+
+    #[test]
+    fn rejects_installation_with_missing_permissions() {
+        let response = installation(
+            json!({
+                "contents": "write",
+                "issues": "read",
+                "pull_requests": "write"
+            }),
+            serde_json::Value::Null,
+        );
+        let error = validate_installation_response(&response).unwrap_err();
+        assert!(error.to_string().contains("issues: write"));
+    }
+
+    #[test]
+    fn discovers_installation_for_repository_owner() {
+        let installations = json!([
+            {
+                "id": 8,
+                "account": {"login": "another-owner"},
+                "suspended_at": null,
+                "permissions": {"contents":"write","issues":"write","pull_requests":"write"}
+            },
+            {
+                "id": 42,
+                "account": {"login": "Example-Owner"},
+                "suspended_at": null,
+                "permissions": {"contents":"write","issues":"write","pull_requests":"write"}
+            }
+        ]);
+        assert_eq!(
+            select_installation_id(&installations, "example-owner").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn installation_discovery_rejects_missing_or_ambiguous_owner() {
+        let one = json!([{
+            "id": 42,
+            "account": {"login": "owner"},
+            "suspended_at": null,
+            "permissions": {"contents":"write","issues":"write","pull_requests":"write"}
+        }]);
+        assert!(select_installation_id(&one, "missing").is_err());
+        let duplicate = json!([one[0].clone(), one[0].clone()]);
+        assert!(select_installation_id(&duplicate, "owner").is_err());
+    }
+
+    #[tokio::test]
+    async fn refreshes_expired_installation_token() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let service = service_fn(move |request: http::Request<octocrab::OctoBody>| {
+            let request_count = Arc::clone(&request_count);
+            async move {
+                assert_eq!(request.method(), http::Method::POST);
+                assert_eq!(request.uri().path(), "/app/installations/8/access_tokens");
+                let index = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = format!(
+                    r#"{{"token":"installation-token-{index}","expires_at":"2000-01-01T00:00:00Z","permissions":{{}},"repositories":null}}"#
+                );
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .status(http::StatusCode::CREATED)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(bytes::Bytes::from(body)))
+                        .unwrap(),
+                )
+            }
+        });
+        let key =
+            EncodingKey::from_rsa_pem(include_bytes!("../tests/fixtures/test-github-app.pem"))
+                .unwrap();
+        let app_client = OctocrabBuilder::new_empty()
+            .with_service(service)
+            .with_auth(AuthState::App(AppAuth {
+                app_id: 7_u64.into(),
+                key,
+            }))
+            .build()
+            .unwrap();
+        let installation_client = app_client.installation(8_u64.into()).unwrap();
+        let provider = super::GitHubCredentialProvider {
+            config: GitHubAuthConfig::App {
+                app_id: 7,
+                installation_id: 8,
+                private_key_file: "unused-test-key.pem".into(),
+            },
+            client: Arc::new(installation_client),
+            app_client: Some(Arc::new(app_client)),
+        };
+
+        assert_eq!(provider.token().await.unwrap(), "installation-token-1");
+        assert_eq!(provider.token().await.unwrap(), "installation-token-2");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }

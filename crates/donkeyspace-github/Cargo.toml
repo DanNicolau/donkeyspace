@@ -9,8 +9,16 @@ repository.workspace = true
 hex.workspace = true
 hmac.workspace = true
 http.workspace = true
+jsonwebtoken.workspace = true
 octocrab.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+http-body-util = "0.1"
+tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }
