@@ -1,11 +1,32 @@
 # Installation and authentication
 
-The `donkeyspace` CLI is the reusable setup control plane for the future TUI.
+The `donkeyspace` CLI and TUI share one reusable setup control plane.
 Instance configuration uses `schema_version = 1` and lives under
 `$XDG_CONFIG_HOME/donkeyspace` or `~/.config/donkeyspace` by default. Pass
 `--config-dir` to select a different instance.
 
 ## First run
+
+The recommended interactive path is:
+
+```sh
+cargo build --bin donkeyspace
+donkeyspace
+```
+
+Running `donkeyspace` without a subcommand opens the terminal interface. On an
+uninitialized instance it starts the setup wizard; configured instances open
+the operations home screen. Use arrow keys or Tab to move, Enter to continue,
+Space to select repositories or toggle webhook ingress, Esc to go back, and
+`q` to leave the home screen.
+
+The wizard creates or resumes the local-build instance, connects GitHub and
+Codex, runs `doctor`, and offers to start the stack when required checks pass.
+The home screen refreshes Compose service state every two seconds and provides
+Doctor, Start, Stop, and authentication reconfiguration actions. Stop preserves
+all volumes. Live logs and destructive reset remain explicit CLI operations.
+
+The equivalent non-interactive commands are:
 
 ```sh
 cargo build --bin donkeyspace
@@ -22,6 +43,10 @@ repository access, secret permissions, and `codex login status`.
 
 `down` preserves PostgreSQL and Codex/workspace volumes. Deletion requires the
 explicit pair `reset --delete-data --confirm`.
+
+Bare-command TUI startup requires an interactive stdin and stdout. Automation
+must use an explicit subcommand; this prevents terminal control sequences from
+being written to redirected output.
 
 ## GitHub App
 
@@ -40,6 +65,18 @@ can pass `--organization ORGANIZATION` to use the organization manifest route.
 After installation, setup discovers the installation ID from the repository
 owner and validates access to every selected repository. All selected
 repositories must belong to that one owner.
+
+The TUI presents the same manifest flow as its primary option. After App
+installation it fetches every repository accessible to the installation and
+shows a checkbox list; one or more repositories from the configured owner must
+be selected. Existing-App import and deprecated PAT authentication are under
+the Advanced choices.
+
+If the process stops after manifest conversion but before repository selection,
+the TUI resumes from a private `pending-github.json` record on its next launch.
+The pending record contains only identifiers, file paths, and setup choices;
+the private key and webhook secret remain separate mode `0600` files. The user
+can resume installation or explicitly discard the pending registration.
 
 When a public HTTPS URL is provided, the App subscribes to `issues`,
 `issue_comment`, `pull_request`, and `push` with signed webhooks. Without one,
@@ -85,3 +122,8 @@ methods described by the
 
 Direct OpenAI-compatible triage settings remain an advanced runtime option and
 are not required during setup.
+
+In the TUI, ChatGPT login temporarily restores the normal terminal while Codex
+owns the browser interaction, then returns to the full-screen interface and
+checks login status. API-key input is masked and piped directly to Codex; it is
+cleared from UI state and never written to instance configuration.

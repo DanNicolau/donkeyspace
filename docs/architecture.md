@@ -44,8 +44,8 @@ Donkeyspace does not merge pull requests.
 - `donkeyspace-core`: workflow state, policy routing, and run-result types.
 - `donkeyspace-db`: PostgreSQL records and lease operations.
 - `donkeyspace-github`: GitHub API helpers and webhook signature verification.
-- `donkeyspace-cli`: reusable installation services and the pre-TUI control
-  plane (`init`, connections, diagnostics, and lifecycle commands).
+- `donkeyspace-cli`: reusable installation services, scriptable setup commands,
+  and the Ratatui installation and operations console.
 - `donkeyspace-runner`: external command execution and structured result
   validation.
 - `web`: React and TanStack Query dashboard served by Vite in the current

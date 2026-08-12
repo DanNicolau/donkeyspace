@@ -63,6 +63,17 @@ cargo run -p donkeyspace-cli -- doctor
 cargo run -p donkeyspace-cli -- up
 ```
 
+For an interactive setup and operations console, run the binary without a
+subcommand:
+
+```sh
+cargo run -p donkeyspace-cli
+```
+
+The TUI guides initialization, GitHub repository selection, Codex login,
+diagnostics, and stack startup. Explicit subcommands remain available for
+scripts and non-interactive environments.
+
 The GitHub connection command creates a private deployment-owned GitHub App
 through GitHub's manifest flow by default. App and installation identifiers are
 stored in the versioned instance configuration; the private key and webhook
