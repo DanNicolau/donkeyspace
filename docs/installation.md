@@ -102,8 +102,9 @@ DONKEYSPACE_GITHUB_TOKEN  # deprecated PAT mode only
 
 App and PAT values are mutually exclusive. The default Compose file binds the
 API and dashboard to localhost, does not publish PostgreSQL, and does not mount
-the Docker socket. Use `docker-compose.dev.yml` for Vite hot reload and
-`docker-compose.plugins.yml` only when plugin execution needs Docker access.
+the Docker socket. Use `docker-compose.dev.yml` for Vite hot reload. The setup
+control plane generates a private overlay and mounts the Docker socket only on
+the worker when a plugin flow is active.
 The checked-in `.donkeyspace/compose-placeholder` is not a key or webhook
 secret; it only lets an unauthenticated Compose configuration parse. Runtime
 credentials are stored outside the source tree by default, and
@@ -127,3 +128,29 @@ In the TUI, ChatGPT login temporarily restores the normal terminal while Codex
 owns the browser interaction, then returns to the full-screen interface and
 checks login status. API-key input is masked and piped directly to Codex; it is
 cleared from UI state and never written to instance configuration.
+
+## Plugins
+
+Connect a local plugin repository with the same control plane used by the TUI:
+
+```sh
+donkeyspace connect plugin --path ../donkey-kong --flow rtl_blocks
+donkeyspace plugin list
+```
+
+The manifest's optional `installation` section tells Donkeyspace how to build
+the image and which environment inputs it accepts. Images are built only when
+missing; use `donkeyspace plugin rebuild ID` for an explicit rebuild. Supply
+non-interactive values through private files, never command-line values:
+
+```sh
+donkeyspace connect plugin --path ../example-plugin \
+  --environment-file PROVIDER_TOKEN=/secure/provider-token
+```
+
+Several plugins may be installed, but exactly one flow can be active. Activate
+or switch with `donkeyspace plugin activate ID --flow FLOW`. Disable plugin
+execution with `donkeyspace plugin disable`; this restores the default policy
+without deleting checkouts, images, configuration, or secret files. The TUI's
+“Manage plugins” action provides connect, activate, rebuild, and disable
+operations and clearly marks lifecycle-replacement flows as exclusive.

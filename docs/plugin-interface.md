@@ -60,6 +60,19 @@ id: example.rtl
 runtime:
   default_image: example-rtl:dev
 
+installation:
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    EXAMPLE_MODE:
+      description: Select the plugin execution mode.
+      default: fake
+    PROVIDER_TOKEN:
+      description: Token used by the external provider.
+      required: true
+      secret: true
+
 roles:
   architect:
     command: [/plugin/bin/run-agent, architect]
@@ -397,26 +410,22 @@ the complete graph succeeds.
 
 ## Deployment
 
-Build the plugin image according to the plugin's instructions. The base Compose
-stack exposes a generic `/plugins` mount; each plugin owns its source mount,
-runtime variables, Compose overlay, and ready-to-use policy. A typical local
-deployment looks like this:
+The installer consumes the manifest's optional `installation` metadata. Build
+paths are relative to the plugin directory and default to `.` and `Dockerfile`.
+Environment names must also be allowlisted by at least one role. Secret inputs
+cannot declare defaults.
+
+Connect and optionally activate a plugin with:
 
 ```sh
-cd ../example-plugin
-docker build -t example-plugin:dev .
-cp donkeyspace.env.example .env
-
-cd ../donkeyspace
-docker compose \
-  --env-file .env \
-  --env-file ../example-plugin/.env \
-  -f docker-compose.yml \
-  -f ../example-plugin/docker-compose.donkeyspace.yml \
-  up -d --build
+donkeyspace connect plugin --path ../example-plugin --flow implementation \
+  --environment-file PROVIDER_TOKEN=/secure/provider-token
 ```
 
-Plugin-specific mount paths and runtime variables belong in the plugin-owned
-overlay and environment file. Donkeyspace itself only requires the generic
-`DONKEYSPACE_PLUGINS_DIR` installation root. Restart the API and worker after
-changing the selected policy or plugin manifest.
+Donkeyspace keeps a registry of installed plugins but generates policy and a
+Compose overlay for only the active flow. Lifecycle-replacement flows are
+exclusive; ordinary flows replace the developer role. The active plugin is
+mounted read-only, environment values are stored in mode-`0600` files and
+mounted as Compose secrets, and only the active worker receives the Docker
+socket. `donkeyspace plugin disable` returns to the default lifecycle while
+preserving installed plugin state.
