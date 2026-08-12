@@ -207,6 +207,14 @@ pub struct GitHubCredentialProvider {
     app_client: Option<Arc<Octocrab>>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GitHubRepository {
+    pub owner: String,
+    pub name: String,
+    pub full_name: String,
+    pub private: bool,
+}
+
 impl std::fmt::Debug for GitHubCredentialProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -315,6 +323,61 @@ impl GitHubCredentialProvider {
             .await?;
         validate_installation_response(&installation)
     }
+
+    pub async fn repositories(&self) -> Result<Vec<GitHubRepository>, GitHubClientError> {
+        let mut repositories = Vec::new();
+        for page in 1.. {
+            let query = serde_json::json!({"per_page": 100, "page": page});
+            let response: Value = match self.mode() {
+                GitHubAuthMode::App => {
+                    self.client
+                        .get("/installation/repositories", Some(&query))
+                        .await?
+                }
+                GitHubAuthMode::Pat => self.client.get("/user/repos", Some(&query)).await?,
+            };
+            let values = match self.mode() {
+                GitHubAuthMode::App => response["repositories"].as_array(),
+                GitHubAuthMode::Pat => response.as_array(),
+            }
+            .ok_or_else(|| {
+                GitHubClientError::InvalidResponse(
+                    "repository listing did not contain an array".into(),
+                )
+            })?;
+            for repository in values {
+                repositories.push(parse_repository(repository)?);
+            }
+            if values.len() < 100 {
+                break;
+            }
+        }
+        repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+        repositories.dedup_by(|left, right| left.full_name == right.full_name);
+        Ok(repositories)
+    }
+}
+
+fn parse_repository(value: &Value) -> Result<GitHubRepository, GitHubClientError> {
+    let owner = value["owner"]["login"]
+        .as_str()
+        .filter(|owner| !owner.is_empty())
+        .ok_or_else(|| GitHubClientError::InvalidResponse("repository omitted owner".into()))?;
+    let name = value["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| GitHubClientError::InvalidResponse("repository omitted name".into()))?;
+    let full_name = value["full_name"]
+        .as_str()
+        .filter(|full_name| !full_name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{owner}/{name}"));
+    Ok(GitHubRepository {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        full_name,
+        private: value["private"].as_bool().unwrap_or(false),
+    })
 }
 
 pub async fn discover_installation_id(
@@ -680,7 +743,7 @@ fn workflow_label_color(label: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubAuthConfig, GitHubAuthMode, SignatureError, select_installation_id,
+        GitHubAuthConfig, GitHubAuthMode, SignatureError, parse_repository, select_installation_id,
         validate_installation_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
@@ -800,6 +863,19 @@ mod tests {
             "suspended_at": suspended_at,
             "permissions": permissions,
         })
+    }
+
+    #[test]
+    fn parses_repository_selection_metadata_without_credentials() {
+        let repository = parse_repository(&json!({
+            "owner": {"login": "example"},
+            "name": "private-repo",
+            "full_name": "example/private-repo",
+            "private": true
+        }))
+        .unwrap();
+        assert_eq!(repository.full_name, "example/private-repo");
+        assert!(repository.private);
     }
 
     #[test]

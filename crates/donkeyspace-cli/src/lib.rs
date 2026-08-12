@@ -1,4 +1,6 @@
-use donkeyspace_github::{GitHubAuthConfig, GitHubCredentialProvider, discover_installation_id};
+use donkeyspace_github::{
+    GitHubAuthConfig, GitHubCredentialProvider, GitHubRepository, discover_installation_id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -13,6 +15,7 @@ use thiserror::Error;
 const SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "instance.json";
 const GENERATED_ENV: &str = "compose.env";
+const PENDING_GITHUB_FILE: &str = "pending-github.json";
 
 #[derive(Debug, Error)]
 pub enum SetupError {
@@ -73,7 +76,7 @@ pub enum GitHubInstanceConfig {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum IngressMode {
     Polling,
@@ -97,6 +100,69 @@ pub struct ConnectGitHubOptions {
 pub enum CodexLoginMethod {
     ChatGpt,
     ApiKey,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckLevel {
+    Pass,
+    Warning,
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub level: CheckLevel,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorReport {
+    pub checks: Vec<DoctorCheck>,
+}
+
+impl DoctorReport {
+    pub fn passed(&self) -> bool {
+        !self
+            .checks
+            .iter()
+            .any(|check| check.level == CheckLevel::Fail)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceStatus {
+    pub name: String,
+    pub state: String,
+    pub health: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentStatus {
+    pub services: Vec<ServiceStatus>,
+}
+
+impl DeploymentStatus {
+    pub fn running(&self) -> bool {
+        !self.services.is_empty()
+            && self
+                .services
+                .iter()
+                .all(|service| service.state.eq_ignore_ascii_case("running"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingGitHubApp {
+    pub app_id: u64,
+    pub slug: String,
+    pub owner: String,
+    pub ingress: IngressMode,
+    pub callback_port: u16,
+    pub organization: Option<String>,
+    private_key_file: PathBuf,
+    webhook_secret_file: PathBuf,
 }
 
 pub struct Instance {
@@ -125,6 +191,18 @@ impl Instance {
 
     pub fn config_path(&self) -> PathBuf {
         self.directory.join(CONFIG_FILE)
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn config(&self) -> Option<&InstanceConfig> {
+        self.config.as_ref()
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.config.is_some()
     }
 
     pub fn init(
@@ -156,6 +234,182 @@ impl Instance {
             },
         };
         self.config = Some(config);
+        self.save()
+    }
+
+    pub fn pending_github_app(&self) -> Result<Option<PendingGitHubApp>, SetupError> {
+        let path = self.directory.join(PENDING_GITHUB_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    }
+
+    pub fn discard_pending_github_app(&self) -> Result<(), SetupError> {
+        let Some(pending) = self.pending_github_app()? else {
+            return Ok(());
+        };
+        remove_file_if_present(&pending.private_key_file)?;
+        remove_file_if_present(&pending.webhook_secret_file)?;
+        remove_file_if_present(&self.directory.join(PENDING_GITHUB_FILE))
+    }
+
+    pub fn begin_github_app(
+        &self,
+        owner: String,
+        ingress: IngressMode,
+        callback_port: u16,
+        organization: Option<String>,
+    ) -> Result<PendingGitHubApp, SetupError> {
+        self.require_config()?;
+        validate_owner(&owner)?;
+        validate_organization(organization.as_deref())?;
+        validate_ingress(&ingress)?;
+        let conversion =
+            run_manifest_registration(callback_port, organization.as_deref(), &ingress)?;
+        let private_key_file = self.secret_path("pending-github-app.pem");
+        let webhook_secret_file = self.secret_path("pending-github-webhook-secret");
+        write_secret(&private_key_file, &conversion.private_key)?;
+        write_secret(&webhook_secret_file, &conversion.webhook_secret)?;
+        let pending = PendingGitHubApp {
+            app_id: conversion.app_id,
+            slug: conversion.slug,
+            owner,
+            ingress,
+            callback_port,
+            organization,
+            private_key_file,
+            webhook_secret_file,
+        };
+        write_secret(
+            &self.directory.join(PENDING_GITHUB_FILE),
+            &serde_json::to_vec_pretty(&pending)?,
+        )?;
+        Ok(pending)
+    }
+
+    pub async fn pending_github_repositories(
+        &self,
+        pending: &PendingGitHubApp,
+    ) -> Result<(u64, Vec<GitHubRepository>), SetupError> {
+        let installation_id = discover_installation_id(
+            pending.app_id,
+            pending.private_key_file.clone(),
+            &pending.owner,
+        )
+        .await?;
+        let provider = GitHubCredentialProvider::new(GitHubAuthConfig::App {
+            app_id: pending.app_id,
+            installation_id,
+            private_key_file: pending.private_key_file.clone(),
+        })?;
+        provider.validate_installation().await?;
+        let repositories = provider
+            .repositories()
+            .await?
+            .into_iter()
+            .filter(|repository| repository.owner.eq_ignore_ascii_case(&pending.owner))
+            .collect();
+        Ok((installation_id, repositories))
+    }
+
+    pub async fn complete_pending_github_app(
+        &mut self,
+        pending: PendingGitHubApp,
+        installation_id: u64,
+        repositories: Vec<String>,
+    ) -> Result<(), SetupError> {
+        self.require_config()?;
+        validate_repositories(&repositories)?;
+        if repositories.iter().any(|repository| {
+            !repository
+                .split_once('/')
+                .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(&pending.owner))
+        }) {
+            return Err(SetupError::Config(format!(
+                "selected repositories must belong to `{}`",
+                pending.owner
+            )));
+        }
+        let provider = GitHubCredentialProvider::new(GitHubAuthConfig::App {
+            app_id: pending.app_id,
+            installation_id,
+            private_key_file: pending.private_key_file.clone(),
+        })?;
+        provider.validate_installation().await?;
+        for repository in &repositories {
+            let (owner, repo) = repository.split_once('/').expect("validated repository");
+            provider.client().repository(owner, repo).await?;
+        }
+        let private_key_file = self.secret_path(&format!("github-app-{}.pem", pending.app_id));
+        let webhook_secret_file =
+            self.secret_path(&format!("github-webhook-secret-{}", pending.app_id));
+        write_secret(&private_key_file, &fs::read(&pending.private_key_file)?)?;
+        write_secret(
+            &webhook_secret_file,
+            &fs::read(&pending.webhook_secret_file)?,
+        )?;
+        self.config.as_mut().unwrap().github = Some(GitHubInstanceConfig::App {
+            app_id: pending.app_id,
+            installation_id,
+            private_key_file,
+            webhook_secret_file,
+            repositories,
+            ingress: pending.ingress,
+        });
+        self.save()?;
+        self.discard_pending_github_app()?;
+        Ok(())
+    }
+
+    pub async fn app_repositories(
+        &self,
+        app_id: u64,
+        installation_id: u64,
+        private_key_file: PathBuf,
+    ) -> Result<Vec<GitHubRepository>, SetupError> {
+        let provider = GitHubCredentialProvider::new(GitHubAuthConfig::App {
+            app_id,
+            installation_id,
+            private_key_file,
+        })?;
+        provider.validate_installation().await?;
+        Ok(provider.repositories().await?)
+    }
+
+    pub async fn pat_repositories(&self, token: &str) -> Result<Vec<GitHubRepository>, SetupError> {
+        let provider = GitHubCredentialProvider::new(GitHubAuthConfig::Pat {
+            token: token.trim().to_string(),
+        })?;
+        Ok(provider.repositories().await?)
+    }
+
+    pub async fn connect_github_pat(
+        &mut self,
+        token: &str,
+        repositories: Vec<String>,
+        ingress: IngressMode,
+    ) -> Result<(), SetupError> {
+        self.require_config()?;
+        validate_repositories(&repositories)?;
+        validate_ingress(&ingress)?;
+        if token.trim().is_empty() {
+            return Err(SetupError::Config("PAT cannot be empty".into()));
+        }
+        let provider = GitHubCredentialProvider::new(GitHubAuthConfig::Pat {
+            token: token.trim().to_string(),
+        })?;
+        for repository in &repositories {
+            let (owner, repo) = repository.split_once('/').expect("validated repository");
+            provider.client().repository(owner, repo).await?;
+        }
+        let token_file = self.secret_path("github-pat");
+        write_secret(&token_file, token.trim().as_bytes())?;
+        self.config.as_mut().unwrap().github = Some(GitHubInstanceConfig::Pat {
+            token_file,
+            repositories,
+            ingress,
+        });
         self.save()
     }
 
@@ -300,86 +554,172 @@ impl Instance {
             CodexLoginMethod::ChatGpt => run_status(Command::new("codex").arg("login"))?,
             CodexLoginMethod::ApiKey => {
                 let key = read_secret("OpenAI project API key: ")?;
-                if key.trim().is_empty() {
-                    return Err(SetupError::Config("API key cannot be empty".into()));
-                }
-                let mut child = Command::new("codex")
-                    .args(["login", "--with-api-key"])
-                    .stdin(Stdio::piped())
-                    .spawn()?;
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(key.trim().as_bytes())?;
-                let status = child.wait()?;
-                if !status.success() {
-                    return Err(SetupError::Command {
-                        command: "codex login --with-api-key".into(),
-                        detail: status.to_string(),
-                    });
-                }
+                self.run_codex_api_key_login(&key)?;
             }
         }
+        self.finish_codex_connection()
+    }
+
+    pub fn connect_codex_api_key(&mut self, key: &str) -> Result<(), SetupError> {
+        self.require_config()?;
+        self.run_codex_api_key_login(key)?;
+        self.finish_codex_connection()
+    }
+
+    pub fn codex_login_status(&self) -> Result<(), SetupError> {
+        check_command("codex", &["login", "status"])
+    }
+
+    fn run_codex_api_key_login(&self, key: &str) -> Result<(), SetupError> {
+        if key.trim().is_empty() {
+            return Err(SetupError::Config("API key cannot be empty".into()));
+        }
+        let mut child = Command::new("codex")
+            .args(["login", "--with-api-key"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(key.trim().as_bytes())?;
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(SetupError::Command {
+                command: "codex login --with-api-key".into(),
+                detail: status.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn finish_codex_connection(&mut self) -> Result<(), SetupError> {
         run_status(Command::new("codex").args(["login", "status"]))?;
         self.config.as_mut().unwrap().codex_home = Some(default_codex_home());
         self.save()
     }
 
-    pub async fn doctor(&self) -> Result<(), SetupError> {
+    pub async fn doctor_report(&self) -> Result<DoctorReport, SetupError> {
         let config = self.require_config()?;
-        check_command("docker", &["--version"])?;
-        check_command("docker", &["compose", "version"])?;
-        check_command("docker", &["info"])?;
+        let mut checks = vec![
+            command_doctor_check("Docker CLI", "docker", &["--version"]),
+            command_doctor_check("Docker Compose", "docker", &["compose", "version"]),
+            command_doctor_check("Docker daemon", "docker", &["info"]),
+        ];
         for file in ["Dockerfile", "docker-compose.yml", "web/package.json"] {
-            if !config.source_tree.join(file).exists() {
-                return Err(SetupError::Config(format!(
-                    "source tree is missing required `{file}`"
-                )));
-            }
+            checks.push(if config.source_tree.join(file).exists() {
+                DoctorCheck {
+                    name: format!("Source: {file}"),
+                    level: CheckLevel::Pass,
+                    detail: "found".into(),
+                }
+            } else {
+                DoctorCheck {
+                    name: format!("Source: {file}"),
+                    level: CheckLevel::Fail,
+                    detail: format!("missing from {}", config.source_tree.display()),
+                }
+            });
         }
-        if std::net::TcpListener::bind(("127.0.0.1", config.api_port)).is_err() {
-            eprintln!("warning: port {} is already in use", config.api_port);
-        }
-        if std::net::TcpListener::bind(("127.0.0.1", 5173)).is_err() {
-            eprintln!("warning: dashboard port 5173 is already in use");
+        let deployment = self.deployment_status().unwrap_or(DeploymentStatus {
+            services: Vec::new(),
+        });
+        for (name, port) in [("API port", config.api_port), ("Dashboard port", 5173)] {
+            let available = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+            checks.push(DoctorCheck {
+                name: name.into(),
+                level: if available || deployment.running() {
+                    CheckLevel::Pass
+                } else {
+                    CheckLevel::Warning
+                },
+                detail: if available {
+                    format!("127.0.0.1:{port} is available")
+                } else if deployment.running() {
+                    format!("127.0.0.1:{port} is used by the running stack")
+                } else {
+                    format!("127.0.0.1:{port} is already in use")
+                },
+            });
         }
         if let Some(github) = &config.github {
-            match github {
-                GitHubInstanceConfig::App {
-                    app_id,
-                    installation_id,
-                    private_key_file,
-                    repositories,
-                    ..
-                } => {
-                    check_secret_permissions(private_key_file)?;
-                    let provider = GitHubCredentialProvider::new(GitHubAuthConfig::App {
-                        app_id: *app_id,
-                        installation_id: *installation_id,
-                        private_key_file: private_key_file.clone(),
-                    })?;
-                    provider.validate_installation().await?;
-                    for repository in repositories {
-                        let (owner, repo) = repository
-                            .split_once('/')
-                            .expect("saved repository is valid");
-                        provider.client().repository(owner, repo).await?;
+            let result: Result<(), SetupError> = async {
+                match github {
+                    GitHubInstanceConfig::App {
+                        app_id,
+                        installation_id,
+                        private_key_file,
+                        repositories,
+                        ..
+                    } => {
+                        check_secret_permissions(private_key_file)?;
+                        let provider = GitHubCredentialProvider::new(GitHubAuthConfig::App {
+                            app_id: *app_id,
+                            installation_id: *installation_id,
+                            private_key_file: private_key_file.clone(),
+                        })?;
+                        provider.validate_installation().await?;
+                        for repository in repositories {
+                            let (owner, repo) = repository
+                                .split_once('/')
+                                .expect("saved repository is valid");
+                            provider.client().repository(owner, repo).await?;
+                        }
+                    }
+                    GitHubInstanceConfig::Pat { token_file, .. } => {
+                        check_secret_permissions(token_file)?
                     }
                 }
-                GitHubInstanceConfig::Pat { token_file, .. } => {
-                    check_secret_permissions(token_file)?
-                }
+                Ok(())
             }
+            .await;
+            checks.push(doctor_result("GitHub connection", result));
         } else {
-            eprintln!("warning: GitHub is not connected");
+            checks.push(DoctorCheck {
+                name: "GitHub connection".into(),
+                level: CheckLevel::Warning,
+                detail: "not connected".into(),
+            });
         }
-        check_command("codex", &["login", "status"])?;
-        run_status(
-            Command::new("docker")
-                .current_dir(&config.source_tree)
-                .args(["compose", "ps"]),
-        )?;
+        checks.push(command_doctor_check(
+            "Codex authentication",
+            "codex",
+            &["login", "status"],
+        ));
+        checks.push(match self.deployment_status() {
+            Ok(status) => DoctorCheck {
+                name: "Compose stack".into(),
+                level: CheckLevel::Pass,
+                detail: if status.services.is_empty() {
+                    "not started".into()
+                } else {
+                    format!("{} service(s) discovered", status.services.len())
+                },
+            },
+            Err(error) => DoctorCheck {
+                name: "Compose stack".into(),
+                level: CheckLevel::Fail,
+                detail: error.to_string(),
+            },
+        });
+        Ok(DoctorReport { checks })
+    }
+
+    pub async fn doctor(&self) -> Result<(), SetupError> {
+        let report = self.doctor_report().await?;
+        for check in &report.checks {
+            let label = match check.level {
+                CheckLevel::Pass => "pass",
+                CheckLevel::Warning => "warning",
+                CheckLevel::Fail => "fail",
+            };
+            println!("{label}: {}: {}", check.name, check.detail);
+        }
+        if !report.passed() {
+            return Err(SetupError::Config(
+                "doctor found one or more required failures".into(),
+            ));
+        }
         println!("doctor: all required checks passed");
         Ok(())
     }
@@ -394,6 +734,26 @@ impl Instance {
 
     pub fn status(&self) -> Result<(), SetupError> {
         self.compose(&["ps"], false)
+    }
+
+    pub fn deployment_status(&self) -> Result<DeploymentStatus, SetupError> {
+        let mut command = self.compose_command(&["ps", "--format", "json"])?;
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(SetupError::Command {
+                command: "docker compose ps --format json".into(),
+                detail: String::from_utf8_lossy(&output.stderr).trim().into(),
+            });
+        }
+        parse_compose_status(&output.stdout)
+    }
+
+    pub fn start(&self) -> Result<(), SetupError> {
+        self.compose_captured(&["up", "-d", "--build"])
+    }
+
+    pub fn stop(&self) -> Result<(), SetupError> {
+        self.compose_captured(&["down"])
     }
 
     pub fn reset(&self, delete_data: bool, confirm: bool) -> Result<(), SetupError> {
@@ -428,6 +788,29 @@ impl Instance {
                 "warning: GitHub ingress uses delayed repository polling; events are not real-time"
             );
         }
+        let mut command = self.compose_command(arguments)?;
+        if destructive {
+            eprintln!("deleting Donkeyspace Compose volumes");
+        }
+        run_status(&mut command)
+    }
+
+    fn compose_captured(&self, arguments: &[&str]) -> Result<(), SetupError> {
+        let mut command = self.compose_command(arguments)?;
+        let description = describe_command(&command);
+        let output = command.output()?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(SetupError::Command {
+                command: description,
+                detail,
+            });
+        }
+        Ok(())
+    }
+
+    fn compose_command(&self, arguments: &[&str]) -> Result<Command, SetupError> {
+        let config = self.require_config()?;
         self.write_compose_env(config)?;
         let mut command = Command::new("docker");
         command
@@ -441,10 +824,7 @@ impl Instance {
                 fs::read_to_string(token_file)?.trim(),
             );
         }
-        if destructive {
-            eprintln!("deleting Donkeyspace Compose volumes");
-        }
-        run_status(&mut command)
+        Ok(command)
     }
 
     fn write_compose_env(&self, config: &InstanceConfig) -> Result<(), SetupError> {
@@ -546,6 +926,41 @@ fn default_codex_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
+fn validate_owner(owner: &str) -> Result<(), SetupError> {
+    if owner.is_empty()
+        || !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(SetupError::Config(
+            "GitHub owner must contain only letters, numbers, and hyphens".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_organization(organization: Option<&str>) -> Result<(), SetupError> {
+    if let Some(organization) = organization {
+        validate_owner(organization).map_err(|_| {
+            SetupError::Config(
+                "organization must contain only letters, numbers, and hyphens".into(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_ingress(ingress: &IngressMode) -> Result<(), SetupError> {
+    if let IngressMode::Webhook { public_url } = ingress
+        && (!public_url.starts_with("https://") || public_url.trim() != public_url)
+    {
+        return Err(SetupError::Config(
+            "public webhook URL must be a trimmed HTTPS URL".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_repositories(repositories: &[String]) -> Result<(), SetupError> {
     if repositories.is_empty() {
         return Err(SetupError::Config(
@@ -577,11 +992,33 @@ fn validate_repositories(repositories: &[String]) -> Result<(), SetupError> {
     Ok(())
 }
 
+fn remove_file_if_present(path: &Path) -> Result<(), SetupError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn run_manifest_flow(
     port: u16,
     organization: Option<&str>,
     ingress: &IngressMode,
 ) -> Result<(u64, Vec<u8>, Vec<u8>), SetupError> {
+    let conversion = run_manifest_registration(port, organization, ingress)?;
+    read_line("Press Enter after the App installation is complete: ")?;
+    Ok((
+        conversion.app_id,
+        conversion.private_key,
+        conversion.webhook_secret,
+    ))
+}
+
+fn run_manifest_registration(
+    port: u16,
+    organization: Option<&str>,
+    ingress: &IngressMode,
+) -> Result<ManifestConversion, SetupError> {
     let state = random_hex(32)?;
     let callback_url = format!("http://127.0.0.1:{port}/callback");
     let manifest = github_app_manifest(&state, &callback_url, ingress);
@@ -646,12 +1083,7 @@ fn run_manifest_flow(
     );
     println!("Install the App and select repositories: {install_url}");
     let _ = launch_url(&install_url);
-    read_line("Press Enter after the App installation is complete: ")?;
-    Ok((
-        conversion.app_id,
-        conversion.private_key,
-        conversion.webhook_secret,
-    ))
+    Ok(conversion)
 }
 
 fn github_app_manifest(state: &str, callback_url: &str, ingress: &IngressMode) -> Value {
@@ -847,6 +1279,61 @@ fn describe_command(command: &Command) -> String {
         .join(" ")
 }
 
+fn command_doctor_check(name: &str, program: &str, args: &[&str]) -> DoctorCheck {
+    doctor_result(name, check_command(program, args))
+}
+
+fn doctor_result(name: &str, result: Result<(), SetupError>) -> DoctorCheck {
+    match result {
+        Ok(()) => DoctorCheck {
+            name: name.into(),
+            level: CheckLevel::Pass,
+            detail: "available".into(),
+        },
+        Err(error) => DoctorCheck {
+            name: name.into(),
+            level: CheckLevel::Fail,
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn parse_compose_status(bytes: &[u8]) -> Result<DeploymentStatus, SetupError> {
+    let text = String::from_utf8_lossy(bytes);
+    if text.trim().is_empty() {
+        return Ok(DeploymentStatus {
+            services: Vec::new(),
+        });
+    }
+    let values = match serde_json::from_str::<Value>(&text)? {
+        Value::Array(values) => values,
+        value @ Value::Object(_) => vec![value],
+        _ => {
+            return Err(SetupError::Config(
+                "docker compose status was not JSON objects".into(),
+            ));
+        }
+    };
+    let mut services = values
+        .iter()
+        .filter_map(|value| {
+            let name = value["Service"].as_str()?.to_string();
+            let state = value["State"].as_str().unwrap_or("unknown").to_string();
+            let health = value["Health"]
+                .as_str()
+                .filter(|health| !health.is_empty())
+                .map(str::to_string);
+            Some(ServiceStatus {
+                name,
+                state,
+                health,
+            })
+        })
+        .collect::<Vec<_>>();
+    services.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(DeploymentStatus { services })
+}
+
 fn check_command(program: &str, args: &[&str]) -> Result<(), SetupError> {
     let output = Command::new(program).args(args).output()?;
     if !output.status.success() {
@@ -1033,6 +1520,56 @@ mod tests {
         let description = describe_command(&command);
         assert_eq!(description, "docker compose ps");
         assert!(!description.contains("ghp_do_not_log"));
+    }
+
+    #[test]
+    fn parses_structured_compose_status() {
+        let status = parse_compose_status(
+            br#"[{"Service":"worker","State":"running","Health":""},{"Service":"postgres","State":"running","Health":"healthy"}]"#,
+        )
+        .unwrap();
+        assert!(status.running());
+        assert_eq!(status.services[0].name, "postgres");
+        assert_eq!(status.services[0].health.as_deref(), Some("healthy"));
+        assert_eq!(status.services[1].name, "worker");
+        assert_eq!(status.services[1].health, None);
+    }
+
+    #[test]
+    fn doctor_report_only_fails_on_required_checks() {
+        let report = DoctorReport {
+            checks: vec![
+                DoctorCheck {
+                    name: "polling".into(),
+                    level: CheckLevel::Warning,
+                    detail: "delayed".into(),
+                },
+                DoctorCheck {
+                    name: "docker".into(),
+                    level: CheckLevel::Pass,
+                    detail: "available".into(),
+                },
+            ],
+        };
+        assert!(report.passed());
+    }
+
+    #[test]
+    fn validates_webhook_ingress_and_owner() {
+        assert!(validate_owner("valid-owner").is_ok());
+        assert!(validate_owner("invalid/owner").is_err());
+        assert!(
+            validate_ingress(&IngressMode::Webhook {
+                public_url: "https://example.test".into()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_ingress(&IngressMode::Webhook {
+                public_url: "http://example.test".into()
+            })
+            .is_err()
+        );
     }
 
     #[test]
