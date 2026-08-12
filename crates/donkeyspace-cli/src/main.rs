@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use donkeyspace_cli::{
-    CodexLoginMethod, ConnectGitHubOptions, Instance, RuntimeSource, SetupError,
+    CodexLoginMethod, ConnectGitHubOptions, Instance, PluginConnectOptions, PluginEnvironmentInput,
+    RuntimeSource, SetupError,
 };
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -24,6 +26,7 @@ enum Command {
     Up,
     Down,
     Status,
+    Plugin(PluginArgs),
     Reset(ResetArgs),
 }
 
@@ -51,6 +54,37 @@ struct ConnectArgs {
 enum ConnectTarget {
     Github(GitHubArgs),
     Codex(CodexArgs),
+    Plugin(ConnectPluginArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConnectPluginArgs {
+    #[arg(long)]
+    path: PathBuf,
+    #[arg(long)]
+    flow: Option<String>,
+    #[arg(long = "environment-file", value_name = "NAME=PATH")]
+    environment_files: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct PluginArgs {
+    #[command(subcommand)]
+    command: PluginCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    List,
+    Activate {
+        id: String,
+        #[arg(long)]
+        flow: String,
+    },
+    Rebuild {
+        id: String,
+    },
+    Disable,
 }
 
 #[derive(Debug, Args)]
@@ -140,11 +174,68 @@ async fn run() -> Result<(), SetupError> {
                 };
                 instance.connect_codex(method)?;
             }
+            ConnectTarget::Plugin(args) => {
+                let mut environment = BTreeMap::new();
+                for item in args.environment_files {
+                    let (name, path) = item.split_once('=').ok_or_else(|| {
+                        SetupError::Config("--environment-file must use NAME=PATH".into())
+                    })?;
+                    if name.is_empty() || path.is_empty() {
+                        return Err(SetupError::Config(
+                            "--environment-file must use NAME=PATH".into(),
+                        ));
+                    }
+                    environment.insert(
+                        name.to_string(),
+                        PluginEnvironmentInput::File(PathBuf::from(path)),
+                    );
+                }
+                instance.connect_plugin(PluginConnectOptions {
+                    path: args.path,
+                    flow: args.flow,
+                    environment,
+                })?;
+                println!("plugin connected");
+            }
         },
         Command::Doctor => instance.doctor().await?,
         Command::Up => instance.up()?,
         Command::Down => instance.down()?,
         Command::Status => instance.status()?,
+        Command::Plugin(args) => match args.command {
+            PluginCommand::List => {
+                let config = instance.config().ok_or_else(|| {
+                    SetupError::Config("instance is not initialized; run `donkeyspace init`".into())
+                })?;
+                if config.plugins.is_empty() {
+                    println!("no plugins installed");
+                }
+                for plugin in config.plugins.values() {
+                    let active = config
+                        .active_plugin
+                        .as_ref()
+                        .filter(|active| active.id == plugin.id)
+                        .map(|active| format!(" active:{}", active.flow))
+                        .unwrap_or_default();
+                    println!("{}{} ({})", plugin.id, active, plugin.source_path.display());
+                    for (flow, class) in &plugin.flows {
+                        println!("  {flow}: {class:?}");
+                    }
+                }
+            }
+            PluginCommand::Activate { id, flow } => {
+                instance.activate_plugin(&id, &flow)?;
+                println!("activated {id}:{flow}");
+            }
+            PluginCommand::Rebuild { id } => {
+                instance.rebuild_plugin(&id)?;
+                println!("rebuilt {id}");
+            }
+            PluginCommand::Disable => {
+                instance.disable_plugin()?;
+                println!("plugin flow disabled; installed plugins were preserved");
+            }
+        },
         Command::Reset(args) => instance.reset(args.delete_data, args.confirm)?,
     }
     Ok(())

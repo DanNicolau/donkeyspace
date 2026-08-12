@@ -4,6 +4,7 @@ use donkeyspace_github::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -12,9 +13,11 @@ use std::{
 };
 use thiserror::Error;
 
+mod plugins;
 pub mod tui;
+pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const CONFIG_FILE: &str = "instance.json";
 const GENERATED_ENV: &str = "compose.env";
 const PENDING_GITHUB_FILE: &str = "pending-github.json";
@@ -27,6 +30,8 @@ pub enum SetupError {
     Config(String),
     #[error("invalid configuration JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid configuration YAML: {0}")]
+    Yaml(#[from] serde_yaml::Error),
     #[error("github error: {0}")]
     GitHub(#[from] donkeyspace_github::GitHubClientError),
     #[error("command `{command}` failed: {detail}")]
@@ -58,6 +63,37 @@ pub struct InstanceConfig {
     pub codex_home: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GitHubInstanceConfig>,
+    #[serde(default)]
+    pub plugins: BTreeMap<String, InstalledPlugin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_plugin: Option<ActivePlugin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledPlugin {
+    pub id: String,
+    pub source_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub image: String,
+    pub build_context: PathBuf,
+    pub dockerfile: PathBuf,
+    pub flows: BTreeMap<String, PluginFlowClass>,
+    #[serde(default)]
+    pub environment_files: BTreeMap<String, PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivePlugin {
+    pub id: String,
+    pub flow: String,
+    pub class: PluginFlowClass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginFlowClass {
+    LifecycleReplacement,
+    Developer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,9 +212,11 @@ impl Instance {
     pub fn open(directory: Option<PathBuf>) -> Result<Self, SetupError> {
         let directory = directory.unwrap_or_else(default_config_directory);
         let path = directory.join(CONFIG_FILE);
-        let config = if path.exists() {
-            let config: InstanceConfig = serde_json::from_slice(&fs::read(&path)?)?;
-            if config.schema_version != SCHEMA_VERSION {
+        let mut config = if path.exists() {
+            let mut config: InstanceConfig = serde_json::from_slice(&fs::read(&path)?)?;
+            if config.schema_version == 1 {
+                config.schema_version = SCHEMA_VERSION;
+            } else if config.schema_version != SCHEMA_VERSION {
                 return Err(SetupError::Config(format!(
                     "unsupported schema_version {}; expected {SCHEMA_VERSION}",
                     config.schema_version
@@ -188,7 +226,16 @@ impl Instance {
         } else {
             None
         };
-        Ok(Self { directory, config })
+        let instance = Self {
+            directory,
+            config: config.take(),
+        };
+        if path.exists()
+            && serde_json::from_slice::<Value>(&fs::read(&path)?)?["schema_version"] == 1
+        {
+            instance.save()?;
+        }
+        Ok(instance)
     }
 
     pub fn config_path(&self) -> PathBuf {
@@ -233,6 +280,8 @@ impl Instance {
                 api_port: 8080,
                 codex_home: None,
                 github: None,
+                plugins: BTreeMap::new(),
+                active_plugin: None,
             },
         };
         self.config = Some(config);
@@ -623,6 +672,41 @@ impl Instance {
                 }
             });
         }
+        if let Some(active) = &config.active_plugin {
+            let plugin = config.plugins.get(&active.id);
+            checks.push(match plugin {
+                Some(plugin) if plugin.manifest_path.is_file() => DoctorCheck {
+                    name: "Active plugin".into(),
+                    level: CheckLevel::Warning,
+                    detail: format!(
+                        "{}:{} is active ({:?}); the worker receives the Docker socket",
+                        active.id, active.flow, active.class
+                    ),
+                },
+                Some(plugin) => DoctorCheck {
+                    name: "Active plugin".into(),
+                    level: CheckLevel::Fail,
+                    detail: format!("manifest is missing: {}", plugin.manifest_path.display()),
+                },
+                None => DoctorCheck {
+                    name: "Active plugin".into(),
+                    level: CheckLevel::Fail,
+                    detail: format!("{} is not in the installed plugin registry", active.id),
+                },
+            });
+            if let Some(plugin) = plugin {
+                for (name, path) in &plugin.environment_files {
+                    checks.push(doctor_result(
+                        &format!("Plugin environment: {name}"),
+                        check_secret_permissions(path),
+                    ));
+                }
+                checks.push(doctor_result(
+                    "Plugin image",
+                    check_command("docker", &["image", "inspect", &plugin.image]),
+                ));
+            }
+        }
         let deployment = self.deployment_status().unwrap_or(DeploymentStatus {
             services: Vec::new(),
         });
@@ -814,12 +898,18 @@ impl Instance {
     fn compose_command(&self, arguments: &[&str]) -> Result<Command, SetupError> {
         let config = self.require_config()?;
         self.write_compose_env(config)?;
+        self.write_plugin_runtime_files()?;
         let mut command = Command::new("docker");
         command
             .current_dir(&config.source_tree)
             .args(["compose", "--env-file"])
             .arg(self.directory.join(GENERATED_ENV))
-            .args(arguments);
+            .arg("-f")
+            .arg(config.source_tree.join("docker-compose.yml"));
+        if config.active_plugin.is_some() {
+            command.arg("-f").arg(self.plugin_overlay_path());
+        }
+        command.args(arguments);
         if let Some(GitHubInstanceConfig::Pat { token_file, .. }) = &config.github {
             command.env(
                 "DONKEYSPACE_GITHUB_TOKEN",
@@ -897,7 +987,10 @@ impl Instance {
         fs::create_dir_all(&self.directory)?;
         set_directory_mode(&self.directory)?;
         let bytes = serde_json::to_vec_pretty(self.require_config()?)?;
-        write_secret(&self.config_path(), &bytes)
+        let temporary = self.directory.join(".instance.json.tmp");
+        write_secret(&temporary, &bytes)?;
+        fs::rename(temporary, self.config_path())?;
+        Ok(())
     }
 
     fn secret_path(&self, name: &str) -> PathBuf {
@@ -1507,10 +1600,42 @@ mod tests {
                 repositories: vec!["owner/repo".into()],
                 ingress: IngressMode::Polling,
             }),
+            plugins: BTreeMap::new(),
+            active_plugin: None,
         };
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(!serialized.contains("ghp_"));
         assert!(serialized.contains("github-pat"));
+    }
+
+    #[test]
+    fn migrates_schema_one_configuration_atomically() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("donkeyspace-schema-test-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CONFIG_FILE),
+            br#"{
+              "schema_version": 1,
+              "source_tree": "/src",
+              "runtime_source": "local-build",
+              "api_port": 8080
+            }"#,
+        )
+        .unwrap();
+        let instance = Instance::open(Some(directory.clone())).unwrap();
+        let config = instance.config().unwrap();
+        assert_eq!(config.schema_version, 2);
+        assert!(config.plugins.is_empty());
+        assert!(config.active_plugin.is_none());
+        let saved: Value =
+            serde_json::from_slice(&fs::read(directory.join(CONFIG_FILE)).unwrap()).unwrap();
+        assert_eq!(saved["schema_version"], 2);
+        assert!(!directory.join(".instance.json.tmp").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

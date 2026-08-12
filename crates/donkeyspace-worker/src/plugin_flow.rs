@@ -1708,9 +1708,21 @@ async fn run_container(
     }
     for name in allowed {
         if let Some(source) = configured.get(name) {
-            let value = env::var(source)
-                .map_err(|_| format!("required plugin environment source `{source}` is unset"))?;
-            docker.arg("--env").arg(format!("{name}={value}"));
+            let value = if Path::new(source).is_absolute() {
+                std::fs::read_to_string(source)
+                    .map(|value| value.trim_end().to_string())
+                    .map_err(|_| {
+                        format!("required plugin environment file `{source}` is unreadable")
+                    })?
+            } else {
+                env::var(source).map_err(|_| {
+                    format!("required plugin environment source `{source}` is unset")
+                })?
+            };
+            // Pass only the variable name on Docker's command line. The value
+            // is inherited from this worker process and is never exposed in
+            // process listings or command diagnostics.
+            docker.arg("--env").arg(name).env(name, value);
         }
     }
     docker
