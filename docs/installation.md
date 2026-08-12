@@ -1,7 +1,7 @@
 # Installation and authentication
 
 The `donkeyspace` CLI and TUI share one reusable setup control plane.
-Instance configuration uses `schema_version = 1` and lives under
+Instance configuration uses `schema_version = 2` and lives under
 `$XDG_CONFIG_HOME/donkeyspace` or `~/.config/donkeyspace` by default. Pass
 `--config-dir` to select a different instance.
 
@@ -25,6 +25,19 @@ Codex, runs `doctor`, and offers to start the stack when required checks pass.
 The home screen refreshes Compose service state every two seconds and provides
 Doctor, Start, Stop, and authentication reconfiguration actions. Stop preserves
 all volumes. Live logs and destructive reset remain explicit CLI operations.
+
+For a headless remote host, establish the manifest callback tunnel from your
+workstation before starting GitHub App registration:
+
+```sh
+ssh -N -L 8787:127.0.0.1:8787 USER@HOST
+```
+
+Keep the tunnel open and visit `http://127.0.0.1:8787/` in your workstation's
+browser when the TUI displays the registration prompt. Both the registration
+URL and the later GitHub App installation URL remain visible for copying.
+Donkeyspace skips automatic browser launch when the host has no graphical
+display.
 
 The equivalent non-interactive commands are:
 

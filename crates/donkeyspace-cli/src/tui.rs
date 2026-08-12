@@ -644,7 +644,10 @@ fn handle_manifest_form(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSen
                 app.error = Some("Enter a public HTTPS URL for webhook ingress.".into());
                 return;
             }
-            app.busy = Some("Waiting for GitHub App registration in the browser…".into());
+            app.busy = Some(
+                "Waiting for GitHub App registration…\n\nHeadless: on your workstation run\nssh -N -L 8787:127.0.0.1:8787 USER@HOST\nthen open http://127.0.0.1:8787/ in its browser."
+                    .into(),
+            );
             let config_dir = app.config_dir.clone();
             tokio::task::spawn_blocking(move || {
                 let result = Instance::open(config_dir).and_then(|instance| {
@@ -1144,7 +1147,7 @@ fn render(frame: &mut Frame, app: &App, instance: &Instance) {
         vertical[2],
     );
     if app.busy.is_some() {
-        let popup = centered_rect(54, 5, area);
+        let popup = centered_rect(76, 10.min(area.height.saturating_sub(2)), area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(app.busy.as_deref().unwrap())
@@ -1424,7 +1427,7 @@ fn render_manifest(frame: &mut Frame, area: Rect, app: &App) {
         &fields,
         app.field,
         false,
-        "Enter opens GitHub  Tab next  Esc back\nPolling is delayed and not real-time.",
+        "Enter starts registration  Tab next  Esc back\nHeadless: first run `ssh -N -L 8787:127.0.0.1:8787 USER@HOST` on your workstation, then open http://127.0.0.1:8787/ there.\nPolling is delayed and not real-time.",
     );
 }
 

@@ -1119,7 +1119,10 @@ fn run_manifest_registration(
     let manifest = github_app_manifest(&state, &callback_url, ingress);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let local_url = format!("http://127.0.0.1:{port}/");
-    println!("Open {local_url} to create the private GitHub App.");
+    println!("GitHub App registration URL: {local_url}");
+    println!(
+        "Headless host: from your workstation run `ssh -N -L {port}:127.0.0.1:{port} USER@HOST`, then open the registration URL in your workstation browser."
+    );
     let _ = launch_url(&local_url);
     let code = loop {
         let (mut stream, _) = listener.accept()?;
@@ -1317,6 +1320,13 @@ fn html_escape(value: &str) -> String {
 }
 
 fn launch_url(url: &str) -> Result<(), SetupError> {
+    if !graphical_browser_available(
+        cfg!(target_os = "macos"),
+        env::var_os("DISPLAY").is_some(),
+        env::var_os("WAYLAND_DISPLAY").is_some(),
+    ) {
+        return Ok(());
+    }
     let command = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -1328,6 +1338,10 @@ fn launch_url(url: &str) -> Result<(), SetupError> {
         .stderr(Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+fn graphical_browser_available(is_macos: bool, display: bool, wayland_display: bool) -> bool {
+    is_macos || display || wayland_display
 }
 
 fn random_hex(bytes: usize) -> Result<String, SetupError> {
@@ -1561,6 +1575,14 @@ mod tests {
             manifest["hook_attributes"]["url"],
             "https://donkeyspace.example/webhooks/github"
         );
+    }
+
+    #[test]
+    fn browser_launch_is_skipped_on_headless_linux() {
+        assert!(!graphical_browser_available(false, false, false));
+        assert!(graphical_browser_available(false, true, false));
+        assert!(graphical_browser_available(false, false, true));
+        assert!(graphical_browser_available(true, false, false));
     }
 
     #[test]
