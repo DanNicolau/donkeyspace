@@ -1,6 +1,6 @@
 use crate::{
     CheckLevel, DeploymentStatus, DoctorReport, GitHubInstanceConfig, IngressMode, Instance,
-    PendingGitHubApp, RuntimeSource, SetupError,
+    PendingGitHubApp, PluginConnectOptions, PluginEnvironmentInput, RuntimeSource, SetupError,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
+    collections::BTreeMap,
     io::{self, IsTerminal, Stdout},
     path::PathBuf,
     time::{Duration, Instant},
@@ -29,6 +30,7 @@ const HOME_ACTIONS: &[&str] = &[
     "Stop Donkeyspace",
     "Configure GitHub",
     "Configure Codex",
+    "Manage plugins",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,8 @@ enum Screen {
     CodexMethod,
     CodexApiKey,
     Doctor,
+    Plugins,
+    PluginConnect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +70,7 @@ enum TaskResult {
     },
     SaveGitHub(Result<(), SetupError>),
     Codex(Result<(), SetupError>),
+    Plugin(Result<String, SetupError>),
 }
 
 struct App {
@@ -148,6 +153,12 @@ impl App {
 
     fn begin_codex(&mut self) {
         self.screen = Screen::CodexMethod;
+        self.selected = 0;
+        self.reset_messages();
+    }
+
+    fn begin_plugins(&mut self) {
+        self.screen = Screen::Plugins;
         self.selected = 0;
         self.reset_messages();
     }
@@ -306,7 +317,8 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
         | TaskResult::Stop(Err(error))
         | TaskResult::Manifest(Err(error))
         | TaskResult::SaveGitHub(Err(error))
-        | TaskResult::Codex(Err(error)) => app.error = Some(error.to_string()),
+        | TaskResult::Codex(Err(error))
+        | TaskResult::Plugin(Err(error)) => app.error = Some(error.to_string()),
         TaskResult::Start(Ok(())) => app.notice = Some("Donkeyspace started.".into()),
         TaskResult::Stop(Ok(())) => {
             app.status.services.clear();
@@ -354,6 +366,11 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
             app.screen = Screen::Doctor;
             app.doctor = None;
         }
+        TaskResult::Plugin(Ok(message)) => {
+            app.notice = Some(message);
+            app.screen = Screen::Plugins;
+            app.selected = 0;
+        }
     }
 }
 
@@ -383,6 +400,8 @@ async fn handle_key(
         Screen::CodexMethod => handle_codex_method(app, terminal, key, sender)?,
         Screen::CodexApiKey => handle_api_key(app, key, sender),
         Screen::Doctor => handle_doctor(app, key, sender),
+        Screen::Plugins => handle_plugins(app, key, sender)?,
+        Screen::PluginConnect => handle_plugin_connect(app, key, sender),
     }
     Ok(())
 }
@@ -433,10 +452,140 @@ fn handle_home(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskR
             }
             3 => app.begin_github(),
             4 => app.begin_codex(),
+            5 => app.begin_plugins(),
             _ => {}
         },
         _ => {}
     }
+}
+
+fn handle_plugins(
+    app: &mut App,
+    key: KeyEvent,
+    sender: mpsc::UnboundedSender<TaskResult>,
+) -> Result<(), SetupError> {
+    let instance = Instance::open(app.config_dir.clone())?;
+    let flows = plugin_flows(&instance);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('b') => app.show_home(),
+        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Down if !flows.is_empty() => {
+            app.selected = (app.selected + 1).min(flows.len() - 1)
+        }
+        KeyCode::Char('c') => {
+            app.screen = Screen::PluginConnect;
+            app.fields = vec![String::new(), String::new(), String::new()];
+            app.field = 0;
+        }
+        KeyCode::Char('d') => {
+            app.busy = Some("Disabling active plugin flow…".into());
+            spawn_plugin_operation(app.config_dir.clone(), sender, |mut instance| {
+                instance.disable_plugin()?;
+                Ok("Plugin flow disabled; installations were preserved.".into())
+            });
+        }
+        KeyCode::Char('r') if !flows.is_empty() => {
+            let id = flows[app.selected].0.clone();
+            app.busy = Some(format!("Rebuilding {id}…"));
+            spawn_plugin_operation(app.config_dir.clone(), sender, move |instance| {
+                instance.rebuild_plugin(&id)?;
+                Ok(format!("Rebuilt {id}."))
+            });
+        }
+        KeyCode::Enter if !flows.is_empty() => {
+            let (id, flow, _) = flows[app.selected].clone();
+            app.busy = Some(format!("Activating {id}:{flow}…"));
+            spawn_plugin_operation(app.config_dir.clone(), sender, move |mut instance| {
+                instance.activate_plugin(&id, &flow)?;
+                Ok(format!("Activated {id}:{flow}."))
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_plugin_connect(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskResult>) {
+    match key.code {
+        KeyCode::Esc => app.begin_plugins(),
+        KeyCode::Tab | KeyCode::Down => app.field = (app.field + 1) % 3,
+        KeyCode::BackTab | KeyCode::Up => app.field = (app.field + 2) % 3,
+        KeyCode::Enter => {
+            let path = PathBuf::from(app.fields[0].trim());
+            if path.as_os_str().is_empty() {
+                app.error = Some("Plugin path is required.".into());
+                return;
+            }
+            let flow = (!app.fields[1].trim().is_empty()).then(|| app.fields[1].trim().to_string());
+            let environment = match parse_plugin_environment_files(&app.fields[2]) {
+                Ok(environment) => environment,
+                Err(error) => {
+                    app.error = Some(error);
+                    return;
+                }
+            };
+            app.busy = Some("Validating and building plugin…".into());
+            spawn_plugin_operation(app.config_dir.clone(), sender, move |mut instance| {
+                instance.connect_plugin(PluginConnectOptions {
+                    path,
+                    flow,
+                    environment,
+                })?;
+                Ok("Plugin connected. Press Enter on a flow to activate it.".into())
+            });
+        }
+        _ => edit_field(&mut app.fields[app.field], key, false),
+    }
+}
+
+fn parse_plugin_environment_files(
+    value: &str,
+) -> Result<BTreeMap<String, PluginEnvironmentInput>, String> {
+    let mut result = BTreeMap::new();
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let (name, path) = item.split_once('=').ok_or_else(|| {
+            "Environment files must use NAME=PATH, separated by commas.".to_string()
+        })?;
+        if name.is_empty() || path.is_empty() {
+            return Err("Environment files must use NAME=PATH, separated by commas.".into());
+        }
+        result.insert(
+            name.to_string(),
+            PluginEnvironmentInput::File(PathBuf::from(path)),
+        );
+    }
+    Ok(result)
+}
+
+fn spawn_plugin_operation<F>(
+    config_dir: Option<PathBuf>,
+    sender: mpsc::UnboundedSender<TaskResult>,
+    operation: F,
+) where
+    F: FnOnce(Instance) -> Result<String, SetupError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let result = Instance::open(config_dir).and_then(operation);
+        let _ = sender.send(TaskResult::Plugin(result));
+    });
+}
+
+fn plugin_flows(instance: &Instance) -> Vec<(String, String, crate::PluginFlowClass)> {
+    instance
+        .config()
+        .into_iter()
+        .flat_map(|config| &config.plugins)
+        .flat_map(|(id, plugin)| {
+            plugin
+                .flows
+                .iter()
+                .map(move |(flow, class)| (id.clone(), flow.clone(), *class))
+        })
+        .collect()
 }
 
 fn handle_github_method(app: &mut App, key: KeyEvent) {
@@ -954,6 +1103,21 @@ fn render(frame: &mut Frame, app: &App, instance: &Instance) {
             "Enter authenticate  Esc back",
         ),
         Screen::Doctor => render_doctor(frame, vertical[1], app),
+        Screen::Plugins => render_plugins(frame, vertical[1], app, instance),
+        Screen::PluginConnect => render_form(
+            frame,
+            vertical[1],
+            "Connect local plugin",
+            &[
+                "Plugin directory or manifest",
+                "Flow to activate (optional)",
+                "Environment files (NAME=PATH, comma-separated)",
+            ],
+            &app.fields,
+            app.field,
+            false,
+            "Enter validate/build  Tab next  Esc back\nValues are read from private files and never entered directly.",
+        ),
     }
     let footer = app
         .busy
@@ -1042,6 +1206,13 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
                 "not configured"
             }
         )),
+        Line::from(format!(
+            "Plugin        {}",
+            config
+                .and_then(|config| config.active_plugin.as_ref())
+                .map(|plugin| format!("{}:{}", plugin.id, plugin.flow))
+                .unwrap_or_else(|| "default lifecycle".into())
+        )),
         Line::from(""),
         Line::styled(
             if app.status.running() {
@@ -1103,6 +1274,54 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
                 .borders(Borders::ALL),
         ),
         right[1],
+    );
+}
+
+fn render_plugins(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
+    let flows = plugin_flows(instance);
+    let active = instance
+        .config()
+        .and_then(|config| config.active_plugin.as_ref());
+    let items = if flows.is_empty() {
+        vec![ListItem::new(
+            "No plugins installed. Press c to connect one.",
+        )]
+    } else {
+        flows
+            .iter()
+            .map(|(id, flow, class)| {
+                let marker =
+                    if active.is_some_and(|active| active.id == *id && active.flow == *flow) {
+                        "●"
+                    } else {
+                        "○"
+                    };
+                ListItem::new(format!("{marker} {id}:{flow}  {class:?}"))
+            })
+            .collect()
+    };
+    let mut state = ListState::default();
+    if !flows.is_empty() {
+        state.select(Some(app.selected.min(flows.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(" Plugins — one active flow ")
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().fg(Color::Cyan)),
+        padded(area, 2, 1),
+        &mut state,
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "Enter activate  c connect/reconfigure  r rebuild  d disable  Esc back\nLifecycle-replacement flows are exclusive and expose the Docker socket to the worker while active.",
+        )
+        .style(Style::default().fg(Color::Yellow)),
+        Rect::new(area.x + 4, area.y + area.height.saturating_sub(4), area.width.saturating_sub(8), 3),
     );
 }
 
@@ -1455,5 +1674,16 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("ghp_hidden"));
+    }
+
+    #[test]
+    fn plugin_environment_accepts_only_file_references() {
+        let values = parse_plugin_environment_files("TOKEN=/tmp/token, MODE=/tmp/mode").unwrap();
+        assert_eq!(values.len(), 2);
+        assert!(matches!(
+            values.get("TOKEN"),
+            Some(PluginEnvironmentInput::File(path)) if path == &PathBuf::from("/tmp/token")
+        ));
+        assert!(parse_plugin_environment_files("TOKEN").is_err());
     }
 }
