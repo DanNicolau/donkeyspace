@@ -1414,15 +1414,26 @@ fn parse_compose_status(bytes: &[u8]) -> Result<DeploymentStatus, SetupError> {
             services: Vec::new(),
         });
     }
-    let values = match serde_json::from_str::<Value>(&text)? {
-        Value::Array(values) => values,
-        value @ Value::Object(_) => vec![value],
-        _ => {
+    let values = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Array(values)) => values,
+        Ok(value @ Value::Object(_)) => vec![value],
+        Ok(_) => {
             return Err(SetupError::Config(
                 "docker compose status was not JSON objects".into(),
             ));
         }
+        Err(error) if error.classify() == serde_json::error::Category::Syntax => text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?,
+        Err(error) => return Err(error.into()),
     };
+    if values.iter().any(|value| !value.is_object()) {
+        return Err(SetupError::Config(
+            "docker compose status was not JSON objects".into(),
+        ));
+    }
     let mut services = values
         .iter()
         .filter_map(|value| {
@@ -1682,6 +1693,17 @@ mod tests {
         assert_eq!(status.services[0].health.as_deref(), Some("healthy"));
         assert_eq!(status.services[1].name, "worker");
         assert_eq!(status.services[1].health, None);
+    }
+
+    #[test]
+    fn parses_newline_delimited_compose_status() {
+        let status = parse_compose_status(
+            b"{\"Service\":\"worker\",\"State\":\"running\",\"Health\":\"\"}\n{\"Service\":\"postgres\",\"State\":\"running\",\"Health\":\"healthy\"}\n",
+        )
+        .unwrap();
+        assert_eq!(status.services.len(), 2);
+        assert_eq!(status.services[0].name, "postgres");
+        assert_eq!(status.services[1].name, "worker");
     }
 
     #[test]
