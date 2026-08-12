@@ -17,6 +17,8 @@ pub struct PluginManifest {
     pub api_version: u32,
     pub id: String,
     pub runtime: PluginRuntime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<PluginInstallation>,
     #[serde(default)]
     pub parameters: BTreeMap<String, PluginParameter>,
     #[serde(default)]
@@ -31,6 +33,50 @@ pub struct PluginManifest {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PluginRuntime {
     pub default_image: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginInstallation {
+    #[serde(default)]
+    pub build: PluginBuild,
+    #[serde(default)]
+    pub environment: BTreeMap<String, PluginEnvironmentVariable>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginBuild {
+    #[serde(default = "default_build_context")]
+    pub context: String,
+    #[serde(default = "default_dockerfile")]
+    pub dockerfile: String,
+}
+
+impl Default for PluginBuild {
+    fn default() -> Self {
+        Self {
+            context: default_build_context(),
+            dockerfile: default_dockerfile(),
+        }
+    }
+}
+
+fn default_build_context() -> String {
+    ".".into()
+}
+
+fn default_dockerfile() -> String {
+    "Dockerfile".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginEnvironmentVariable {
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub secret: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -235,6 +281,36 @@ impl PluginManifest {
                 "id and runtime.default_image are required".into(),
             ));
         }
+        if let Some(installation) = &self.installation {
+            validate_relative_path(&installation.build.context)?;
+            validate_relative_path(&installation.build.dockerfile)?;
+            for (name, variable) in &installation.environment {
+                if !is_environment_name(name) {
+                    return Err(PluginError::Invalid(format!(
+                        "invalid installation environment name `{name}`"
+                    )));
+                }
+                if variable.description.trim().is_empty() {
+                    return Err(PluginError::Invalid(format!(
+                        "installation environment `{name}` requires a description"
+                    )));
+                }
+                if variable.secret && variable.default.is_some() {
+                    return Err(PluginError::Invalid(format!(
+                        "secret installation environment `{name}` cannot have a default"
+                    )));
+                }
+                if !self
+                    .roles
+                    .values()
+                    .any(|role| role.environment.iter().any(|allowed| allowed == name))
+                {
+                    return Err(PluginError::Invalid(format!(
+                        "installation environment `{name}` is not allowed by any role"
+                    )));
+                }
+            }
+        }
         for (name, parameter) in &self.parameters {
             validate_safe_id("parameter", name)?;
             match parameter {
@@ -361,6 +437,14 @@ impl PluginManifest {
         }
         Ok(())
     }
+}
+
+fn is_environment_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
+        && value.as_bytes()[0].is_ascii_uppercase()
 }
 
 fn validate_resource_assignments(
@@ -535,6 +619,59 @@ flows:
         )
         .unwrap();
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_installation_contract() {
+        let manifest: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example.plugin
+runtime: { default_image: example:dev }
+installation:
+  environment:
+    EXAMPLE_MODE:
+      description: Select the example execution mode.
+      default: fake
+roles:
+  developer:
+    command: [run]
+    environment: [EXAMPLE_MODE]
+flows:
+  implementation:
+    start: develop
+    tasks:
+      develop: { role: developer, terminal: true }
+"#,
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        let installation = manifest.installation.unwrap();
+        assert_eq!(installation.build.context, ".");
+        assert_eq!(installation.build.dockerfile, "Dockerfile");
+    }
+
+    #[test]
+    fn rejects_secret_installation_defaults() {
+        let manifest: PluginManifest = serde_yaml::from_str(
+            r#"
+api_version: 1
+id: example.plugin
+runtime: { default_image: example:dev }
+installation:
+  environment:
+    API_TOKEN: { description: API token, secret: true, default: unsafe }
+roles:
+  developer: { command: [run], environment: [API_TOKEN] }
+flows:
+  implementation:
+    start: develop
+    tasks:
+      develop: { role: developer, terminal: true }
+"#,
+        )
+        .unwrap();
+        assert!(manifest.validate().is_err());
     }
 
     #[test]
