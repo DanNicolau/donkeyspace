@@ -12,6 +12,8 @@ use std::{
 };
 use thiserror::Error;
 
+pub mod tui;
+
 const SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "instance.json";
 const GENERATED_ENV: &str = "compose.env";
@@ -145,11 +147,11 @@ pub struct DeploymentStatus {
 
 impl DeploymentStatus {
     pub fn running(&self) -> bool {
-        !self.services.is_empty()
-            && self
-                .services
-                .iter()
-                .all(|service| service.state.eq_ignore_ascii_case("running"))
+        ["postgres", "api", "worker", "web"].iter().all(|expected| {
+            self.services.iter().any(|service| {
+                service.name == *expected && service.state.eq_ignore_ascii_case("running")
+            })
+        })
     }
 }
 
@@ -1528,11 +1530,26 @@ mod tests {
             br#"[{"Service":"worker","State":"running","Health":""},{"Service":"postgres","State":"running","Health":"healthy"}]"#,
         )
         .unwrap();
-        assert!(status.running());
+        assert!(!status.running());
         assert_eq!(status.services[0].name, "postgres");
         assert_eq!(status.services[0].health.as_deref(), Some("healthy"));
         assert_eq!(status.services[1].name, "worker");
         assert_eq!(status.services[1].health, None);
+    }
+
+    #[test]
+    fn deployment_is_running_only_when_every_core_service_is_running() {
+        let status = DeploymentStatus {
+            services: ["postgres", "api", "worker", "web"]
+                .into_iter()
+                .map(|name| ServiceStatus {
+                    name: name.into(),
+                    state: "running".into(),
+                    health: None,
+                })
+                .collect(),
+        };
+        assert!(status.running());
     }
 
     #[test]
@@ -1615,6 +1632,43 @@ mod tests {
                 0o700
             );
         }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_github_registration_resumes_and_discards_privately() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("donkeyspace-pending-test-{unique}"));
+        let private_key_file = directory.join("secrets/pending.pem");
+        let webhook_secret_file = directory.join("secrets/pending-webhook");
+        write_secret(&private_key_file, b"fixture key").unwrap();
+        write_secret(&webhook_secret_file, b"fixture webhook").unwrap();
+        let pending = PendingGitHubApp {
+            app_id: 42,
+            slug: "donkeyspace-test".into(),
+            owner: "example".into(),
+            ingress: IngressMode::Polling,
+            callback_port: 8787,
+            organization: None,
+            private_key_file: private_key_file.clone(),
+            webhook_secret_file: webhook_secret_file.clone(),
+        };
+        write_secret(
+            &directory.join(PENDING_GITHUB_FILE),
+            &serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let instance = Instance::open(Some(directory.clone())).unwrap();
+        assert_eq!(instance.pending_github_app().unwrap(), Some(pending));
+        instance.discard_pending_github_app().unwrap();
+        assert!(instance.pending_github_app().unwrap().is_none());
+        assert!(!private_key_file.exists());
+        assert!(!webhook_secret_file.exists());
 
         fs::remove_dir_all(directory).unwrap();
     }

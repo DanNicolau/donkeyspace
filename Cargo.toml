@@ -21,11 +21,13 @@ axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
 http = "1"
 octocrab = "0.50"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

@@ -13,7 +13,7 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -105,8 +105,11 @@ async fn main() {
 
 async fn run() -> Result<(), SetupError> {
     let cli = Cli::parse();
+    if cli.command.is_none() {
+        return donkeyspace_cli::tui::run(cli.config_dir).await;
+    }
     let mut instance = Instance::open(cli.config_dir)?;
-    match cli.command {
+    match cli.command.expect("checked above") {
         Command::Init(args) => {
             let source = match args.runtime_source {
                 SourceArg::LocalBuild => RuntimeSource::LocalBuild,
