@@ -274,6 +274,28 @@ pub async fn list_github_repositories(pool: &PgPool) -> Result<Vec<RepositoryRec
     Ok(repositories)
 }
 
+pub async fn list_github_repositories_for_installation(
+    pool: &PgPool,
+    installation_external_id: &str,
+) -> Result<Vec<RepositoryRecord>, DbError> {
+    let repositories = sqlx::query_as::<_, RepositoryRecord>(
+        r#"
+        SELECT r.id, r.provider, r.owner, r.name, r.default_branch
+        FROM repositories r
+        JOIN installations i ON i.id = r.installation_id
+        WHERE r.provider = 'github'
+          AND i.provider = 'github'
+          AND i.external_id = $1
+        ORDER BY r.owner ASC, r.name ASC
+        "#,
+    )
+    .bind(installation_external_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(repositories)
+}
+
 pub async fn upsert_workflow_item(
     pool: &PgPool,
     input: &WorkflowItemInput,

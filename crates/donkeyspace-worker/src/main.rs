@@ -8,8 +8,9 @@ use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
     acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
     create_job, create_outbound_action, fail_job, list_github_repositories,
-    list_pending_outbound_actions, list_ready_developer_candidates, list_repair_candidates,
-    mark_job_running, mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
+    list_github_repositories_for_installation, list_pending_outbound_actions,
+    list_ready_developer_candidates, list_repair_candidates, mark_job_running,
+    mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
     record_state_transition, update_workflow_item_state,
 };
 use donkeyspace_github::{
@@ -270,7 +271,13 @@ async fn ensure_policy_labels(
         return Ok(());
     }
 
-    for repository in list_github_repositories(pool).await? {
+    let repositories = match env::var("DONKEYSPACE_GITHUB_INSTALLATION_ID") {
+        Ok(installation_id) if !installation_id.trim().is_empty() => {
+            list_github_repositories_for_installation(pool, &installation_id).await?
+        }
+        _ => list_github_repositories(pool).await?,
+    };
+    for repository in repositories {
         let sync_key = format!("{}/{}", repository.owner, repository.name);
         if label_synced_repositories.contains(&sync_key) {
             continue;
