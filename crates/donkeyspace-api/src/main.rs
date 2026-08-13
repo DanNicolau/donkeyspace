@@ -20,7 +20,7 @@ use donkeyspace_db::{
     upsert_pull_request, upsert_repository, upsert_workflow_item,
 };
 use donkeyspace_github::{GitHubClient, GitHubCredentialProvider};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::trace::TraceLayer;
@@ -1305,9 +1305,17 @@ struct GitHubIssue {
     id: i64,
     number: i64,
     state: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     body: String,
     labels: Vec<GitHubLabel>,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1371,7 +1379,7 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubComment, JobRecord, can_retry_job, comment_is_from_donkeyspace,
+        GitHubComment, GitHubIssueWebhook, JobRecord, can_retry_job, comment_is_from_donkeyspace,
         extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
         issue_number_from_donkeyspace_branch, parse_polled_repositories, should_queue_reviewer,
         should_queue_triage, webhook_installation_matches,
@@ -1424,6 +1432,27 @@ mod tests {
         assert_eq!(ingress.delivery_id, "github-poll:acme/rtl:12345");
         assert_eq!(ingress.payload["repository"]["default_branch"], "main");
         assert_eq!(ingress.payload["issue"]["number"], 3);
+    }
+
+    #[test]
+    fn accepts_null_issue_body_from_github() {
+        let payload: GitHubIssueWebhook = serde_json::from_value(json!({
+            "action": "opened",
+            "repository": {
+                "name": "rtl",
+                "default_branch": "main",
+                "owner": {"login": "acme"}
+            },
+            "issue": {
+                "id": 7,
+                "number": 34,
+                "state": "open",
+                "body": null,
+                "labels": [{"name": "ai"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(payload.issue.body, "");
     }
 
     #[test]
