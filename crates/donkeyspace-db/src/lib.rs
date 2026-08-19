@@ -196,8 +196,33 @@ pub struct OutboundActionRecord {
     pub status: String,
     pub payload: Value,
     pub last_error: Option<String>,
+    pub provider_resource_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngagementDecisionInput {
+    pub webhook_delivery_id: i64,
+    pub workflow_item_id: Option<i64>,
+    pub gate: String,
+    pub disposition: String,
+    pub actor: Option<Value>,
+    pub matched_selector: Option<Value>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct EngagementDecisionRecord {
+    pub id: i64,
+    pub webhook_delivery_id: i64,
+    pub workflow_item_id: Option<i64>,
+    pub gate: String,
+    pub disposition: String,
+    pub actor: Option<Value>,
+    pub matched_selector: Option<Value>,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -578,7 +603,7 @@ pub async fn record_webhook_delivery(
     delivery_id: &str,
     event_name: &str,
     payload: &Value,
-) -> Result<bool, DbError> {
+) -> Result<Option<i64>, DbError> {
     let inserted = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO webhook_deliveries (repository_id, delivery_id, event_name, payload)
@@ -594,7 +619,120 @@ pub async fn record_webhook_delivery(
     .fetch_optional(pool)
     .await?;
 
-    Ok(inserted.is_some())
+    Ok(inserted)
+}
+
+pub async fn record_engagement_decision(
+    pool: &PgPool,
+    input: &EngagementDecisionInput,
+) -> Result<EngagementDecisionRecord, DbError> {
+    Ok(sqlx::query_as::<_, EngagementDecisionRecord>(
+        r#"
+        INSERT INTO engagement_decisions (
+            webhook_delivery_id, workflow_item_id, gate, disposition,
+            actor, matched_selector, reason
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (webhook_delivery_id) DO UPDATE SET
+            workflow_item_id = EXCLUDED.workflow_item_id,
+            gate = EXCLUDED.gate,
+            disposition = EXCLUDED.disposition,
+            actor = EXCLUDED.actor,
+            matched_selector = EXCLUDED.matched_selector,
+            reason = EXCLUDED.reason
+        RETURNING *
+        "#,
+    )
+    .bind(input.webhook_delivery_id)
+    .bind(input.workflow_item_id)
+    .bind(&input.gate)
+    .bind(&input.disposition)
+    .bind(&input.actor)
+    .bind(&input.matched_selector)
+    .bind(&input.reason)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn list_recent_engagement_decisions(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<EngagementDecisionRecord>, DbError> {
+    Ok(sqlx::query_as::<_, EngagementDecisionRecord>(
+        "SELECT * FROM engagement_decisions ORDER BY created_at DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn record_github_managed_resource_for_workflow_item(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    resource_kind: &str,
+    provider_id: &str,
+    metadata: &Value,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        INSERT INTO github_managed_resources (
+            repository_id, workflow_item_id, resource_kind, provider_id, metadata
+        )
+        SELECT repository_id, id, $2, $3, $4
+        FROM workflow_items WHERE id = $1
+        ON CONFLICT (repository_id, resource_kind, provider_id) DO NOTHING
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(resource_kind)
+    .bind(provider_id)
+    .bind(metadata)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn github_managed_resource_exists(
+    pool: &PgPool,
+    repository_id: i64,
+    resource_kind: &str,
+    provider_id: &str,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM github_managed_resources
+            WHERE repository_id = $1 AND resource_kind = $2 AND provider_id = $3
+        )
+        "#,
+    )
+    .bind(repository_id)
+    .bind(resource_kind)
+    .bind(provider_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn pending_outbound_comment_exists(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    body: &str,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM outbound_actions
+            WHERE workflow_item_id = $1
+              AND action_type = 'issue.create_comment'
+              AND status = 'pending'
+              AND payload ->> 'body' = $2
+        )
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(body)
+    .fetch_one(pool)
+    .await?)
 }
 
 pub async fn create_job(
@@ -985,19 +1123,49 @@ pub async fn list_pending_outbound_actions(
     Ok(actions)
 }
 
-pub async fn mark_outbound_action_completed(pool: &PgPool, id: i64) -> Result<(), DbError> {
+pub async fn mark_outbound_action_completed(
+    pool: &PgPool,
+    id: i64,
+    provider_resource_id: Option<&str>,
+) -> Result<(), DbError> {
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r#"
         UPDATE outbound_actions
         SET status = 'completed',
             last_error = NULL,
+            provider_resource_id = $2,
             updated_at = now()
         WHERE id = $1
         "#,
     )
     .bind(id)
-    .execute(pool)
+    .bind(provider_resource_id)
+    .execute(&mut *transaction)
     .await?;
+
+    if let Some(provider_id) = provider_resource_id {
+        sqlx::query(
+            r#"
+            INSERT INTO github_managed_resources (
+                repository_id, workflow_item_id, outbound_action_id,
+                resource_kind, provider_id, metadata
+            )
+            SELECT workflow_items.repository_id, outbound_actions.workflow_item_id,
+                   outbound_actions.id, 'issue_comment', $2, '{}'::jsonb
+            FROM outbound_actions
+            JOIN workflow_items ON workflow_items.id = outbound_actions.workflow_item_id
+            WHERE outbound_actions.id = $1
+            ON CONFLICT (repository_id, resource_kind, provider_id) DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .bind(provider_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    transaction.commit().await?;
 
     Ok(())
 }
