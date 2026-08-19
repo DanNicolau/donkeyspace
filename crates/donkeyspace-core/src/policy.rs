@@ -596,8 +596,18 @@ automation:
     fn engagement_gate_override_and_full_selectors_parse() {
         let mut yaml = include_str!("../../../docs/policy.example.yml").to_string();
         yaml = yaml.replace(
-            "    needs_human_resume:\n",
-            "    blocked_resume:\n      allow: []\n    needs_human_resume:\n",
+            "    repositories: {}",
+            r#"    repositories:
+      "acme/rtl":
+        default:
+          allow:
+            - { type: user, login: alice }
+        blocked_resume:
+          allow: []
+        needs_human_resume:
+          allow:
+            - { type: user, login: alice }
+            - { type: collaborator_permission, minimum: write }"#,
         );
         let policy = Policy::from_yaml(&yaml).unwrap();
 
@@ -605,7 +615,7 @@ automation:
             policy
                 .workflow
                 .engagement
-                .rule(EngagementGate::BlockedResume, None)
+                .rule(EngagementGate::BlockedResume, Some("ACME/RTL"))
                 .allow
                 .is_empty()
         );
@@ -613,7 +623,7 @@ automation:
             policy
                 .workflow
                 .engagement
-                .rule(EngagementGate::NeedsHumanResume, None)
+                .rule(EngagementGate::NeedsHumanResume, Some("acme/rtl"))
                 .allow[1],
             EngagementSelector::CollaboratorPermission { .. }
         ));
@@ -649,8 +659,14 @@ allow:
 
     #[test]
     fn invalid_engagement_selector_fails_policy_loading() {
-        let yaml = include_str!("../../../docs/policy.example.yml")
-            .replace("minimum: \"write\"", "minimum: \"superuser\"");
+        let yaml = include_str!("../../../docs/policy.example.yml").replace(
+            "    repositories: {}",
+            r#"    repositories:
+      "acme/rtl":
+        default:
+          allow:
+            - { type: collaborator_permission, minimum: superuser }"#,
+        );
         assert!(Policy::from_yaml(&yaml).is_err());
     }
 

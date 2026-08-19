@@ -13,6 +13,11 @@ workflow:
   allow_labels:
     - "ai"
 
+  engagement:
+    default:
+      allow: []
+    repositories: {}
+
 agents:
   triage:
     enabled: true

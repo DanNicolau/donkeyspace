@@ -329,6 +329,11 @@ preserved. A human reply requeues the same coordinator UUID, reuses the
 checkout and projected block issues, and restarts only the target task and its
 downstream dependents. Successful parallel siblings remain complete.
 
+The reply must first pass the policy's `needs_human_resume` engagement rule;
+denied replies leave the coordinator paused. Projected issue IDs are registered
+as Donkeyspace-managed resources so their webhook or polling events cannot
+start an independent lifecycle.
+
 ## Filesystem isolation
 
 Every attempt receives a separate physical workspace containing only declared

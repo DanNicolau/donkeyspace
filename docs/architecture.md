@@ -113,7 +113,7 @@ deprecated compatibility mode. Codex authentication is delegated to Codex CLI.
   discovers that owner's manifest-created App installation automatically.
 - No token accounting or configurable retention policy.
 - The dashboard does not yet show GitHub links, transitions, policy snapshots,
-  or policy decisions, although some of that data is available from the API.
+  or engagement decisions, although decision records are available from the API.
 - Registry images are modeled by setup but intentionally unavailable until a
   release-image backend exists.
 - Test coverage is primarily unit-level; PostgreSQL, live GitHub, and complete

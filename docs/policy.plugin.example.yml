@@ -11,6 +11,11 @@ workflow:
   block_labels: ["ai:disabled"]
   allow_labels: ["ai"]
 
+  engagement:
+    default:
+      allow: []
+    repositories: {}
+
 lifecycle:
   plugin:
     manifest_path: /plugins/example/donkeyspace-plugin.yml

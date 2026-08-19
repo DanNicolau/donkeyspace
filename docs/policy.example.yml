@@ -16,6 +16,12 @@ workflow:
   allow_labels:
     - "ai"
 
+  engagement:
+    default:
+      allow: []
+    # CLI/TUI setup generates repository entries in the private effective policy.
+    repositories: {}
+
 agents:
   triage:
     enabled: true
