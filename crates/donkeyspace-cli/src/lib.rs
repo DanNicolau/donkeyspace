@@ -17,7 +17,10 @@ mod plugins;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
+pub const DEFAULT_API_PORT: u16 = 8080;
+pub const DEFAULT_WEB_PORT: u16 = 5173;
+const PORT_SUGGESTION_ATTEMPTS: u16 = 100;
 const CONFIG_FILE: &str = "instance.json";
 const GENERATED_ENV: &str = "compose.env";
 const PENDING_GITHUB_FILE: &str = "pending-github.json";
@@ -59,6 +62,8 @@ pub struct InstanceConfig {
     pub source_tree: PathBuf,
     pub runtime_source: RuntimeSource,
     pub api_port: u16,
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +194,12 @@ impl DeploymentStatus {
             })
         })
     }
+
+    pub fn service_running(&self, expected: &str) -> bool {
+        self.services.iter().any(|service| {
+            service.name == expected && service.state.eq_ignore_ascii_case("running")
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,27 +223,27 @@ impl Instance {
     pub fn open(directory: Option<PathBuf>) -> Result<Self, SetupError> {
         let directory = directory.unwrap_or_else(default_config_directory);
         let path = directory.join(CONFIG_FILE);
-        let mut config = if path.exists() {
-            let mut config: InstanceConfig = serde_json::from_slice(&fs::read(&path)?)?;
-            if config.schema_version == 1 {
-                config.schema_version = SCHEMA_VERSION;
-            } else if config.schema_version != SCHEMA_VERSION {
-                return Err(SetupError::Config(format!(
-                    "unsupported schema_version {}; expected {SCHEMA_VERSION}",
-                    config.schema_version
-                )));
-            }
-            Some(config)
+        let (config, migrated) = if path.exists() {
+            let bytes = fs::read(&path)?;
+            let mut config: InstanceConfig = serde_json::from_slice(&bytes)?;
+            let migrated = match config.schema_version {
+                1 | 2 => {
+                    config.schema_version = SCHEMA_VERSION;
+                    true
+                }
+                SCHEMA_VERSION => false,
+                version => {
+                    return Err(SetupError::Config(format!(
+                        "unsupported schema_version {version}; expected {SCHEMA_VERSION}",
+                    )));
+                }
+            };
+            (Some(config), migrated)
         } else {
-            None
+            (None, false)
         };
-        let instance = Self {
-            directory,
-            config: config.take(),
-        };
-        if path.exists()
-            && serde_json::from_slice::<Value>(&fs::read(&path)?)?["schema_version"] == 1
-        {
+        let instance = Self { directory, config };
+        if migrated {
             instance.save()?;
         }
         Ok(instance)
@@ -259,6 +270,16 @@ impl Instance {
         source_tree: PathBuf,
         runtime_source: RuntimeSource,
     ) -> Result<(), SetupError> {
+        self.init_with_ports(source_tree, runtime_source, None, None)
+    }
+
+    pub fn init_with_ports(
+        &mut self,
+        source_tree: PathBuf,
+        runtime_source: RuntimeSource,
+        api_port: Option<u16>,
+        web_port: Option<u16>,
+    ) -> Result<(), SetupError> {
         if runtime_source == RuntimeSource::RegistryImage {
             return Err(SetupError::Config(
                 "registry-image is reserved for a future release backend".into(),
@@ -267,25 +288,88 @@ impl Instance {
         fs::create_dir_all(&self.directory)?;
         set_directory_mode(&self.directory)?;
         let source_tree = fs::canonicalize(source_tree)?;
-        let config = match self.config.take() {
+        let config = match self.config.clone() {
             Some(mut existing) => {
                 existing.source_tree = source_tree;
                 existing.runtime_source = runtime_source;
+                existing.api_port = api_port.unwrap_or(existing.api_port);
+                existing.web_port = web_port.unwrap_or(existing.web_port);
                 existing
             }
             None => InstanceConfig {
                 schema_version: SCHEMA_VERSION,
                 source_tree,
                 runtime_source,
-                api_port: 8080,
+                api_port: api_port.unwrap_or(DEFAULT_API_PORT),
+                web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
                 codex_home: None,
                 github: None,
                 plugins: BTreeMap::new(),
                 active_plugin: None,
             },
         };
+        validate_ports(config.api_port, config.web_port)?;
         self.config = Some(config);
         self.save()
+    }
+
+    pub fn configure_ports(
+        &mut self,
+        api_port: Option<u16>,
+        web_port: Option<u16>,
+    ) -> Result<(), SetupError> {
+        self.configure_ports_with_availability(api_port, web_port, port_is_available)
+    }
+
+    fn configure_ports_with_availability<F>(
+        &mut self,
+        api_port: Option<u16>,
+        web_port: Option<u16>,
+        available: F,
+    ) -> Result<(), SetupError>
+    where
+        F: Fn(u16) -> bool,
+    {
+        if api_port.is_none() && web_port.is_none() {
+            return Err(SetupError::Config(
+                "provide --api-port, --web-port, or both".into(),
+            ));
+        }
+        let config = self.require_config()?;
+        let api_port = api_port.unwrap_or(config.api_port);
+        let web_port = web_port.unwrap_or(config.web_port);
+        validate_ports(api_port, web_port)?;
+        for (label, flag, current, requested) in [
+            ("API", "--api-port", config.api_port, api_port),
+            ("dashboard", "--web-port", config.web_port, web_port),
+        ] {
+            if requested != current && !available(requested) {
+                let suggestion =
+                    suggest_available_port_with(requested, &[api_port, web_port], &available)
+                        .map(|port| format!("; try `{flag} {port}`"))
+                        .unwrap_or_default();
+                return Err(SetupError::Config(format!(
+                    "{label} port 127.0.0.1:{requested} is already in use{suggestion}"
+                )));
+            }
+        }
+        self.config.as_mut().unwrap().api_port = api_port;
+        self.config.as_mut().unwrap().web_port = web_port;
+        self.save()
+    }
+
+    pub fn api_url(&self) -> Result<String, SetupError> {
+        Ok(format!(
+            "http://127.0.0.1:{}",
+            self.require_config()?.api_port
+        ))
+    }
+
+    pub fn dashboard_url(&self) -> Result<String, SetupError> {
+        Ok(format!(
+            "http://127.0.0.1:{}",
+            self.require_config()?.web_port
+        ))
     }
 
     pub fn pending_github_app(&self) -> Result<Option<PendingGitHubApp>, SetupError> {
@@ -710,21 +794,31 @@ impl Instance {
         let deployment = self.deployment_status().unwrap_or(DeploymentStatus {
             services: Vec::new(),
         });
-        for (name, port) in [("API port", config.api_port), ("Dashboard port", 5173)] {
-            let available = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+        for (name, service, flag, port) in [
+            ("API port", "api", "--api-port", config.api_port),
+            ("Dashboard port", "web", "--web-port", config.web_port),
+        ] {
+            let available = port_is_available(port);
+            let service_running = deployment.service_running(service);
             checks.push(DoctorCheck {
                 name: name.into(),
-                level: if available || deployment.running() {
+                level: if available || service_running {
                     CheckLevel::Pass
                 } else {
-                    CheckLevel::Warning
+                    CheckLevel::Fail
                 },
                 detail: if available {
                     format!("127.0.0.1:{port} is available")
-                } else if deployment.running() {
+                } else if service_running {
                     format!("127.0.0.1:{port} is used by the running stack")
                 } else {
-                    format!("127.0.0.1:{port} is already in use")
+                    let suggestion =
+                        suggest_available_port(port, &[config.api_port, config.web_port])
+                            .map(|port| {
+                                format!("; try `donkeyspace configure ports {flag} {port}`")
+                            })
+                            .unwrap_or_default();
+                    format!("127.0.0.1:{port} is already in use{suggestion}")
                 },
             });
         }
@@ -811,7 +905,9 @@ impl Instance {
     }
 
     pub fn up(&self) -> Result<(), SetupError> {
-        self.compose(&["up", "-d", "--build"], false)
+        self.ensure_start_ports_available()?;
+        self.compose(&["up", "-d", "--build"], false)?;
+        self.print_endpoints()
     }
 
     pub fn down(&self) -> Result<(), SetupError> {
@@ -819,7 +915,8 @@ impl Instance {
     }
 
     pub fn status(&self) -> Result<(), SetupError> {
-        self.compose(&["ps"], false)
+        self.compose(&["ps"], false)?;
+        self.print_endpoints()
     }
 
     pub fn deployment_status(&self) -> Result<DeploymentStatus, SetupError> {
@@ -835,6 +932,7 @@ impl Instance {
     }
 
     pub fn start(&self) -> Result<(), SetupError> {
+        self.ensure_start_ports_available()?;
         self.compose_captured(&["up", "-d", "--build"])
     }
 
@@ -854,6 +952,20 @@ impl Instance {
             ));
         }
         self.compose(&["down", "--volumes"], true)
+    }
+
+    fn ensure_start_ports_available(&self) -> Result<(), SetupError> {
+        let config = self.require_config()?;
+        let deployment = self.deployment_status().unwrap_or(DeploymentStatus {
+            services: Vec::new(),
+        });
+        validate_start_ports(config, &deployment, port_is_available)
+    }
+
+    fn print_endpoints(&self) -> Result<(), SetupError> {
+        println!("Dashboard: {}", self.dashboard_url()?);
+        println!("API: {}", self.api_url()?);
+        Ok(())
     }
 
     fn compose(&self, arguments: &[&str], destructive: bool) -> Result<(), SetupError> {
@@ -920,7 +1032,10 @@ impl Instance {
     }
 
     fn write_compose_env(&self, config: &InstanceConfig) -> Result<(), SetupError> {
-        let mut lines = vec![format!("DONKEYSPACE_API_PORT={}", config.api_port)];
+        let mut lines = vec![
+            format!("DONKEYSPACE_API_PORT={}", config.api_port),
+            format!("DONKEYSPACE_WEB_PORT={}", config.web_port),
+        ];
         if let Some(codex_home) = &config.codex_home {
             lines.push(format!(
                 "DONKEYSPACE_CODEX_HOME_SOURCE={}",
@@ -1002,6 +1117,66 @@ impl Instance {
             SetupError::Config("instance is not initialized; run `donkeyspace init`".into())
         })
     }
+}
+
+fn default_web_port() -> u16 {
+    DEFAULT_WEB_PORT
+}
+
+fn validate_ports(api_port: u16, web_port: u16) -> Result<(), SetupError> {
+    if api_port == 0 || web_port == 0 {
+        return Err(SetupError::Config(
+            "ports must be between 1 and 65535".into(),
+        ));
+    }
+    if api_port == web_port {
+        return Err(SetupError::Config(
+            "API and dashboard ports must be different".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn port_is_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+fn validate_start_ports<F>(
+    config: &InstanceConfig,
+    deployment: &DeploymentStatus,
+    available: F,
+) -> Result<(), SetupError>
+where
+    F: Fn(u16) -> bool,
+{
+    for (label, flag, service, port) in [
+        ("API", "--api-port", "api", config.api_port),
+        ("dashboard", "--web-port", "web", config.web_port),
+    ] {
+        if !deployment.service_running(service) && !available(port) {
+            let suggestion =
+                suggest_available_port_with(port, &[config.api_port, config.web_port], &available)
+                    .map(|port| format!("; try `donkeyspace configure ports {flag} {port}`"))
+                    .unwrap_or_default();
+            return Err(SetupError::Config(format!(
+                "{label} port 127.0.0.1:{port} is already in use{suggestion}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn suggest_available_port(preferred: u16, excluded: &[u16]) -> Option<u16> {
+    suggest_available_port_with(preferred, excluded, port_is_available)
+}
+
+fn suggest_available_port_with<F>(preferred: u16, excluded: &[u16], available: F) -> Option<u16>
+where
+    F: Fn(u16) -> bool,
+{
+    (0..=PORT_SUGGESTION_ATTEMPTS)
+        .filter_map(|offset| preferred.checked_add(offset))
+        .find(|port| !excluded.contains(port) && available(*port))
 }
 
 fn default_config_directory() -> PathBuf {
@@ -1623,10 +1798,11 @@ mod tests {
     #[test]
     fn instance_config_never_serializes_secret_values() {
         let config = InstanceConfig {
-            schema_version: 1,
+            schema_version: 3,
             source_tree: "/src".into(),
             runtime_source: RuntimeSource::LocalBuild,
             api_port: 8080,
+            web_port: 5173,
             codex_home: None,
             github: Some(GitHubInstanceConfig::Pat {
                 token_file: "/config/secrets/github-pat".into(),
@@ -1642,32 +1818,112 @@ mod tests {
     }
 
     #[test]
-    fn migrates_schema_one_configuration_atomically() {
+    fn migrates_legacy_configurations_atomically() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = env::temp_dir().join(format!("donkeyspace-schema-test-{unique}"));
+        for schema_version in [1, 2] {
+            let directory =
+                env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(CONFIG_FILE),
+                format!(
+                    r#"{{
+                      "schema_version": {schema_version},
+                      "source_tree": "/src",
+                      "runtime_source": "local-build",
+                      "api_port": 8080
+                    }}"#
+                ),
+            )
+            .unwrap();
+            let instance = Instance::open(Some(directory.clone())).unwrap();
+            let config = instance.config().unwrap();
+            assert_eq!(config.schema_version, 3);
+            assert_eq!(config.web_port, 5173);
+            assert!(config.plugins.is_empty());
+            assert!(config.active_plugin.is_none());
+            let saved: Value =
+                serde_json::from_slice(&fs::read(directory.join(CONFIG_FILE)).unwrap()).unwrap();
+            assert_eq!(saved["schema_version"], 3);
+            assert_eq!(saved["web_port"], 5173);
+            assert!(!directory.join(".instance.json.tmp").exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn validates_and_suggests_distinct_ports() {
+        assert!(validate_ports(8080, 5173).is_ok());
+        assert!(validate_ports(0, 5173).is_err());
+        assert!(validate_ports(8080, 8080).is_err());
+
+        let suggestion =
+            suggest_available_port_with(20_000, &[20_001], |port| port >= 20_001).unwrap();
+        assert_eq!(suggestion, 20_002);
+    }
+
+    #[test]
+    fn startup_port_validation_distinguishes_stack_services_from_conflicts() {
+        let config = InstanceConfig {
+            schema_version: SCHEMA_VERSION,
+            source_tree: "/src".into(),
+            runtime_source: RuntimeSource::LocalBuild,
+            api_port: 8080,
+            web_port: 5173,
+            codex_home: None,
+            github: None,
+            plugins: BTreeMap::new(),
+            active_plugin: None,
+        };
+        let stopped = DeploymentStatus { services: vec![] };
+        let error = validate_start_ports(&config, &stopped, |port| port == 8081).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("donkeyspace configure ports --api-port 8081")
+        );
+
+        let partial = DeploymentStatus {
+            services: vec![ServiceStatus {
+                name: "api".into(),
+                state: "running".into(),
+                health: None,
+            }],
+        };
+        assert!(validate_start_ports(&config, &partial, |port| port == 5173).is_ok());
+    }
+
+    #[test]
+    fn compose_environment_contains_both_host_ports() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("donkeyspace-port-env-test-{unique}"));
+        let instance = Instance {
+            directory: directory.clone(),
+            config: Some(InstanceConfig {
+                schema_version: SCHEMA_VERSION,
+                source_tree: "/src".into(),
+                runtime_source: RuntimeSource::LocalBuild,
+                api_port: 18_080,
+                web_port: 15_173,
+                codex_home: None,
+                github: None,
+                plugins: BTreeMap::new(),
+                active_plugin: None,
+            }),
+        };
         fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join(CONFIG_FILE),
-            br#"{
-              "schema_version": 1,
-              "source_tree": "/src",
-              "runtime_source": "local-build",
-              "api_port": 8080
-            }"#,
-        )
-        .unwrap();
-        let instance = Instance::open(Some(directory.clone())).unwrap();
-        let config = instance.config().unwrap();
-        assert_eq!(config.schema_version, 2);
-        assert!(config.plugins.is_empty());
-        assert!(config.active_plugin.is_none());
-        let saved: Value =
-            serde_json::from_slice(&fs::read(directory.join(CONFIG_FILE)).unwrap()).unwrap();
-        assert_eq!(saved["schema_version"], 2);
-        assert!(!directory.join(".instance.json.tmp").exists());
+        instance
+            .write_compose_env(instance.config().unwrap())
+            .unwrap();
+        let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
+        assert!(environment.contains("DONKEYSPACE_API_PORT=18080\n"));
+        assert!(environment.contains("DONKEYSPACE_WEB_PORT=15173\n"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1773,13 +2029,30 @@ mod tests {
             .to_path_buf();
         let mut instance = Instance::open(Some(directory.clone())).unwrap();
         instance
-            .init(source_tree.clone(), RuntimeSource::LocalBuild)
+            .init_with_ports(
+                source_tree.clone(),
+                RuntimeSource::LocalBuild,
+                Some(18_080),
+                Some(15_173),
+            )
             .unwrap();
         instance.config.as_mut().unwrap().codex_home = Some("/tmp/codex-test".into());
         instance.save().unwrap();
         instance
             .init(source_tree, RuntimeSource::LocalBuild)
             .unwrap();
+        assert_eq!(instance.config.as_ref().unwrap().api_port, 18_080);
+        assert_eq!(instance.config.as_ref().unwrap().web_port, 15_173);
+        let replacement_web_port = 15_174;
+        instance
+            .configure_ports_with_availability(None, Some(replacement_web_port), |_| true)
+            .unwrap();
+        assert_eq!(instance.config.as_ref().unwrap().api_port, 18_080);
+        assert_eq!(
+            instance.config.as_ref().unwrap().web_port,
+            replacement_web_port
+        );
+        assert!(instance.configure_ports(None, None).is_err());
         assert_eq!(
             instance.config.as_ref().unwrap().codex_home.as_deref(),
             Some(Path::new("/tmp/codex-test"))

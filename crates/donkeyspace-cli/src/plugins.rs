@@ -366,10 +366,11 @@ mod tests {
         let instance = Instance {
             directory: directory.clone(),
             config: Some(InstanceConfig {
-                schema_version: 2,
+                schema_version: 3,
                 source_tree,
                 runtime_source: RuntimeSource::LocalBuild,
                 api_port: 8080,
+                web_port: 5173,
                 codex_home: None,
                 github: None,
                 plugins: BTreeMap::from([(plugin.id.clone(), plugin)]),
