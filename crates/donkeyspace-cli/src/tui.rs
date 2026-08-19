@@ -1,7 +1,8 @@
 use crate::{
     CheckLevel, DEFAULT_API_PORT, DEFAULT_WEB_PORT, DeploymentStatus, DoctorReport,
-    GitHubInstanceConfig, IngressMode, Instance, PendingGitHubApp, PluginConnectOptions,
-    PluginEnvironmentInput, RuntimeSource, SetupError, suggest_available_port,
+    GitHubAccessSubject, GitHubInstanceConfig, IngressMode, Instance, PendingGitHubApp,
+    PluginConnectOptions, PluginEnvironmentInput, RuntimeSource, SetupError,
+    suggest_available_port,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -31,6 +32,7 @@ const HOME_ACTIONS: &[&str] = &[
     "Stop Donkeyspace",
     "Configure ports",
     "Configure GitHub",
+    "Manage GitHub access",
     "Configure Codex",
     "Manage plugins",
 ];
@@ -46,6 +48,10 @@ enum Screen {
     GitHubExisting,
     GitHubPat,
     RepositorySelect,
+    GitHubAccessRepositories,
+    GitHubAccessSubjects,
+    GitHubAccessType,
+    GitHubAccessForm,
     CodexMethod,
     CodexApiKey,
     Doctor,
@@ -60,6 +66,13 @@ enum GitHubFlow {
     Pat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubAccessKind {
+    User,
+    Organization,
+    Team,
+}
+
 enum TaskResult {
     Status(Result<DeploymentStatus, SetupError>),
     Doctor(Result<DoctorReport, SetupError>),
@@ -72,6 +85,7 @@ enum TaskResult {
         result: Result<Vec<GitHubRepository>, SetupError>,
     },
     SaveGitHub(Result<(), SetupError>),
+    Access(Result<String, SetupError>),
     Codex(Result<(), SetupError>),
     Plugin(Result<String, SetupError>),
 }
@@ -94,6 +108,10 @@ struct App {
     github_flow: GitHubFlow,
     pending: Option<PendingGitHubApp>,
     installation_id: Option<u64>,
+    access_repository: Option<String>,
+    access_kind: GitHubAccessKind,
+    confirm_remove: bool,
+    continue_setup_after_access: bool,
     pat: Option<String>,
     should_quit: bool,
     last_refresh: Instant,
@@ -148,6 +166,10 @@ impl App {
             github_flow: GitHubFlow::Pending,
             pending,
             installation_id: None,
+            access_repository: None,
+            access_kind: GitHubAccessKind::User,
+            confirm_remove: false,
+            continue_setup_after_access: false,
             pat: None,
             should_quit: false,
             last_refresh: Instant::now() - Duration::from_secs(3),
@@ -176,6 +198,19 @@ impl App {
     fn begin_codex(&mut self) {
         self.screen = Screen::CodexMethod;
         self.selected = 0;
+        self.reset_messages();
+    }
+
+    fn begin_github_access(&mut self, instance: &Instance) {
+        if configured_github_repositories(instance).is_empty() {
+            self.error = Some("Configure GitHub repositories first.".into());
+            return;
+        }
+        self.screen = Screen::GitHubAccessRepositories;
+        self.selected = 0;
+        self.access_repository = None;
+        self.confirm_remove = false;
+        self.continue_setup_after_access = false;
         self.reset_messages();
     }
 
@@ -350,6 +385,7 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
         | TaskResult::Stop(Err(error))
         | TaskResult::Manifest(Err(error))
         | TaskResult::SaveGitHub(Err(error))
+        | TaskResult::Access(Err(error))
         | TaskResult::Codex(Err(error))
         | TaskResult::Plugin(Err(error)) => app.error = Some(error.to_string()),
         TaskResult::Start(Ok(())) => app.notice = Some("Donkeyspace started.".into()),
@@ -387,12 +423,22 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
                 .and_then(|instance| instance.config().cloned())
                 .and_then(|config| config.codex_home)
                 .is_some();
-            if codex_connected {
-                app.doctor = None;
-                app.screen = Screen::Doctor;
-            } else {
-                app.begin_codex();
+            match Instance::open(app.config_dir.clone()) {
+                Ok(instance) => {
+                    app.begin_github_access(&instance);
+                    app.continue_setup_after_access = !codex_connected;
+                    app.notice = Some(
+                        "GitHub connected. Configure trusted identities before continuing.".into(),
+                    );
+                }
+                Err(error) => app.error = Some(error.to_string()),
             }
+        }
+        TaskResult::Access(Ok(message)) => {
+            app.notice = Some(message);
+            app.screen = Screen::GitHubAccessSubjects;
+            app.selected = 0;
+            app.confirm_remove = false;
         }
         TaskResult::Codex(Ok(())) => {
             app.notice = Some("Codex authentication verified.".into());
@@ -431,6 +477,10 @@ async fn handle_key(
         Screen::GitHubExisting => handle_existing(app, key, sender),
         Screen::GitHubPat => handle_pat(app, key, sender),
         Screen::RepositorySelect => handle_repositories(app, key, sender),
+        Screen::GitHubAccessRepositories => handle_access_repositories(app, key)?,
+        Screen::GitHubAccessSubjects => handle_access_subjects(app, key, sender)?,
+        Screen::GitHubAccessType => handle_access_type(app, key)?,
+        Screen::GitHubAccessForm => handle_access_form(app, key, sender)?,
         Screen::CodexMethod => handle_codex_method(app, terminal, key, sender)?,
         Screen::CodexApiKey => handle_api_key(app, key, sender),
         Screen::Doctor => handle_doctor(app, key, sender),
@@ -564,12 +614,200 @@ fn handle_home(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskR
                 Err(error) => app.error = Some(error.to_string()),
             },
             4 => app.begin_github(),
-            5 => app.begin_codex(),
-            6 => app.begin_plugins(),
+            5 => match Instance::open(app.config_dir.clone()) {
+                Ok(instance) => app.begin_github_access(&instance),
+                Err(error) => app.error = Some(error.to_string()),
+            },
+            6 => app.begin_codex(),
+            7 => app.begin_plugins(),
             _ => {}
         },
         _ => {}
     }
+}
+
+fn configured_github_repositories(instance: &Instance) -> Vec<String> {
+    match instance.config().and_then(|config| config.github.as_ref()) {
+        Some(GitHubInstanceConfig::App { repositories, .. })
+        | Some(GitHubInstanceConfig::Pat { repositories, .. }) => repositories.clone(),
+        None => Vec::new(),
+    }
+}
+
+fn handle_access_repositories(app: &mut App, key: KeyEvent) -> Result<(), SetupError> {
+    let instance = Instance::open(app.config_dir.clone())?;
+    let repositories = configured_github_repositories(&instance);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('b') => {
+            if app.continue_setup_after_access {
+                app.continue_setup_after_access = false;
+                app.begin_codex();
+            } else {
+                app.show_home();
+            }
+        }
+        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Down if !repositories.is_empty() => {
+            app.selected = (app.selected + 1).min(repositories.len() - 1)
+        }
+        KeyCode::Enter if !repositories.is_empty() => {
+            app.access_repository = Some(repositories[app.selected].clone());
+            app.screen = Screen::GitHubAccessSubjects;
+            app.selected = 0;
+            app.confirm_remove = false;
+            app.reset_messages();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_access_subjects(
+    app: &mut App,
+    key: KeyEvent,
+    sender: mpsc::UnboundedSender<TaskResult>,
+) -> Result<(), SetupError> {
+    let repository = app
+        .access_repository
+        .clone()
+        .ok_or_else(|| SetupError::Config("access repository is missing".into()))?;
+    let instance = Instance::open(app.config_dir.clone())?;
+    let subjects = instance.github_access(&repository)?.to_vec();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('b') => {
+            app.screen = Screen::GitHubAccessRepositories;
+            app.selected = 0;
+            app.confirm_remove = false;
+        }
+        KeyCode::Up => {
+            app.selected = app.selected.saturating_sub(1);
+            app.confirm_remove = false;
+        }
+        KeyCode::Down if !subjects.is_empty() => {
+            app.selected = (app.selected + 1).min(subjects.len() - 1);
+            app.confirm_remove = false;
+        }
+        KeyCode::Char('a') => {
+            app.screen = Screen::GitHubAccessType;
+            app.selected = 0;
+            app.confirm_remove = false;
+        }
+        KeyCode::Char('d') if !subjects.is_empty() => {
+            if subjects.len() == 1 && !app.confirm_remove {
+                app.confirm_remove = true;
+                app.notice = Some(
+                    "This is the final trusted subject; press d again to deny all engagement."
+                        .into(),
+                );
+                return Ok(());
+            }
+            let subject = subjects[app.selected].clone();
+            app.busy = Some(format!("Removing {}…", subject.display_name()));
+            let config_dir = app.config_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = Instance::open(config_dir).and_then(|mut instance| {
+                    instance.remove_github_access(&repository, &subject)?;
+                    Ok(format!(
+                        "Removed {} from {repository}.",
+                        subject.display_name()
+                    ))
+                });
+                let _ = sender.send(TaskResult::Access(result));
+            });
+        }
+        _ => app.confirm_remove = false,
+    }
+    Ok(())
+}
+
+fn handle_access_type(app: &mut App, key: KeyEvent) -> Result<(), SetupError> {
+    match key.code {
+        KeyCode::Esc => app.screen = Screen::GitHubAccessSubjects,
+        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Down => app.selected = (app.selected + 1).min(3),
+        KeyCode::Enter => {
+            if app.selected == 3 {
+                app.screen = Screen::GitHubAccessSubjects;
+                app.selected = 0;
+                return Ok(());
+            }
+            let repository = app
+                .access_repository
+                .as_deref()
+                .ok_or_else(|| SetupError::Config("access repository is missing".into()))?;
+            let owner = repository.split_once('/').expect("configured repository").0;
+            app.access_kind = match app.selected {
+                0 => GitHubAccessKind::User,
+                1 => GitHubAccessKind::Organization,
+                2 => GitHubAccessKind::Team,
+                _ => unreachable!(),
+            };
+            app.fields = match app.access_kind {
+                GitHubAccessKind::User => vec![String::new()],
+                GitHubAccessKind::Organization => vec![owner.to_string()],
+                GitHubAccessKind::Team => vec![owner.to_string(), String::new()],
+            };
+            app.field = 0;
+            app.screen = Screen::GitHubAccessForm;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_access_form(
+    app: &mut App,
+    key: KeyEvent,
+    sender: mpsc::UnboundedSender<TaskResult>,
+) -> Result<(), SetupError> {
+    let field_count = app.fields.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = Screen::GitHubAccessType;
+            app.selected = 0;
+        }
+        KeyCode::Tab | KeyCode::Down => app.field = (app.field + 1) % field_count,
+        KeyCode::BackTab | KeyCode::Up => app.field = (app.field + field_count - 1) % field_count,
+        KeyCode::Enter => {
+            let subject = match app.access_kind {
+                GitHubAccessKind::User => GitHubAccessSubject::User {
+                    login: app.fields[0].trim().into(),
+                },
+                GitHubAccessKind::Organization => GitHubAccessSubject::Organization {
+                    login: app.fields[0].trim().into(),
+                },
+                GitHubAccessKind::Team => GitHubAccessSubject::Team {
+                    organization: app.fields[0].trim().into(),
+                    team_slug: app.fields[1].trim().into(),
+                },
+            };
+            if subject.display_name().ends_with(':') || subject.display_name().ends_with('/') {
+                app.error = Some("GitHub access value cannot be empty.".into());
+                return Ok(());
+            }
+            let repository = app
+                .access_repository
+                .clone()
+                .ok_or_else(|| SetupError::Config("access repository is missing".into()))?;
+            app.busy = Some(format!("Validating {}…", subject.display_name()));
+            let config_dir = app.config_dir.clone();
+            tokio::spawn(async move {
+                let result =
+                    match Instance::open(config_dir) {
+                        Ok(mut instance) => instance
+                            .add_github_access(&repository, subject)
+                            .await
+                            .map(|subject| {
+                                format!("Added {} to {repository}.", subject.display_name())
+                            }),
+                        Err(error) => Err(error),
+                    };
+                let _ = sender.send(TaskResult::Access(result));
+            });
+        }
+        _ => edit_field(&mut app.fields[app.field], key, false),
+    }
+    Ok(())
 }
 
 fn handle_plugins(
@@ -1211,6 +1449,44 @@ fn render(frame: &mut Frame, app: &App, instance: &Instance) {
             "Enter load repositories  Tab next  Esc back",
         ),
         Screen::RepositorySelect => render_repositories(frame, vertical[1], app),
+        Screen::GitHubAccessRepositories => {
+            render_access_repositories(frame, vertical[1], app, instance)
+        }
+        Screen::GitHubAccessSubjects => render_access_subjects(frame, vertical[1], app, instance),
+        Screen::GitHubAccessType => render_menu(
+            frame,
+            vertical[1],
+            "Add trusted GitHub identity",
+            &[
+                "User",
+                "Repository owner organization",
+                "Owner team",
+                "Back",
+            ],
+            app.selected,
+        ),
+        Screen::GitHubAccessForm => {
+            let (title, labels): (&str, &[&str]) = match app.access_kind {
+                GitHubAccessKind::User => ("Add trusted user", &["GitHub login"]),
+                GitHubAccessKind::Organization => {
+                    ("Trust repository owner organization", &["Organization"])
+                }
+                GitHubAccessKind::Team => (
+                    "Add trusted organization team",
+                    &["Organization", "Team slug"],
+                ),
+            };
+            render_form(
+                frame,
+                vertical[1],
+                title,
+                labels,
+                &app.fields,
+                app.field,
+                false,
+                "Enter validate and save  Tab next  Esc back\nRunning APIs are recreated automatically so changes apply to new events.",
+            );
+        }
         Screen::CodexMethod => render_menu(
             frame,
             vertical[1],
@@ -1333,6 +1609,20 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
             }
         )),
         Line::from(format!(
+            "Access        {}",
+            config
+                .map(|config| {
+                    let configured = config
+                        .github_access
+                        .values()
+                        .filter(|subjects| !subjects.is_empty())
+                        .count();
+                    let total = config.github_access.len();
+                    format!("{configured}/{total} repositories trusted")
+                })
+                .unwrap_or_else(|| "not configured".into())
+        )),
+        Line::from(format!(
             "Plugin        {}",
             config
                 .and_then(|config| config.active_plugin.as_ref())
@@ -1412,6 +1702,79 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
                 .borders(Borders::ALL),
         ),
         right[1],
+    );
+}
+
+fn render_access_repositories(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
+    let repositories = configured_github_repositories(instance);
+    let items = repositories.iter().map(|repository| {
+        let count = instance
+            .github_access(repository)
+            .map(|subjects| subjects.len())
+            .unwrap_or(0);
+        let status = if count == 0 {
+            "DENY ALL".into()
+        } else {
+            format!("{count} trusted")
+        };
+        ListItem::new(format!("{repository:<40} {status}"))
+    });
+    let mut state = ListState::default();
+    if !repositories.is_empty() {
+        state.select(Some(app.selected.min(repositories.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(" GitHub access by repository ")
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().fg(Color::Cyan)),
+        padded(area, 3, 2),
+        &mut state,
+    );
+}
+
+fn render_access_subjects(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
+    let repository = app.access_repository.as_deref().unwrap_or("unknown");
+    let subjects = instance.github_access(repository).unwrap_or_default();
+    let items: Vec<ListItem> = if subjects.is_empty() {
+        vec![ListItem::new(
+            "DENY ALL — press a to add a trusted identity",
+        )]
+    } else {
+        subjects
+            .iter()
+            .map(|subject| ListItem::new(subject.display_name()))
+            .collect()
+    };
+    let mut state = ListState::default();
+    if !subjects.is_empty() {
+        state.select(Some(app.selected.min(subjects.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(format!(" Trusted identities — {repository} "))
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().fg(Color::Cyan)),
+        padded(area, 3, 2),
+        &mut state,
+    );
+    frame.render_widget(
+        Paragraph::new("a add  d remove  Esc repositories")
+            .style(Style::default().fg(Color::Yellow)),
+        Rect::new(
+            area.x + 4,
+            area.y + area.height.saturating_sub(3),
+            area.width.saturating_sub(8),
+            1,
+        ),
     );
 }
 
@@ -1727,6 +2090,10 @@ mod tests {
             github_flow: GitHubFlow::Pending,
             pending: None,
             installation_id: None,
+            access_repository: None,
+            access_kind: GitHubAccessKind::User,
+            confirm_remove: false,
+            continue_setup_after_access: false,
             pat: None,
             should_quit: false,
             last_refresh: Instant::now(),
@@ -1758,6 +2125,17 @@ mod tests {
         assert_eq!(parse_port("8081", "API port").unwrap(), 8081);
         assert!(parse_port("0", "API port").is_err());
         assert!(parse_port("not-a-port", "API port").is_err());
+    }
+
+    #[test]
+    fn access_team_form_is_scoped_to_repository_owner() {
+        let mut app = app(Screen::GitHubAccessType);
+        app.access_repository = Some("acme/rtl".into());
+        app.selected = 2;
+        handle_access_type(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert_eq!(app.screen, Screen::GitHubAccessForm);
+        assert_eq!(app.access_kind, GitHubAccessKind::Team);
+        assert_eq!(app.fields, vec!["acme", ""]);
     }
 
     #[test]
