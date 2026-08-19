@@ -15,8 +15,9 @@ pub use plugin::{
     PluginWorkItemRegistry,
 };
 pub use policy::{
-    AgentConfig, AgentRoleConfig, AutomationDecision, LifecyclePolicy, PluginFlowSelection, Policy,
-    PolicyError, StageAccessOverride, TaskAccessOverride,
+    AgentConfig, AgentRoleConfig, AutomationDecision, EngagementGate, EngagementPolicy,
+    EngagementRule, EngagementSelector, LifecyclePolicy, PluginFlowSelection, Policy, PolicyError,
+    RepositoryEngagementPolicy, StageAccessOverride, TaskAccessOverride,
 };
 pub use run_result::{
     AgentHandoff, Confidence, Outcome, PluginStageResult, PluginTaskResult, Risk, RunResult,
