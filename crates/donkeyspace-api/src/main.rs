@@ -197,6 +197,19 @@ async fn poll_github_events(
         let repository_payload = client
             .repository(&repository.owner, &repository.name)
             .await?;
+        let repository_input = polled_repository_input(
+            &repository_payload,
+            state
+                .github_auth
+                .as_ref()
+                .and_then(GitHubCredentialProvider::installation_id),
+        )?;
+        let repository_id = upsert_repository(pool, &repository_input).await?;
+        tracing::debug!(
+            repository_id,
+            repository = format_args!("{}/{}", repository_input.owner, repository_input.name),
+            "registered polled github repository"
+        );
         let mut events = client
             .repository_events(&repository.owner, &repository.name, config.max_pages)
             .await?;
@@ -250,6 +263,39 @@ async fn poll_github_events(
         }
     }
     Ok(())
+}
+
+fn polled_repository_input(
+    repository: &Value,
+    installation_id: Option<u64>,
+) -> Result<RepositoryInput, String> {
+    let owner = repository
+        .pointer("/owner/login")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("polled github repository omitted owner.login")?
+        .to_string();
+    let name = repository
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("polled github repository omitted name")?
+        .to_string();
+    let default_branch = repository
+        .get("default_branch")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("polled github repository omitted default_branch")?
+        .to_string();
+
+    Ok(RepositoryInput {
+        installation_external_id: installation_id.map(|value| value.to_string()),
+        installation_account_login: installation_id.map(|_| owner.clone()),
+        provider: "github".to_string(),
+        owner,
+        name,
+        default_branch,
+    })
 }
 
 fn github_poll_event_to_ingress(
@@ -1381,8 +1427,8 @@ mod tests {
     use super::{
         GitHubComment, GitHubIssueWebhook, JobRecord, can_retry_job, comment_is_from_donkeyspace,
         extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
-        issue_number_from_donkeyspace_branch, parse_polled_repositories, should_queue_reviewer,
-        should_queue_triage, webhook_installation_matches,
+        issue_number_from_donkeyspace_branch, parse_polled_repositories, polled_repository_input,
+        should_queue_reviewer, should_queue_triage, webhook_installation_matches,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -1396,6 +1442,40 @@ mod tests {
         assert_eq!(repositories[0].name, "rtl");
         assert!(parse_polled_repositories("missing-owner-separator").is_err());
         assert!(parse_polled_repositories("acme/too/many").is_err());
+    }
+
+    #[test]
+    fn registers_polled_repository_for_configured_installation() {
+        let repository = json!({
+            "name": "empty-repository",
+            "default_branch": "main",
+            "owner": {"login": "example-owner"}
+        });
+
+        let input = polled_repository_input(&repository, Some(42)).unwrap();
+
+        assert_eq!(input.provider, "github");
+        assert_eq!(input.owner, "example-owner");
+        assert_eq!(input.name, "empty-repository");
+        assert_eq!(input.default_branch, "main");
+        assert_eq!(input.installation_external_id.as_deref(), Some("42"));
+        assert_eq!(
+            input.installation_account_login.as_deref(),
+            Some("example-owner")
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_polled_repository_metadata() {
+        let repository = json!({
+            "name": "empty-repository",
+            "owner": {"login": "example-owner"}
+        });
+
+        assert_eq!(
+            polled_repository_input(&repository, Some(42)).unwrap_err(),
+            "polled github repository omitted default_branch"
+        );
     }
 
     #[test]
