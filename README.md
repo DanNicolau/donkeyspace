@@ -183,7 +183,7 @@ DONKEYSPACE_REPO_CONTEXT_MAX_FILES=12
 Useful local endpoints:
 
 - `GET /healthz`
-- Dashboard: `http://localhost:5173`
+- Dashboard: `http://localhost:5173` by default; `donkeyspace status` prints the configured URL
 - `GET /api/runs`
 - `GET /api/outbound-actions`
 - `GET /api/runs/{id}`

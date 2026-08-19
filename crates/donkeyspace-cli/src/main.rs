@@ -22,6 +22,7 @@ struct Cli {
 enum Command {
     Init(InitArgs),
     Connect(ConnectArgs),
+    Configure(ConfigureArgs),
     Doctor,
     Up,
     Down,
@@ -36,6 +37,10 @@ struct InitArgs {
     source_tree: PathBuf,
     #[arg(long, value_enum, default_value_t = SourceArg::LocalBuild)]
     runtime_source: SourceArg,
+    #[arg(long)]
+    api_port: Option<u16>,
+    #[arg(long)]
+    web_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -55,6 +60,25 @@ enum ConnectTarget {
     Github(GitHubArgs),
     Codex(CodexArgs),
     Plugin(ConnectPluginArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigureArgs {
+    #[command(subcommand)]
+    target: ConfigureTarget,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigureTarget {
+    Ports(PortArgs),
+}
+
+#[derive(Debug, Args)]
+struct PortArgs {
+    #[arg(long)]
+    api_port: Option<u16>,
+    #[arg(long)]
+    web_port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
@@ -149,8 +173,10 @@ async fn run() -> Result<(), SetupError> {
                 SourceArg::LocalBuild => RuntimeSource::LocalBuild,
                 SourceArg::RegistryImage => RuntimeSource::RegistryImage,
             };
-            instance.init(args.source_tree, source)?;
+            instance.init_with_ports(args.source_tree, source, args.api_port, args.web_port)?;
             println!("initialized {}", instance.config_path().display());
+            println!("Dashboard: {}", instance.dashboard_url()?);
+            println!("API: {}", instance.api_url()?);
         }
         Command::Connect(args) => match args.target {
             ConnectTarget::Github(args) => {
@@ -198,6 +224,28 @@ async fn run() -> Result<(), SetupError> {
                 println!("plugin connected");
             }
         },
+        Command::Configure(args) => match args.target {
+            ConfigureTarget::Ports(args) => {
+                let stack_running = instance
+                    .deployment_status()
+                    .map(|status| {
+                        status
+                            .services
+                            .iter()
+                            .any(|service| service.state.eq_ignore_ascii_case("running"))
+                    })
+                    .unwrap_or(false);
+                instance.configure_ports(args.api_port, args.web_port)?;
+                println!("ports saved");
+                println!("Dashboard: {}", instance.dashboard_url()?);
+                println!("API: {}", instance.api_url()?);
+                if stack_running {
+                    println!(
+                        "restart required: run `donkeyspace down` followed by `donkeyspace up`"
+                    );
+                }
+            }
+        },
         Command::Doctor => instance.doctor().await?,
         Command::Up => instance.up()?,
         Command::Down => instance.down()?,
@@ -239,4 +287,39 @@ async fn run() -> Result<(), SetupError> {
         Command::Reset(args) => instance.reset(args.delete_data, args.confirm)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_init_and_reconfigure_port_flags() {
+        let init = Cli::try_parse_from([
+            "donkeyspace",
+            "init",
+            "--api-port",
+            "8081",
+            "--web-port",
+            "5174",
+        ])
+        .unwrap();
+        let Some(Command::Init(args)) = init.command else {
+            panic!("expected init command");
+        };
+        assert_eq!(args.api_port, Some(8081));
+        assert_eq!(args.web_port, Some(5174));
+
+        let configure =
+            Cli::try_parse_from(["donkeyspace", "configure", "ports", "--web-port", "5175"])
+                .unwrap();
+        let Some(Command::Configure(ConfigureArgs {
+            target: ConfigureTarget::Ports(args),
+        })) = configure.command
+        else {
+            panic!("expected configure ports command");
+        };
+        assert_eq!(args.api_port, None);
+        assert_eq!(args.web_port, Some(5175));
+    }
 }

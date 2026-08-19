@@ -1,7 +1,7 @@
 # Installation and authentication
 
 The `donkeyspace` CLI and TUI share one reusable setup control plane.
-Instance configuration uses `schema_version = 2` and lives under
+Instance configuration uses `schema_version = 3` and lives under
 `$XDG_CONFIG_HOME/donkeyspace` or `~/.config/donkeyspace` by default. Pass
 `--config-dir` to select a different instance.
 
@@ -50,8 +50,25 @@ donkeyspace doctor
 donkeyspace up
 ```
 
+First-run automation can select stable host ports explicitly:
+
+```sh
+donkeyspace init --source-tree /path/to/donkeyspace \
+  --api-port 8081 --web-port 5174
+```
+
+Interactive setup suggests nearby available ports when the defaults are busy.
+For an existing instance, change either or both ports with:
+
+```sh
+donkeyspace configure ports --api-port 8081 --web-port 5174
+```
+
+Port changes are persisted but do not silently restart a running stack. Run
+`donkeyspace down` followed by `donkeyspace up` to apply them.
+
 `init` is resumable and preserves connection settings. `doctor` is read-only:
-it checks Docker and Compose, required source files, the API port, GitHub
+it checks Docker and Compose, required source files, the API and dashboard ports, GitHub
 repository access, secret permissions, and `codex login status`.
 
 `down` preserves PostgreSQL and Codex/workspace volumes. Deletion requires the
@@ -115,7 +132,9 @@ DONKEYSPACE_GITHUB_TOKEN  # deprecated PAT mode only
 
 App and PAT values are mutually exclusive. The default Compose file binds the
 API and dashboard to localhost, does not publish PostgreSQL, and does not mount
-the Docker socket. Use `docker-compose.dev.yml` for Vite hot reload. The setup
+the Docker socket. The installer writes the configured host bindings through
+`DONKEYSPACE_API_PORT` and `DONKEYSPACE_WEB_PORT`; container-internal ports stay
+fixed. Use `docker-compose.dev.yml` for Vite hot reload. The setup
 control plane generates a private overlay and mounts the Docker socket only on
 the worker when a plugin flow is active.
 The checked-in `.donkeyspace/compose-placeholder` is not a key or webhook

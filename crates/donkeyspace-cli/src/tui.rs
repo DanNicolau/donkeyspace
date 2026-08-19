@@ -1,6 +1,7 @@
 use crate::{
-    CheckLevel, DeploymentStatus, DoctorReport, GitHubInstanceConfig, IngressMode, Instance,
-    PendingGitHubApp, PluginConnectOptions, PluginEnvironmentInput, RuntimeSource, SetupError,
+    CheckLevel, DEFAULT_API_PORT, DEFAULT_WEB_PORT, DeploymentStatus, DoctorReport,
+    GitHubInstanceConfig, IngressMode, Instance, PendingGitHubApp, PluginConnectOptions,
+    PluginEnvironmentInput, RuntimeSource, SetupError, suggest_available_port,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -28,6 +29,7 @@ const HOME_ACTIONS: &[&str] = &[
     "Run doctor",
     "Start Donkeyspace",
     "Stop Donkeyspace",
+    "Configure ports",
     "Configure GitHub",
     "Configure Codex",
     "Manage plugins",
@@ -37,6 +39,7 @@ const HOME_ACTIONS: &[&str] = &[
 enum Screen {
     Init,
     Home,
+    Ports,
     GitHubMethod,
     GitHubManifest,
     GitHubInstall,
@@ -99,6 +102,7 @@ struct App {
 impl App {
     fn new(instance: &Instance, config_dir: Option<PathBuf>) -> Result<Self, SetupError> {
         let pending = instance.pending_github_app()?;
+        let initialized = instance.is_initialized();
         let screen = if !instance.is_initialized() {
             Screen::Init
         } else if pending.is_some() {
@@ -106,17 +110,35 @@ impl App {
         } else {
             Screen::Home
         };
+        let (fields, port_notice) = if initialized {
+            (vec![String::new()], None)
+        } else {
+            let api_port =
+                suggest_available_port(DEFAULT_API_PORT, &[]).unwrap_or(DEFAULT_API_PORT);
+            let web_port =
+                suggest_available_port(DEFAULT_WEB_PORT, &[api_port]).unwrap_or(DEFAULT_WEB_PORT);
+            let notice = (api_port != DEFAULT_API_PORT || web_port != DEFAULT_WEB_PORT).then(|| {
+                format!(
+                    "Default ports were busy; suggested API {api_port} and dashboard {web_port}."
+                )
+            });
+            (
+                vec![String::new(), api_port.to_string(), web_port.to_string()],
+                notice,
+            )
+        };
         Ok(Self {
             config_dir,
             screen,
             selected: 0,
-            fields: vec![String::new()],
+            fields,
             field: 0,
             webhook: false,
             busy: None,
             notice: pending
                 .as_ref()
-                .map(|pending| format!("Resume installation of GitHub App `{}`.", pending.slug)),
+                .map(|pending| format!("Resume installation of GitHub App `{}`.", pending.slug))
+                .or(port_notice),
             error: None,
             status: DeploymentStatus { services: vec![] },
             doctor: None,
@@ -160,6 +182,17 @@ impl App {
     fn begin_plugins(&mut self) {
         self.screen = Screen::Plugins;
         self.selected = 0;
+        self.reset_messages();
+    }
+
+    fn begin_ports(&mut self, instance: &Instance) {
+        let Some(config) = instance.config() else {
+            self.error = Some("Instance is not initialized.".into());
+            return;
+        };
+        self.screen = Screen::Ports;
+        self.fields = vec![config.api_port.to_string(), config.web_port.to_string()];
+        self.field = 0;
         self.reset_messages();
     }
 
@@ -391,6 +424,7 @@ async fn handle_key(
     match app.screen {
         Screen::Init => handle_init(app, key)?,
         Screen::Home => handle_home(app, key, sender),
+        Screen::Ports => handle_ports(app, key)?,
         Screen::GitHubMethod => handle_github_method(app, key),
         Screen::GitHubManifest => handle_manifest_form(app, key, sender),
         Screen::GitHubInstall => handle_install(app, key, sender),
@@ -408,21 +442,96 @@ async fn handle_key(
 
 fn handle_init(app: &mut App, key: KeyEvent) -> Result<(), SetupError> {
     match key.code {
+        KeyCode::Tab | KeyCode::Down => app.field = (app.field + 1) % 3,
+        KeyCode::BackTab | KeyCode::Up => app.field = (app.field + 2) % 3,
         KeyCode::Enter => {
             let source = if app.fields[0].trim().is_empty() {
                 PathBuf::from(".")
             } else {
                 PathBuf::from(app.fields[0].trim())
             };
+            let api_port = match parse_port(&app.fields[1], "API port") {
+                Ok(port) => port,
+                Err(error) => {
+                    app.error = Some(error);
+                    return Ok(());
+                }
+            };
+            let web_port = match parse_port(&app.fields[2], "Dashboard port") {
+                Ok(port) => port,
+                Err(error) => {
+                    app.error = Some(error);
+                    return Ok(());
+                }
+            };
             let mut instance = Instance::open(app.config_dir.clone())?;
-            instance.init(source, RuntimeSource::LocalBuild)?;
+            if let Err(error) = instance.init_with_ports(
+                source,
+                RuntimeSource::LocalBuild,
+                Some(api_port),
+                Some(web_port),
+            ) {
+                app.error = Some(error.to_string());
+                return Ok(());
+            }
             app.notice = Some("Instance initialized with local-build runtime.".into());
             app.begin_github();
         }
         KeyCode::Esc => app.should_quit = true,
-        _ => edit_field(&mut app.fields[0], key, false),
+        _ => edit_field(&mut app.fields[app.field], key, false),
     }
     Ok(())
+}
+
+fn handle_ports(app: &mut App, key: KeyEvent) -> Result<(), SetupError> {
+    match key.code {
+        KeyCode::Esc => app.show_home(),
+        KeyCode::Tab | KeyCode::Down => app.field = (app.field + 1) % 2,
+        KeyCode::BackTab | KeyCode::Up => app.field = (app.field + 1) % 2,
+        KeyCode::Enter => {
+            let api_port = match parse_port(&app.fields[0], "API port") {
+                Ok(port) => port,
+                Err(error) => {
+                    app.error = Some(error);
+                    return Ok(());
+                }
+            };
+            let web_port = match parse_port(&app.fields[1], "Dashboard port") {
+                Ok(port) => port,
+                Err(error) => {
+                    app.error = Some(error);
+                    return Ok(());
+                }
+            };
+            let stack_running = app
+                .status
+                .services
+                .iter()
+                .any(|service| service.state.eq_ignore_ascii_case("running"));
+            let mut instance = Instance::open(app.config_dir.clone())?;
+            if let Err(error) = instance.configure_ports(Some(api_port), Some(web_port)) {
+                app.error = Some(error.to_string());
+                return Ok(());
+            }
+            app.show_home();
+            app.notice = Some(if stack_running {
+                "Ports saved. Stop and start Donkeyspace to apply them.".into()
+            } else {
+                "Ports saved.".into()
+            });
+        }
+        _ => edit_field(&mut app.fields[app.field], key, false),
+    }
+    Ok(())
+}
+
+fn parse_port(value: &str, label: &str) -> Result<u16, String> {
+    value
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| format!("{label} must be between 1 and 65535."))
 }
 
 fn handle_home(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskResult>) {
@@ -450,9 +559,13 @@ fn handle_home(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskR
                 app.busy = Some("Stopping services…".into());
                 spawn_operation(app.config_dir.clone(), sender, "stop");
             }
-            3 => app.begin_github(),
-            4 => app.begin_codex(),
-            5 => app.begin_plugins(),
+            3 => match Instance::open(app.config_dir.clone()) {
+                Ok(instance) => app.begin_ports(&instance),
+                Err(error) => app.error = Some(error.to_string()),
+            },
+            4 => app.begin_github(),
+            5 => app.begin_codex(),
+            6 => app.begin_plugins(),
             _ => {}
         },
         _ => {}
@@ -1035,13 +1148,23 @@ fn render(frame: &mut Frame, app: &App, instance: &Instance) {
             frame,
             vertical[1],
             "Initialize",
-            &["Source tree"],
+            &["Source tree", "API port", "Dashboard port"],
             &app.fields,
             app.field,
             false,
             "Enter initialize  Esc quit",
         ),
         Screen::Home => render_home(frame, vertical[1], app, instance),
+        Screen::Ports => render_form(
+            frame,
+            vertical[1],
+            "Configure host ports",
+            &["API port", "Dashboard port"],
+            &app.fields,
+            app.field,
+            false,
+            "Enter save  Tab next  Esc back\nChanging a running stack requires a stop and start.",
+        ),
         Screen::GitHubMethod => render_menu(
             frame,
             vertical[1],
@@ -1215,6 +1338,18 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
                 .and_then(|config| config.active_plugin.as_ref())
                 .map(|plugin| format!("{}:{}", plugin.id, plugin.flow))
                 .unwrap_or_else(|| "default lifecycle".into())
+        )),
+        Line::from(format!(
+            "Dashboard     {}",
+            config
+                .map(|config| format!("http://127.0.0.1:{}", config.web_port))
+                .unwrap_or_else(|| "not configured".into())
+        )),
+        Line::from(format!(
+            "API           {}",
+            config
+                .map(|config| format!("http://127.0.0.1:{}", config.api_port))
+                .unwrap_or_else(|| "not configured".into())
         )),
         Line::from(""),
         Line::styled(
@@ -1616,6 +1751,26 @@ mod tests {
             );
         }
         assert_eq!(app.selected, HOME_ACTIONS.len() - 1);
+    }
+
+    #[test]
+    fn validates_port_fields() {
+        assert_eq!(parse_port("8081", "API port").unwrap(), 8081);
+        assert!(parse_port("0", "API port").is_err());
+        assert!(parse_port("not-a-port", "API port").is_err());
+    }
+
+    #[test]
+    fn uninitialized_app_prefills_distinct_available_ports() {
+        let directory =
+            std::env::temp_dir().join(format!("donkeyspace-tui-port-test-{}", std::process::id()));
+        let instance = Instance::open(Some(directory)).unwrap();
+        let app = App::new(&instance, None).unwrap();
+        assert_eq!(app.screen, Screen::Init);
+        assert_eq!(app.fields.len(), 3);
+        assert_ne!(app.fields[1], app.fields[2]);
+        assert!(parse_port(&app.fields[1], "API port").is_ok());
+        assert!(parse_port(&app.fields[2], "Dashboard port").is_ok());
     }
 
     #[test]
