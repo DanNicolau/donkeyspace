@@ -32,7 +32,7 @@ checks:
     - name: "diff whitespace"
       command: ["git", "diff", "--check"]
     - name: "rust tests"
-      command: ["cargo", "test", "--workspace"]
+      command: ["sh", "-lc", "test ! -f Cargo.toml || cargo test --workspace"]
     - name: "dashboard build"
       command: ["sh", "-lc", "test ! -f web/package.json || (cd web && npm install && npm run build)"]
   require_github_checks: false
