@@ -20,19 +20,22 @@ services:
     environment: &github-environment
       DONKEYSPACE_BIND_ADDR: 0.0.0.0:8080
       DONKEYSPACE_DATABASE_URL: postgres://donkeyspace:donkeyspace@postgres:5432/donkeyspace
-      DONKEYSPACE_POLICY_PATH: .donkeyspace/policy.yml
+      DONKEYSPACE_POLICY_PATH: /run/donkeyspace/policy.yml
       DONKEYSPACE_GITHUB_AUTH_MODE: ${DONKEYSPACE_GITHUB_AUTH_MODE:-}
       DONKEYSPACE_GITHUB_APP_ID: ${DONKEYSPACE_GITHUB_APP_ID:-}
       DONKEYSPACE_GITHUB_INSTALLATION_ID: ${DONKEYSPACE_GITHUB_INSTALLATION_ID:-}
       DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE: ${DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE:-}
       DONKEYSPACE_GITHUB_TOKEN: ${DONKEYSPACE_GITHUB_TOKEN:-}
       DONKEYSPACE_GITHUB_POLL_REPOSITORIES: ${DONKEYSPACE_GITHUB_POLL_REPOSITORIES:-}
+      DONKEYSPACE_GITHUB_REPOSITORIES: ${DONKEYSPACE_GITHUB_REPOSITORIES:-}
       DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS: ${DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS:-60}
       DONKEYSPACE_GITHUB_POLL_MAX_PAGES: ${DONKEYSPACE_GITHUB_POLL_MAX_PAGES:-2}
       DONKEYSPACE_WEBHOOK_SECRET_FILE: ${DONKEYSPACE_WEBHOOK_SECRET_FILE:-}
       RUST_LOG: ${RUST_LOG:-donkeyspace=info,tower_http=info}
     ports:
       - "127.0.0.1:${DONKEYSPACE_API_PORT:-8080}:8080"
+    volumes:
+      - ${DONKEYSPACE_POLICY_SOURCE:-./.donkeyspace/policy.yml}:/run/donkeyspace/policy.yml:ro
     secrets:
       - github_private_key
       - github_webhook_secret
@@ -62,6 +65,7 @@ services:
       DONKEYSPACE_REPAIR_RECONCILE_LIMIT: ${DONKEYSPACE_REPAIR_RECONCILE_LIMIT:-1}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     volumes:
+      - ${DONKEYSPACE_POLICY_SOURCE:-./.donkeyspace/policy.yml}:/run/donkeyspace/policy.yml:ro
       - ${DONKEYSPACE_CODEX_HOME_SOURCE:-codex-home}:/root/.codex
       - donkeyspace-workspaces:/workspaces
     secrets:

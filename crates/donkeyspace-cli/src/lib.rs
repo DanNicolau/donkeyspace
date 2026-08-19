@@ -1,3 +1,4 @@
+use donkeyspace_core::EngagementSelector;
 use donkeyspace_github::{
     GitHubAuthConfig, GitHubCredentialProvider, GitHubRepository, discover_installation_id,
 };
@@ -17,7 +18,7 @@ mod plugins;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
 const PORT_SUGGESTION_ATTEMPTS: u16 = 100;
@@ -69,9 +70,57 @@ pub struct InstanceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GitHubInstanceConfig>,
     #[serde(default)]
+    pub github_access: BTreeMap<String, Vec<GitHubAccessSubject>>,
+    #[serde(default)]
     pub plugins: BTreeMap<String, InstalledPlugin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_plugin: Option<ActivePlugin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum GitHubAccessSubject {
+    User {
+        login: String,
+    },
+    Organization {
+        login: String,
+    },
+    Team {
+        organization: String,
+        team_slug: String,
+    },
+}
+
+impl GitHubAccessSubject {
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::User { login } => format!("user:{login}"),
+            Self::Organization { login } => format!("organization:{login}"),
+            Self::Team {
+                organization,
+                team_slug,
+            } => format!("team:{organization}/{team_slug}"),
+        }
+    }
+
+    fn selector(&self) -> EngagementSelector {
+        match self {
+            Self::User { login } => EngagementSelector::User {
+                login: login.clone(),
+            },
+            Self::Organization { login } => EngagementSelector::OrganizationMember {
+                organization: login.clone(),
+            },
+            Self::Team {
+                organization,
+                team_slug,
+            } => EngagementSelector::TeamMember {
+                organization: organization.clone(),
+                team_slug: team_slug.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,7 +276,8 @@ impl Instance {
             let bytes = fs::read(&path)?;
             let mut config: InstanceConfig = serde_json::from_slice(&bytes)?;
             let migrated = match config.schema_version {
-                1 | 2 => {
+                1 | 2 | 3 => {
+                    reconcile_github_access(&mut config);
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
@@ -304,6 +354,7 @@ impl Instance {
                 web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
                 codex_home: None,
                 github: None,
+                github_access: BTreeMap::new(),
                 plugins: BTreeMap::new(),
                 active_plugin: None,
             },
@@ -370,6 +421,100 @@ impl Instance {
             "http://127.0.0.1:{}",
             self.require_config()?.web_port
         ))
+    }
+
+    pub fn github_access(&self, repository: &str) -> Result<&[GitHubAccessSubject], SetupError> {
+        let config = self.require_config()?;
+        let repository = configured_repository(config, repository)?;
+        Ok(config
+            .github_access
+            .get(repository)
+            .map(Vec::as_slice)
+            .unwrap_or_default())
+    }
+
+    pub async fn add_github_access(
+        &mut self,
+        repository: &str,
+        subject: GitHubAccessSubject,
+    ) -> Result<GitHubAccessSubject, SetupError> {
+        let repository = configured_repository(self.require_config()?, repository)?.to_string();
+        let owner = repository.split_once('/').expect("validated repository").0;
+        validate_subject_owner(owner, &subject)?;
+        let provider = self.github_credential_provider()?;
+        let subject = match subject {
+            GitHubAccessSubject::User { login } => GitHubAccessSubject::User {
+                login: provider.client().canonical_user_login(login.trim()).await?,
+            },
+            GitHubAccessSubject::Organization { login } => {
+                provider.validate_members_permission().await?;
+                GitHubAccessSubject::Organization {
+                    login: provider
+                        .client()
+                        .canonical_organization_login(login.trim())
+                        .await?,
+                }
+            }
+            GitHubAccessSubject::Team {
+                organization,
+                team_slug,
+            } => {
+                provider.validate_members_permission().await?;
+                let team_slug = provider
+                    .client()
+                    .canonical_team_slug(organization.trim(), team_slug.trim())
+                    .await?;
+                GitHubAccessSubject::Team {
+                    organization: owner.to_string(),
+                    team_slug,
+                }
+            }
+        };
+        validate_subject_owner(owner, &subject)?;
+        let entries = self
+            .config
+            .as_mut()
+            .expect("configuration was validated")
+            .github_access
+            .entry(repository)
+            .or_default();
+        if entries
+            .iter()
+            .any(|existing| subjects_equal(existing, &subject))
+        {
+            return Err(SetupError::Config(format!(
+                "GitHub access `{}` is already configured",
+                subject.display_name()
+            )));
+        }
+        entries.push(subject.clone());
+        entries.sort_by_key(GitHubAccessSubject::display_name);
+        self.save_and_apply_github_access()?;
+        Ok(subject)
+    }
+
+    pub fn remove_github_access(
+        &mut self,
+        repository: &str,
+        subject: &GitHubAccessSubject,
+    ) -> Result<(), SetupError> {
+        let repository = configured_repository(self.require_config()?, repository)?.to_string();
+        let entries = self
+            .config
+            .as_mut()
+            .expect("configuration was validated")
+            .github_access
+            .entry(repository)
+            .or_default();
+        let previous = entries.len();
+        entries.retain(|existing| !subjects_equal(existing, subject));
+        if entries.len() == previous {
+            return Err(SetupError::Config(format!(
+                "GitHub access `{}` is not configured",
+                subject.display_name()
+            )));
+        }
+        self.save_and_apply_github_access()
     }
 
     pub fn pending_github_app(&self) -> Result<Option<PendingGitHubApp>, SetupError> {
@@ -492,6 +637,7 @@ impl Instance {
             repositories,
             ingress: pending.ingress,
         });
+        reconcile_github_access(self.config.as_mut().unwrap());
         self.save()?;
         self.discard_pending_github_app()?;
         Ok(())
@@ -545,6 +691,7 @@ impl Instance {
             repositories,
             ingress,
         });
+        reconcile_github_access(self.config.as_mut().unwrap());
         self.save()
     }
 
@@ -678,6 +825,7 @@ impl Instance {
             }
         };
         self.config.as_mut().unwrap().github = Some(github);
+        reconcile_github_access(self.config.as_mut().unwrap());
         self.save()?;
         println!("GitHub connection saved and validated");
         Ok(())
@@ -839,6 +987,15 @@ impl Instance {
                             private_key_file: private_key_file.clone(),
                         })?;
                         provider.validate_installation().await?;
+                        if config.github_access.values().flatten().any(|subject| {
+                            matches!(
+                                subject,
+                                GitHubAccessSubject::Organization { .. }
+                                    | GitHubAccessSubject::Team { .. }
+                            )
+                        }) {
+                            provider.validate_members_permission().await?;
+                        }
                         for repository in repositories {
                             let (owner, repo) = repository
                                 .split_once('/')
@@ -859,6 +1016,26 @@ impl Instance {
                 name: "GitHub connection".into(),
                 level: CheckLevel::Warning,
                 detail: "not connected".into(),
+            });
+        }
+        for repository in github_repositories(config) {
+            let subjects = config
+                .github_access
+                .get(repository)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            checks.push(DoctorCheck {
+                name: format!("GitHub access {repository}"),
+                level: if subjects.is_empty() {
+                    CheckLevel::Fail
+                } else {
+                    CheckLevel::Pass
+                },
+                detail: if subjects.is_empty() {
+                    "deny all: add a trusted user, organization, or team".into()
+                } else {
+                    format!("{} trusted subject(s)", subjects.len())
+                },
             });
         }
         checks.push(command_doctor_check(
@@ -1007,6 +1184,46 @@ impl Instance {
         Ok(())
     }
 
+    fn save_and_apply_github_access(&self) -> Result<(), SetupError> {
+        self.save()?;
+        let running = self
+            .deployment_status()
+            .map(|status| status.service_running("api"))
+            .unwrap_or(false);
+        if running {
+            self.compose_captured(&["up", "-d", "--force-recreate", "api"])
+                .map_err(|error| {
+                    SetupError::Config(format!(
+                        "access was saved but the API restart failed; run `donkeyspace down` then `donkeyspace up`: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn github_credential_provider(&self) -> Result<GitHubCredentialProvider, SetupError> {
+        match self.require_config()?.github.as_ref() {
+            Some(GitHubInstanceConfig::App {
+                app_id,
+                installation_id,
+                private_key_file,
+                ..
+            }) => Ok(GitHubCredentialProvider::new(GitHubAuthConfig::App {
+                app_id: *app_id,
+                installation_id: *installation_id,
+                private_key_file: private_key_file.clone(),
+            })?),
+            Some(GitHubInstanceConfig::Pat { token_file, .. }) => {
+                Ok(GitHubCredentialProvider::new(GitHubAuthConfig::Pat {
+                    token: fs::read_to_string(token_file)?.trim().to_string(),
+                })?)
+            }
+            None => Err(SetupError::Config(
+                "GitHub is not connected; configure GitHub first".into(),
+            )),
+        }
+    }
+
     fn compose_command(&self, arguments: &[&str]) -> Result<Command, SetupError> {
         let config = self.require_config()?;
         self.write_compose_env(config)?;
@@ -1035,6 +1252,10 @@ impl Instance {
         let mut lines = vec![
             format!("DONKEYSPACE_API_PORT={}", config.api_port),
             format!("DONKEYSPACE_WEB_PORT={}", config.web_port),
+            format!(
+                "DONKEYSPACE_POLICY_SOURCE={}",
+                self.directory.join("effective-policy.yml").display()
+            ),
         ];
         if let Some(codex_home) = &config.codex_home {
             lines.push(format!(
@@ -1067,6 +1288,7 @@ impl Instance {
                             webhook_secret_file.display()
                         ),
                         "DONKEYSPACE_WEBHOOK_SECRET_FILE=/run/secrets/github_webhook_secret".into(),
+                        format!("DONKEYSPACE_GITHUB_REPOSITORIES={}", repositories.join(",")),
                         format!(
                             "DONKEYSPACE_GITHUB_POLL_REPOSITORIES={}",
                             if matches!(ingress, IngressMode::Polling) {
@@ -1083,6 +1305,7 @@ impl Instance {
                     ..
                 } => lines.extend([
                     "DONKEYSPACE_GITHUB_AUTH_MODE=pat".into(),
+                    format!("DONKEYSPACE_GITHUB_REPOSITORIES={}", repositories.join(",")),
                     format!(
                         "DONKEYSPACE_GITHUB_POLL_REPOSITORIES={}",
                         if matches!(ingress, IngressMode::Polling) {
@@ -1262,6 +1485,72 @@ fn validate_repositories(repositories: &[String]) -> Result<(), SetupError> {
     Ok(())
 }
 
+fn github_repositories(config: &InstanceConfig) -> &[String] {
+    match config.github.as_ref() {
+        Some(GitHubInstanceConfig::App { repositories, .. })
+        | Some(GitHubInstanceConfig::Pat { repositories, .. }) => repositories,
+        None => &[],
+    }
+}
+
+fn reconcile_github_access(config: &mut InstanceConfig) {
+    let repositories = github_repositories(config).to_vec();
+    config.github_access.retain(|repository, _| {
+        repositories
+            .iter()
+            .any(|selected| selected.eq_ignore_ascii_case(repository))
+    });
+    for repository in repositories {
+        if !config
+            .github_access
+            .keys()
+            .any(|existing| existing.eq_ignore_ascii_case(&repository))
+        {
+            config.github_access.insert(repository, Vec::new());
+        }
+    }
+}
+
+fn configured_repository<'a>(
+    config: &'a InstanceConfig,
+    requested: &str,
+) -> Result<&'a str, SetupError> {
+    github_repositories(config)
+        .iter()
+        .find(|repository| repository.eq_ignore_ascii_case(requested.trim()))
+        .map(String::as_str)
+        .ok_or_else(|| {
+            SetupError::Config(format!(
+                "repository `{requested}` is not selected for this instance"
+            ))
+        })
+}
+
+fn validate_subject_owner(owner: &str, subject: &GitHubAccessSubject) -> Result<(), SetupError> {
+    let subject_owner = match subject {
+        GitHubAccessSubject::User { login } => {
+            if login.trim().is_empty() {
+                return Err(SetupError::Config("GitHub user cannot be empty".into()));
+            }
+            return Ok(());
+        }
+        GitHubAccessSubject::Organization { login } => login,
+        GitHubAccessSubject::Team { organization, .. } => organization,
+    };
+    if subject_owner.eq_ignore_ascii_case(owner) {
+        Ok(())
+    } else {
+        Err(SetupError::Config(format!(
+            "organization and team access must use repository owner `{owner}`"
+        )))
+    }
+}
+
+fn subjects_equal(left: &GitHubAccessSubject, right: &GitHubAccessSubject) -> bool {
+    left.display_name()
+        .eq_ignore_ascii_case(&right.display_name())
+}
+
 fn remove_file_if_present(path: &Path) -> Result<(), SetupError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1380,7 +1669,8 @@ fn github_app_manifest(state: &str, callback_url: &str, ingress: &IngressMode) -
         "redirect_url": callback_url,
         "public": false,
         "default_permissions": {
-            "metadata": "read", "contents": "write", "issues": "write", "pull_requests": "write"
+            "metadata": "read", "contents": "write", "issues": "write",
+            "pull_requests": "write", "members": "read"
         },
         "default_events": ["issues", "issue_comment", "pull_request", "push"]
     })
@@ -1745,6 +2035,7 @@ mod tests {
             "https://example.com/github/events"
         );
         assert_eq!(manifest["redirect_url"], "http://127.0.0.1:8787/callback");
+        assert_eq!(manifest["default_permissions"]["members"], "read");
     }
 
     #[test]
@@ -1798,7 +2089,7 @@ mod tests {
     #[test]
     fn instance_config_never_serializes_secret_values() {
         let config = InstanceConfig {
-            schema_version: 3,
+            schema_version: SCHEMA_VERSION,
             source_tree: "/src".into(),
             runtime_source: RuntimeSource::LocalBuild,
             api_port: 8080,
@@ -1809,6 +2100,7 @@ mod tests {
                 repositories: vec!["owner/repo".into()],
                 ingress: IngressMode::Polling,
             }),
+            github_access: BTreeMap::from([("owner/repo".into(), Vec::new())]),
             plugins: BTreeMap::new(),
             active_plugin: None,
         };
@@ -1823,7 +2115,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for schema_version in [1, 2] {
+        for schema_version in [1, 2, 3] {
             let directory =
                 env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
             fs::create_dir_all(&directory).unwrap();
@@ -1841,13 +2133,14 @@ mod tests {
             .unwrap();
             let instance = Instance::open(Some(directory.clone())).unwrap();
             let config = instance.config().unwrap();
-            assert_eq!(config.schema_version, 3);
+            assert_eq!(config.schema_version, SCHEMA_VERSION);
             assert_eq!(config.web_port, 5173);
             assert!(config.plugins.is_empty());
             assert!(config.active_plugin.is_none());
+            assert!(config.github_access.is_empty());
             let saved: Value =
                 serde_json::from_slice(&fs::read(directory.join(CONFIG_FILE)).unwrap()).unwrap();
-            assert_eq!(saved["schema_version"], 3);
+            assert_eq!(saved["schema_version"], SCHEMA_VERSION);
             assert_eq!(saved["web_port"], 5173);
             assert!(!directory.join(".instance.json.tmp").exists());
             fs::remove_dir_all(directory).unwrap();
@@ -1866,6 +2159,45 @@ mod tests {
     }
 
     #[test]
+    fn repository_access_is_reconciled_and_owner_scoped() {
+        let mut config = InstanceConfig {
+            schema_version: SCHEMA_VERSION,
+            source_tree: "/src".into(),
+            runtime_source: RuntimeSource::LocalBuild,
+            api_port: 8080,
+            web_port: 5173,
+            codex_home: None,
+            github: Some(GitHubInstanceConfig::Pat {
+                token_file: "/secret".into(),
+                repositories: vec!["acme/rtl".into(), "acme/dv".into()],
+                ingress: IngressMode::Polling,
+            }),
+            github_access: BTreeMap::from([(
+                "old/repo".into(),
+                vec![GitHubAccessSubject::User {
+                    login: "stale".into(),
+                }],
+            )]),
+            plugins: BTreeMap::new(),
+            active_plugin: None,
+        };
+        reconcile_github_access(&mut config);
+        assert_eq!(config.github_access.len(), 2);
+        assert!(config.github_access["acme/rtl"].is_empty());
+        assert!(config.github_access["acme/dv"].is_empty());
+        assert!(
+            validate_subject_owner(
+                "acme",
+                &GitHubAccessSubject::Team {
+                    organization: "other".into(),
+                    team_slug: "maintainers".into(),
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn startup_port_validation_distinguishes_stack_services_from_conflicts() {
         let config = InstanceConfig {
             schema_version: SCHEMA_VERSION,
@@ -1875,6 +2207,7 @@ mod tests {
             web_port: 5173,
             codex_home: None,
             github: None,
+            github_access: BTreeMap::new(),
             plugins: BTreeMap::new(),
             active_plugin: None,
         };
@@ -1913,6 +2246,7 @@ mod tests {
                 web_port: 15_173,
                 codex_home: None,
                 github: None,
+                github_access: BTreeMap::new(),
                 plugins: BTreeMap::new(),
                 active_plugin: None,
             }),
@@ -1924,6 +2258,7 @@ mod tests {
         let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
         assert!(environment.contains("DONKEYSPACE_API_PORT=18080\n"));
         assert!(environment.contains("DONKEYSPACE_WEB_PORT=15173\n"));
+        assert!(environment.contains("DONKEYSPACE_POLICY_SOURCE="));
         fs::remove_dir_all(directory).unwrap();
     }
 

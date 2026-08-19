@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use donkeyspace_cli::{
-    CodexLoginMethod, ConnectGitHubOptions, Instance, PluginConnectOptions, PluginEnvironmentInput,
-    RuntimeSource, SetupError,
+    CodexLoginMethod, ConnectGitHubOptions, GitHubAccessSubject, Instance, PluginConnectOptions,
+    PluginEnvironmentInput, RuntimeSource, SetupError,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -71,6 +71,57 @@ struct ConfigureArgs {
 #[derive(Debug, Subcommand)]
 enum ConfigureTarget {
     Ports(PortArgs),
+    GithubAccess(GitHubAccessArgs),
+}
+
+#[derive(Debug, Args)]
+struct GitHubAccessArgs {
+    #[arg(long)]
+    repository: String,
+    #[command(subcommand)]
+    command: GitHubAccessCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum GitHubAccessCommand {
+    List,
+    Add(AccessSubjectArgs),
+    Remove(AccessSubjectArgs),
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct AccessSubjectArgs {
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    organization: Option<String>,
+    #[arg(long, value_name = "ORG/TEAM-SLUG")]
+    team: Option<String>,
+}
+
+impl AccessSubjectArgs {
+    fn subject(self) -> Result<GitHubAccessSubject, SetupError> {
+        match (self.user, self.organization, self.team) {
+            (Some(login), None, None) => Ok(GitHubAccessSubject::User { login }),
+            (None, Some(login), None) => Ok(GitHubAccessSubject::Organization { login }),
+            (None, None, Some(team)) => {
+                let (organization, team_slug) = team
+                    .split_once('/')
+                    .ok_or_else(|| SetupError::Config("--team must use ORG/TEAM-SLUG".into()))?;
+                if organization.is_empty() || team_slug.is_empty() || team_slug.contains('/') {
+                    return Err(SetupError::Config("--team must use ORG/TEAM-SLUG".into()));
+                }
+                Ok(GitHubAccessSubject::Team {
+                    organization: organization.into(),
+                    team_slug: team_slug.into(),
+                })
+            }
+            _ => Err(SetupError::Config(
+                "provide exactly one of --user, --organization, or --team".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -245,6 +296,35 @@ async fn run() -> Result<(), SetupError> {
                     );
                 }
             }
+            ConfigureTarget::GithubAccess(args) => match args.command {
+                GitHubAccessCommand::List => {
+                    let subjects = instance.github_access(&args.repository)?;
+                    if subjects.is_empty() {
+                        println!("deny all: no trusted subjects configured");
+                    }
+                    for subject in subjects {
+                        println!("{}", subject.display_name());
+                    }
+                }
+                GitHubAccessCommand::Add(subject) => {
+                    let subject = instance
+                        .add_github_access(&args.repository, subject.subject()?)
+                        .await?;
+                    println!("added {} to {}", subject.display_name(), args.repository);
+                }
+                GitHubAccessCommand::Remove(subject) => {
+                    let subject = subject.subject()?;
+                    instance.remove_github_access(&args.repository, &subject)?;
+                    println!(
+                        "removed {} from {}",
+                        subject.display_name(),
+                        args.repository
+                    );
+                    if instance.github_access(&args.repository)?.is_empty() {
+                        println!("warning: repository now denies all engagement");
+                    }
+                }
+            },
         },
         Command::Doctor => instance.doctor().await?,
         Command::Up => instance.up()?,
@@ -321,5 +401,37 @@ mod tests {
         };
         assert_eq!(args.api_port, None);
         assert_eq!(args.web_port, Some(5175));
+    }
+
+    #[test]
+    fn parses_repository_access_subjects() {
+        let cli = Cli::try_parse_from([
+            "donkeyspace",
+            "configure",
+            "github-access",
+            "--repository",
+            "acme/rtl",
+            "add",
+            "--team",
+            "acme/hardware",
+        ])
+        .unwrap();
+        let Some(Command::Configure(ConfigureArgs {
+            target: ConfigureTarget::GithubAccess(args),
+        })) = cli.command
+        else {
+            panic!("expected GitHub access command");
+        };
+        assert_eq!(args.repository, "acme/rtl");
+        let GitHubAccessCommand::Add(subject) = args.command else {
+            panic!("expected add command");
+        };
+        assert_eq!(
+            subject.subject().unwrap(),
+            GitHubAccessSubject::Team {
+                organization: "acme".into(),
+                team_slug: "hardware".into(),
+            }
+        );
     }
 }

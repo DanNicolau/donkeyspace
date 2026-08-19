@@ -1,7 +1,7 @@
 use crate::{
     ActivePlugin, InstalledPlugin, Instance, PluginFlowClass, SetupError, run_status, write_secret,
 };
-use donkeyspace_core::{PluginFlowSelection, PluginManifest, Policy};
+use donkeyspace_core::{PluginFlowSelection, PluginManifest, Policy, RepositoryEngagementPolicy};
 use serde::Serialize;
 use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
 
@@ -193,7 +193,21 @@ impl Instance {
 
     pub(crate) fn write_plugin_runtime_files(&self) -> Result<(), SetupError> {
         let config = self.require_config()?;
+        let base_policy_path = config.source_tree.join(".donkeyspace/policy.yml");
+        let mut policy = Policy::from_yaml(&fs::read_to_string(&base_policy_path)?)
+            .map_err(|error| SetupError::Config(error.to_string()))?;
+        for (repository, subjects) in &config.github_access {
+            let rules = policy
+                .workflow
+                .engagement
+                .repositories
+                .entry(repository.clone())
+                .or_insert_with(RepositoryEngagementPolicy::default);
+            rules.default.allow = subjects.iter().map(|subject| subject.selector()).collect();
+        }
+        let policy_path = self.directory.join("effective-policy.yml");
         let Some(active) = &config.active_plugin else {
+            write_secret(&policy_path, serde_yaml::to_string(&policy)?.as_bytes())?;
             return Ok(());
         };
         let plugin = config.plugins.get(&active.id).ok_or_else(|| {
@@ -215,9 +229,6 @@ impl Instance {
             parameters: BTreeMap::new(),
             task_access_overrides: BTreeMap::new(),
         };
-        let base_policy_path = config.source_tree.join(".donkeyspace/policy.yml");
-        let mut policy = Policy::from_yaml(&fs::read_to_string(&base_policy_path)?)
-            .map_err(|error| SetupError::Config(error.to_string()))?;
         match active.class {
             PluginFlowClass::LifecycleReplacement => {
                 policy.lifecycle.plugin = Some(selection);
@@ -230,7 +241,6 @@ impl Instance {
                 policy.agents.developer.plugin = Some(selection);
             }
         }
-        let policy_path = self.directory.join("plugin-policy.yml");
         write_secret(&policy_path, serde_yaml::to_string(&policy)?.as_bytes())?;
 
         let plugin_mount = format!("{}:/plugins/{mount_id}:ro", plugin.source_path.display());
@@ -332,7 +342,7 @@ fn safe_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InstanceConfig, RuntimeSource};
+    use crate::{GitHubAccessSubject, InstanceConfig, RuntimeSource};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -366,13 +376,19 @@ mod tests {
         let instance = Instance {
             directory: directory.clone(),
             config: Some(InstanceConfig {
-                schema_version: 3,
+                schema_version: 4,
                 source_tree,
                 runtime_source: RuntimeSource::LocalBuild,
                 api_port: 8080,
                 web_port: 5173,
                 codex_home: None,
                 github: None,
+                github_access: BTreeMap::from([(
+                    "acme/rtl".into(),
+                    vec![GitHubAccessSubject::User {
+                        login: "alice".into(),
+                    }],
+                )]),
                 plugins: BTreeMap::from([(plugin.id.clone(), plugin)]),
                 active_plugin: Some(ActivePlugin {
                     id: "example.plugin".into(),
@@ -383,12 +399,14 @@ mod tests {
         };
         instance.write_plugin_runtime_files().unwrap();
         let overlay = fs::read_to_string(instance.plugin_overlay_path()).unwrap();
-        let policy = fs::read_to_string(directory.join("plugin-policy.yml")).unwrap();
+        let policy = fs::read_to_string(directory.join("effective-policy.yml")).unwrap();
         assert!(overlay.contains("/var/run/docker.sock"));
         assert!(overlay.contains("plugin_env_0"));
         assert!(!overlay.contains("do-not-serialize"));
         assert!(policy.contains("replacement"));
         assert!(policy.contains("/run/secrets/plugin_env_0"));
+        assert!(policy.contains("acme/rtl"));
+        assert!(policy.contains("alice"));
         assert!(!policy.contains("do-not-serialize"));
         fs::remove_dir_all(directory).unwrap();
     }

@@ -335,6 +335,22 @@ impl GitHubCredentialProvider {
         validate_installation_response(&installation)
     }
 
+    pub async fn validate_members_permission(&self) -> Result<(), GitHubClientError> {
+        if self.mode() == GitHubAuthMode::Pat {
+            return Ok(());
+        }
+        let installation_id = self
+            .installation_id()
+            .expect("App mode has installation id");
+        let app_client = self.app_client.as_ref().ok_or_else(|| {
+            GitHubClientError::InvalidAuthConfig("App client is unavailable".into())
+        })?;
+        let installation: Value = app_client
+            .get(format!("/app/installations/{installation_id}"), None::<&()>)
+            .await?;
+        validate_members_permission_response(&installation)
+    }
+
     pub async fn repositories(&self) -> Result<Vec<GitHubRepository>, GitHubClientError> {
         let mut repositories = Vec::new();
         for page in 1.. {
@@ -389,6 +405,18 @@ fn parse_repository(value: &Value) -> Result<GitHubRepository, GitHubClientError
         full_name,
         private: value["private"].as_bool().unwrap_or(false),
     })
+}
+
+fn required_string(
+    value: &Value,
+    field: &str,
+    resource: &str,
+) -> Result<String, GitHubClientError> {
+    value[field]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| GitHubClientError::InvalidResponse(format!("{resource} omitted `{field}`")))
 }
 
 pub async fn discover_installation_id(
@@ -462,6 +490,19 @@ fn validate_installation_response(installation: &Value) -> Result<(), GitHubClie
         }
     }
     Ok(())
+}
+
+fn validate_members_permission_response(installation: &Value) -> Result<(), GitHubClientError> {
+    if matches!(
+        installation["permissions"]["members"].as_str(),
+        Some("read" | "write")
+    ) {
+        Ok(())
+    } else {
+        Err(GitHubClientError::InvalidResponse(
+            "installation is missing `members: read` organization permission".into(),
+        ))
+    }
 }
 
 fn parse_id(name: &str, value: String) -> Result<u64, GitHubClientError> {
@@ -565,6 +606,40 @@ impl GitHubClient {
 
     pub async fn authenticated_login(&self) -> Result<String, GitHubClientError> {
         Ok(self.client.current().user().await?.login)
+    }
+
+    pub async fn canonical_user_login(&self, username: &str) -> Result<String, GitHubClientError> {
+        let user: Value = self
+            .client
+            .get(format!("/users/{username}"), None::<&()>)
+            .await?;
+        required_string(&user, "login", "GitHub user")
+    }
+
+    pub async fn canonical_organization_login(
+        &self,
+        organization: &str,
+    ) -> Result<String, GitHubClientError> {
+        let organization: Value = self
+            .client
+            .get(format!("/orgs/{organization}"), None::<&()>)
+            .await?;
+        required_string(&organization, "login", "GitHub organization")
+    }
+
+    pub async fn canonical_team_slug(
+        &self,
+        organization: &str,
+        team_slug: &str,
+    ) -> Result<String, GitHubClientError> {
+        let team: Value = self
+            .client
+            .get(
+                format!("/orgs/{organization}/teams/{team_slug}"),
+                None::<&()>,
+            )
+            .await?;
+        required_string(&team, "slug", "GitHub team")
     }
 
     pub async fn collaborator_permission(
@@ -809,7 +884,7 @@ fn workflow_label_color(label: &str) -> &'static str {
 mod tests {
     use super::{
         GitHubAuthConfig, GitHubAuthMode, SignatureError, parse_repository, select_installation_id,
-        validate_installation_response, verify_signature,
+        validate_installation_response, validate_members_permission_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
     use http_body_util::Full;
@@ -955,6 +1030,26 @@ mod tests {
             serde_json::Value::Null,
         );
         validate_installation_response(&response).unwrap();
+    }
+
+    #[test]
+    fn members_permission_is_required_for_organization_access() {
+        assert!(
+            validate_members_permission_response(&installation(
+                json!({"members": "read"}),
+                serde_json::Value::Null,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_members_permission_response(&installation(
+                json!({"metadata": "read"}),
+                serde_json::Value::Null,
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("members: read")
+        );
     }
 
     #[test]
