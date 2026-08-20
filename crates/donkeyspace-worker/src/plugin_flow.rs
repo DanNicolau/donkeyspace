@@ -103,6 +103,8 @@ struct LifecycleCheckpoint {
     pending_approvals: Vec<PendingApproval>,
     #[serde(default)]
     start_approved: bool,
+    #[serde(default)]
+    revision_targets: Vec<TaskKey>,
 }
 
 pub async fn run(
@@ -358,7 +360,6 @@ async fn run_work_item_lifecycle(
     };
 
     let mut rerun_start = false;
-    let mut revision_targets = Vec::<TaskKey>::new();
     if let Some(saved) = checkpoint.as_mut()
         && !saved.pending_approvals.is_empty()
     {
@@ -410,7 +411,9 @@ async fn run_work_item_lifecycle(
                 }
                 (HumanDecision::Revise { .. }, _, false)
                 | (HumanDecision::Approve { .. }, ApprovalTrigger::AgentRequested, false) => {
-                    revision_targets.push(approval.key.clone());
+                    if !saved.revision_targets.contains(&approval.key) {
+                        saved.revision_targets.push(approval.key.clone());
+                    }
                 }
                 (HumanDecision::Approve { .. }, ApprovalTrigger::AgentRequested, true) => {
                     rerun_start = true;
@@ -441,6 +444,10 @@ async fn run_work_item_lifecycle(
             ));
         }
     }
+    let revision_targets = checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.revision_targets.clone())
+        .unwrap_or_default();
 
     let (
         mut previous,
@@ -662,6 +669,7 @@ async fn run_work_item_lifecycle(
                 resume_target: pending[0].key.clone(),
                 pending_approvals: pending,
                 start_approved: false,
+                revision_targets: Vec::new(),
             },
         )?;
         return Ok(finish_result(result, accumulated_tests, &previous));
@@ -972,6 +980,7 @@ async fn run_work_item_lifecycle(
                                 resume_target: resume_target.clone(),
                                 pending_approvals: required_approvals,
                                 start_approved: true,
+                                revision_targets: Vec::new(),
                             },
                         )?;
                         return Ok(finish_result(result, accumulated_tests, &previous));
@@ -1054,6 +1063,7 @@ async fn run_work_item_lifecycle(
                             resume_target: resume_target.clone(),
                             pending_approvals: required_approvals,
                             start_approved: true,
+                            revision_targets: Vec::new(),
                         },
                     )?;
                     return Ok(finish_result(result, accumulated_tests, &previous));
@@ -1141,6 +1151,7 @@ async fn run_work_item_lifecycle(
                     resume_target: required_approvals[0].key.clone(),
                     pending_approvals: required_approvals,
                     start_approved: true,
+                    revision_targets: Vec::new(),
                 },
             )?;
             return Ok(finish_result(result, accumulated_tests, &previous));
