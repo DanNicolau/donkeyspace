@@ -19,6 +19,7 @@ flows:
       architect:
         role: architect
         write: [docs/design]
+        approval: required
       rtl:
         role: rtl
         scope: work_item
