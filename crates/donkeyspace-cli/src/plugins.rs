@@ -205,6 +205,16 @@ impl Instance {
                 .or_insert_with(RepositoryEngagementPolicy::default);
             rules.default.allow = subjects.iter().map(|subject| subject.selector()).collect();
         }
+        for (repository, subjects) in &config.github_approvers {
+            let rules = policy
+                .workflow
+                .engagement
+                .repositories
+                .entry(repository.clone())
+                .or_insert_with(RepositoryEngagementPolicy::default);
+            rules.needs_human_resume.get_or_insert_default().allow =
+                subjects.iter().map(|subject| subject.selector()).collect();
+        }
         let policy_path = self.directory.join("effective-policy.yml");
         let Some(active) = &config.active_plugin else {
             write_secret(&policy_path, serde_yaml::to_string(&policy)?.as_bytes())?;
@@ -376,7 +386,7 @@ mod tests {
         let instance = Instance {
             directory: directory.clone(),
             config: Some(InstanceConfig {
-                schema_version: 4,
+                schema_version: crate::SCHEMA_VERSION,
                 source_tree,
                 runtime_source: RuntimeSource::LocalBuild,
                 api_port: 8080,
@@ -387,6 +397,12 @@ mod tests {
                     "acme/rtl".into(),
                     vec![GitHubAccessSubject::User {
                         login: "alice".into(),
+                    }],
+                )]),
+                github_approvers: BTreeMap::from([(
+                    "acme/rtl".into(),
+                    vec![GitHubAccessSubject::User {
+                        login: "reviewer".into(),
                     }],
                 )]),
                 plugins: BTreeMap::from([(plugin.id.clone(), plugin)]),
@@ -407,6 +423,8 @@ mod tests {
         assert!(policy.contains("/run/secrets/plugin_env_0"));
         assert!(policy.contains("acme/rtl"));
         assert!(policy.contains("alice"));
+        assert!(policy.contains("reviewer"));
+        assert!(policy.contains("needs_human_resume"));
         assert!(!policy.contains("do-not-serialize"));
         fs::remove_dir_all(directory).unwrap();
     }

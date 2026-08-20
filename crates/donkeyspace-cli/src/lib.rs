@@ -18,7 +18,7 @@ mod plugins;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
 const PORT_SUGGESTION_ATTEMPTS: u16 = 100;
@@ -72,6 +72,8 @@ pub struct InstanceConfig {
     #[serde(default)]
     pub github_access: BTreeMap<String, Vec<GitHubAccessSubject>>,
     #[serde(default)]
+    pub github_approvers: BTreeMap<String, Vec<GitHubAccessSubject>>,
+    #[serde(default)]
     pub plugins: BTreeMap<String, InstalledPlugin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_plugin: Option<ActivePlugin>,
@@ -90,6 +92,13 @@ pub enum GitHubAccessSubject {
         organization: String,
         team_slug: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GitHubAccessScope {
+    #[default]
+    Starters,
+    Approvers,
 }
 
 impl GitHubAccessSubject {
@@ -278,6 +287,13 @@ impl Instance {
             let migrated = match config.schema_version {
                 1 | 2 | 3 => {
                     reconcile_github_access(&mut config);
+                    config.github_approvers = config.github_access.clone();
+                    config.schema_version = SCHEMA_VERSION;
+                    true
+                }
+                4 => {
+                    config.github_approvers = config.github_access.clone();
+                    reconcile_github_access(&mut config);
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
@@ -355,6 +371,7 @@ impl Instance {
                 codex_home: None,
                 github: None,
                 github_access: BTreeMap::new(),
+                github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
                 active_plugin: None,
             },
@@ -424,10 +441,17 @@ impl Instance {
     }
 
     pub fn github_access(&self, repository: &str) -> Result<&[GitHubAccessSubject], SetupError> {
+        self.github_access_for_scope(repository, GitHubAccessScope::Starters)
+    }
+
+    pub fn github_access_for_scope(
+        &self,
+        repository: &str,
+        scope: GitHubAccessScope,
+    ) -> Result<&[GitHubAccessSubject], SetupError> {
         let config = self.require_config()?;
         let repository = configured_repository(config, repository)?;
-        Ok(config
-            .github_access
+        Ok(github_access_map(config, scope)
             .get(repository)
             .map(Vec::as_slice)
             .unwrap_or_default())
@@ -437,6 +461,16 @@ impl Instance {
         &mut self,
         repository: &str,
         subject: GitHubAccessSubject,
+    ) -> Result<GitHubAccessSubject, SetupError> {
+        self.add_github_access_for_scope(repository, subject, GitHubAccessScope::Starters)
+            .await
+    }
+
+    pub async fn add_github_access_for_scope(
+        &mut self,
+        repository: &str,
+        subject: GitHubAccessSubject,
+        scope: GitHubAccessScope,
     ) -> Result<GitHubAccessSubject, SetupError> {
         let repository = configured_repository(self.require_config()?, repository)?.to_string();
         let owner = repository.split_once('/').expect("validated repository").0;
@@ -471,13 +505,12 @@ impl Instance {
             }
         };
         validate_subject_owner(owner, &subject)?;
-        let entries = self
-            .config
-            .as_mut()
-            .expect("configuration was validated")
-            .github_access
-            .entry(repository)
-            .or_default();
+        let entries = github_access_map_mut(
+            self.config.as_mut().expect("configuration was validated"),
+            scope,
+        )
+        .entry(repository)
+        .or_default();
         if entries
             .iter()
             .any(|existing| subjects_equal(existing, &subject))
@@ -498,14 +531,22 @@ impl Instance {
         repository: &str,
         subject: &GitHubAccessSubject,
     ) -> Result<(), SetupError> {
+        self.remove_github_access_for_scope(repository, subject, GitHubAccessScope::Starters)
+    }
+
+    pub fn remove_github_access_for_scope(
+        &mut self,
+        repository: &str,
+        subject: &GitHubAccessSubject,
+        scope: GitHubAccessScope,
+    ) -> Result<(), SetupError> {
         let repository = configured_repository(self.require_config()?, repository)?.to_string();
-        let entries = self
-            .config
-            .as_mut()
-            .expect("configuration was validated")
-            .github_access
-            .entry(repository)
-            .or_default();
+        let entries = github_access_map_mut(
+            self.config.as_mut().expect("configuration was validated"),
+            scope,
+        )
+        .entry(repository)
+        .or_default();
         let previous = entries.len();
         entries.retain(|existing| !subjects_equal(existing, subject));
         if entries.len() == previous {
@@ -987,13 +1028,19 @@ impl Instance {
                             private_key_file: private_key_file.clone(),
                         })?;
                         provider.validate_installation().await?;
-                        if config.github_access.values().flatten().any(|subject| {
-                            matches!(
-                                subject,
-                                GitHubAccessSubject::Organization { .. }
-                                    | GitHubAccessSubject::Team { .. }
-                            )
-                        }) {
+                        if config
+                            .github_access
+                            .values()
+                            .chain(config.github_approvers.values())
+                            .flatten()
+                            .any(|subject| {
+                                matches!(
+                                    subject,
+                                    GitHubAccessSubject::Organization { .. }
+                                        | GitHubAccessSubject::Team { .. }
+                                )
+                            })
+                        {
                             provider.validate_members_permission().await?;
                         }
                         for repository in repositories {
@@ -1019,24 +1066,28 @@ impl Instance {
             });
         }
         for repository in github_repositories(config) {
-            let subjects = config
-                .github_access
-                .get(repository)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            checks.push(DoctorCheck {
-                name: format!("GitHub access {repository}"),
-                level: if subjects.is_empty() {
-                    CheckLevel::Fail
-                } else {
-                    CheckLevel::Pass
-                },
-                detail: if subjects.is_empty() {
-                    "deny all: add a trusted user, organization, or team".into()
-                } else {
-                    format!("{} trusted subject(s)", subjects.len())
-                },
-            });
+            for (name, scope) in [
+                ("job starters", GitHubAccessScope::Starters),
+                ("human approvers", GitHubAccessScope::Approvers),
+            ] {
+                let subjects = github_access_map(config, scope)
+                    .get(repository)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                checks.push(DoctorCheck {
+                    name: format!("GitHub {name} {repository}"),
+                    level: if subjects.is_empty() {
+                        CheckLevel::Fail
+                    } else {
+                        CheckLevel::Pass
+                    },
+                    detail: if subjects.is_empty() {
+                        format!("deny all: add at least one {name} subject")
+                    } else {
+                        format!("{} trusted subject(s)", subjects.len())
+                    },
+                });
+            }
         }
         checks.push(command_doctor_check(
             "Codex authentication",
@@ -1493,20 +1544,42 @@ fn github_repositories(config: &InstanceConfig) -> &[String] {
     }
 }
 
+fn github_access_map(
+    config: &InstanceConfig,
+    scope: GitHubAccessScope,
+) -> &BTreeMap<String, Vec<GitHubAccessSubject>> {
+    match scope {
+        GitHubAccessScope::Starters => &config.github_access,
+        GitHubAccessScope::Approvers => &config.github_approvers,
+    }
+}
+
+fn github_access_map_mut(
+    config: &mut InstanceConfig,
+    scope: GitHubAccessScope,
+) -> &mut BTreeMap<String, Vec<GitHubAccessSubject>> {
+    match scope {
+        GitHubAccessScope::Starters => &mut config.github_access,
+        GitHubAccessScope::Approvers => &mut config.github_approvers,
+    }
+}
+
 fn reconcile_github_access(config: &mut InstanceConfig) {
     let repositories = github_repositories(config).to_vec();
-    config.github_access.retain(|repository, _| {
-        repositories
-            .iter()
-            .any(|selected| selected.eq_ignore_ascii_case(repository))
-    });
-    for repository in repositories {
-        if !config
-            .github_access
-            .keys()
-            .any(|existing| existing.eq_ignore_ascii_case(&repository))
-        {
-            config.github_access.insert(repository, Vec::new());
+    for scope in [GitHubAccessScope::Starters, GitHubAccessScope::Approvers] {
+        let access = github_access_map_mut(config, scope);
+        access.retain(|repository, _| {
+            repositories
+                .iter()
+                .any(|selected| selected.eq_ignore_ascii_case(repository))
+        });
+        for repository in &repositories {
+            if !access
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(repository))
+            {
+                access.insert(repository.clone(), Vec::new());
+            }
         }
     }
 }
@@ -2101,6 +2174,7 @@ mod tests {
                 ingress: IngressMode::Polling,
             }),
             github_access: BTreeMap::from([("owner/repo".into(), Vec::new())]),
+            github_approvers: BTreeMap::from([("owner/repo".into(), Vec::new())]),
             plugins: BTreeMap::new(),
             active_plugin: None,
         };
@@ -2115,7 +2189,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for schema_version in [1, 2, 3] {
+        for schema_version in [1, 2, 3, 4] {
             let directory =
                 env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
             fs::create_dir_all(&directory).unwrap();
@@ -2138,6 +2212,7 @@ mod tests {
             assert!(config.plugins.is_empty());
             assert!(config.active_plugin.is_none());
             assert!(config.github_access.is_empty());
+            assert!(config.github_approvers.is_empty());
             let saved: Value =
                 serde_json::from_slice(&fs::read(directory.join(CONFIG_FILE)).unwrap()).unwrap();
             assert_eq!(saved["schema_version"], SCHEMA_VERSION);
@@ -2145,6 +2220,35 @@ mod tests {
             assert!(!directory.join(".instance.json.tmp").exists());
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn schema_four_access_migrates_to_separate_approvers() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("donkeyspace-schema-four-test-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CONFIG_FILE),
+            r#"{
+              "schema_version": 4,
+              "source_tree": "/src",
+              "runtime_source": "local-build",
+              "api_port": 8080,
+              "web_port": 5173,
+              "github_access": {
+                "acme/rtl": [{"type": "user", "login": "alice"}]
+              }
+            }"#,
+        )
+        .unwrap();
+        let instance = Instance::open(Some(directory.clone())).unwrap();
+        let config = instance.config().unwrap();
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        assert_eq!(config.github_approvers, config.github_access);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2178,11 +2282,13 @@ mod tests {
                     login: "stale".into(),
                 }],
             )]),
+            github_approvers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             active_plugin: None,
         };
         reconcile_github_access(&mut config);
         assert_eq!(config.github_access.len(), 2);
+        assert_eq!(config.github_approvers.len(), 2);
         assert!(config.github_access["acme/rtl"].is_empty());
         assert!(config.github_access["acme/dv"].is_empty());
         assert!(
@@ -2208,6 +2314,7 @@ mod tests {
             codex_home: None,
             github: None,
             github_access: BTreeMap::new(),
+            github_approvers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             active_plugin: None,
         };
@@ -2247,6 +2354,7 @@ mod tests {
                 codex_home: None,
                 github: None,
                 github_access: BTreeMap::new(),
+                github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
                 active_plugin: None,
             }),
