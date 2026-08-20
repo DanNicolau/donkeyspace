@@ -171,6 +171,14 @@ fn default_max_parallel_tasks() -> usize {
     4
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginApprovalMode {
+    #[default]
+    None,
+    Required,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PluginTask {
     #[serde(alias = "agent")]
@@ -197,6 +205,11 @@ pub struct PluginTask {
     pub transitions: BTreeMap<String, String>,
     #[serde(default)]
     pub terminal: bool,
+    /// Pause after a successful task result until an authorized human approves
+    /// the published output. Agents may still request human input themselves
+    /// by returning `needs_human` when this is `none`.
+    #[serde(default)]
+    pub approval: PluginApprovalMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -694,6 +707,7 @@ flows:
       architect:
         role: architect
         write: [docs/design]
+        approval: required
       rtl:
         role: rtl
         scope: work_item
@@ -716,6 +730,14 @@ flows:
         .unwrap();
         manifest.validate().unwrap();
         assert!(manifest.flows["blocks"].replaces_default_lifecycle);
+        assert_eq!(
+            manifest.flows["blocks"].tasks["architect"].approval,
+            PluginApprovalMode::Required
+        );
+        assert_eq!(
+            manifest.flows["blocks"].tasks["rtl"].approval,
+            PluginApprovalMode::None
+        );
     }
 
     #[test]
