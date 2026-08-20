@@ -156,9 +156,9 @@ credentials are stored outside the source tree by default, and
 
 ## GitHub engagement access
 
-Each selected repository starts with an empty trust list and therefore denies
-all new AI engagement. Manage access interactively from **Manage GitHub access**
-or headlessly:
+Each selected repository has separate job-starter and human-approver lists.
+Both start empty for new installations and fail closed. Manage them
+interactively from **Manage GitHub access** or headlessly:
 
 ```sh
 donkeyspace configure github-access --repository OWNER/REPOSITORY list
@@ -166,13 +166,16 @@ donkeyspace configure github-access --repository OWNER/REPOSITORY add --user USE
 donkeyspace configure github-access --repository OWNER/REPOSITORY add --organization OWNER
 donkeyspace configure github-access --repository OWNER/REPOSITORY add --team OWNER/TEAM-SLUG
 donkeyspace configure github-access --repository OWNER/REPOSITORY remove --user USER
+donkeyspace configure github-access --repository OWNER/REPOSITORY --scope approvers list
+donkeyspace configure github-access --repository OWNER/REPOSITORY --scope approvers add --team OWNER/TEAM-SLUG
 ```
 
 Organization and team entries must belong to the repository owner. Changes are
 saved outside the source tree and recreate a running API service automatically;
-already queued or running jobs continue. Removing the final entry returns the
-repository to deny-all. `doctor` fails until every selected repository has at
-least one trusted identity.
+already queued or running jobs continue. Removing the final entry returns that
+scope to deny-all. `doctor` fails until every selected repository has at least
+one job starter and one human approver. Schema-v4 instances initially copy
+their existing trusted identities into both independent lists.
 
 ## Codex
 

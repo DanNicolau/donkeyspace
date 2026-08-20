@@ -27,11 +27,11 @@ The current implementation handles these GitHub events:
 - `issues.edited`: re-run triage for an open, policy-eligible issue.
 - `issues.reopened`: schedule triage unless blocked by policy.
 - `issues.labeled`: schedule triage when an allow label is added to an
-  unstarted, `needs_info`, `needs_human`, or `blocked` issue.
+  unstarted, `needs_info`, or `blocked` issue.
 - `issue_comment.created` and `issue_comment.edited`: re-run triage when a
   human comments on an issue in `needs_info` or `blocked`; for a paused plugin
-  lifecycle in `needs_human`, requeue the same lifecycle coordinator and resume
-  its checkpoint.
+  lifecycle in `needs_human`, only a newly created explicit approval command
+  requeues the same lifecycle coordinator and resumes its checkpoint.
 - `pull_request.opened`: link a managed PR to its issue and schedule review.
 - `pull_request.synchronize`: schedule reviewer agent for donkeyspace-managed PRs.
 - `pull_request.reopened`: schedule reviewer agent for donkeyspace-managed PRs.
@@ -69,20 +69,21 @@ each action completed or failed.
 
 ## Human Control
 
-The default workflow uses labels and normal comments rather than slash commands.
-
 - Pause new automation: apply a configured block label such as `ai:disabled`.
 - Resume after clarification: comment with the requested information. If the issue has `ai:needs-info`, donkeyspace re-runs triage.
-- Resume a plugin human handoff: comment with the requested decision or
-  correction while the issue has `ai:needs-human`. Donkeyspace resumes the same
-  coordinator and preserves completed graph work.
+- Approve a plugin checkpoint: comment `/donkeyspace approve` or target one
+  pending task with `/donkeyspace approve TASK/WORK-ITEM`.
+- Request checkpoint changes: use `/donkeyspace revise TASK/WORK-ITEM` and put
+  the feedback on following lines. Donkeyspace reruns only that task and its
+  dependents while preserving independent completed work.
 - Retry a failed job: use the dashboard or `POST /api/runs/{id}/retry`. Results
   ending in `blocked` or `needs_human` are not eligible for direct retry.
 - Resume a blocked issue through GitHub: remove the block condition and add the
   configured allow label or provide a human comment, as appropriate.
 
 There is no cancellation API. A block label prevents new jobs but does not stop
-an already running command. Slash commands are not supported.
+an already running command. Approval commands work only on the parent issue and
+still require an authorized `needs_human_resume` actor.
 
 ## Conflict Handling
 

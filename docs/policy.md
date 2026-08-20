@@ -38,8 +38,9 @@ work, and `ai:needs-human` resumption, including plugin checkpoints.
 
 Engagement is repository scoped. A missing repository or an empty `allow` list
 denies all engagement. The TUI and `configure github-access` commands maintain
-each selected repository's `default.allow` list in local instance configuration;
-they do not modify the checked-in policy or GitHub membership.
+separate local lists: job starters populate `default.allow`, while human
+approvers populate `needs_human_resume.allow`. They do not modify the checked-in
+policy or GitHub membership.
 
 ```yaml
 workflow:
@@ -148,8 +149,9 @@ Supported path patterns are exact paths, prefix globs ending in `/**`, and neste
 Failed jobs can be retried manually through `POST /api/runs/{id}/retry` or the
 dashboard when `dashboard.allow_retry` is true. Only failed jobs are eligible;
 results with `blocked` or `needs_human` outcomes must be resolved by a person
-instead. For a paused lifecycle plugin, a human comment on the parent issue
-resumes the checkpoint only after `needs_human_resume` authorizes the actor. A
+instead. For a paused lifecycle plugin, a newly created `/donkeyspace approve`
+or `/donkeyspace revise` comment on the parent issue resumes the checkpoint only
+after `needs_human_resume` authorizes the actor. A
 retry creates a new job linked through `retry_of_job_id`.
 
 ## Dashboard
