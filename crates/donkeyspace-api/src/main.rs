@@ -74,6 +74,18 @@ struct GitHubIngressEvent {
     payload: Value,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum HumanApprovalAction {
+    Approve {
+        target: Option<String>,
+    },
+    Revise {
+        target: Option<String>,
+        feedback: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
@@ -932,6 +944,15 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
+    let human_approval = if current_state.as_deref() == Some("needs_human") {
+        payload
+            .comment
+            .as_ref()
+            .and_then(|comment| parse_human_approval_command(&comment.body))
+    } else {
+        None
+    };
+
     let gate = engagement_gate(event, current_state.as_deref())
         .ok_or("queueable github event has no engagement gate")?;
     let managed_resource = if let Some(comment) = &payload.comment {
@@ -1055,6 +1076,12 @@ async fn persist_issue_webhook(
                 "reason": authorization.reason,
             }),
         );
+        if let Some(action) = human_approval {
+            map.insert(
+                "donkeyspace_human_decision".into(),
+                serde_json::to_value(action).expect("approval action serializes"),
+            );
+        }
     }
 
     if active_job_exists_for_workflow_item(pool, workflow_item_id).await? {
@@ -1374,29 +1401,64 @@ fn should_queue_triage(
         return false;
     }
 
+    if current_state == Some("needs_human") {
+        return event == "issue_comment"
+            && action == "created"
+            && comment
+                .is_some_and(|comment| parse_human_approval_command(&comment.body).is_some());
+    }
+
     match (event, action) {
         ("issues", "opened" | "edited" | "reopened") => true,
         ("issues", "labeled") => {
             changed_label
                 .map(|label| allow_labels.iter().any(|allowed| allowed == label))
                 .unwrap_or(false)
-                && matches!(
-                    current_state,
-                    None | Some("needs_info" | "needs_human" | "blocked")
-                )
+                && matches!(current_state, None | Some("needs_info" | "blocked"))
         }
         ("issue_comment", "created" | "edited") => {
             matches!(
                 current_state,
-                Some(state)
-                    if matches!(
-                        state,
-                        "needs_info" | "needs_human" | "blocked"
-                    )
+                Some(state) if matches!(state, "needs_info" | "blocked")
             ) && comment.is_some()
         }
         _ => false,
     }
+}
+
+fn parse_human_approval_command(body: &str) -> Option<HumanApprovalAction> {
+    let mut lines = body.lines();
+    let first = lines.find(|line| !line.trim().is_empty())?.trim();
+    let mut parts = first.split_whitespace();
+    if parts.next()? != "/donkeyspace" {
+        return None;
+    }
+    let action = parts.next()?;
+    let target = parts.next().map(str::to_string);
+    if parts.next().is_some()
+        || target
+            .as_deref()
+            .is_some_and(|value| !valid_approval_target(value))
+    {
+        return None;
+    }
+    match action {
+        "approve" => Some(HumanApprovalAction::Approve { target }),
+        "revise" => {
+            let feedback = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+            (!feedback.is_empty()).then_some(HumanApprovalAction::Revise { target, feedback })
+        }
+        _ => None,
+    }
+}
+
+fn valid_approval_target(value: &str) -> bool {
+    value == "all"
+        || (!value.is_empty()
+            && value.matches('/').count() <= 1
+            && value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
+            }))
 }
 
 fn engagement_gate(event: &str, current_state: Option<&str>) -> Option<EngagementGate> {
@@ -1846,6 +1908,8 @@ struct GitHubComment {
     author_association: Option<String>,
     #[serde(default)]
     performed_via_github_app: Option<GitHubAppIdentity>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    body: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1916,9 +1980,10 @@ impl ApiError {
 mod tests {
     use super::{
         AppState, GitHubActor, GitHubAppIdentity, GitHubComment, GitHubIssue, GitHubIssueWebhook,
-        GitHubLabel, GitHubOwner, GitHubRepository, JobRecord, PolledRepository,
-        authorize_engagement, can_retry_job, engagement_gate, extract_linked_issue_number,
-        github_poll_event_to_ingress, is_projected_work_item, issue_number_from_donkeyspace_branch,
+        GitHubLabel, GitHubOwner, GitHubRepository, HumanApprovalAction, JobRecord,
+        PolledRepository, authorize_engagement, can_retry_job, engagement_gate,
+        extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
+        issue_number_from_donkeyspace_branch, parse_human_approval_command,
         parse_polled_repositories, permission_rank, polled_repository_input, should_queue_reviewer,
         should_queue_triage, webhook_installation_matches, webhook_repository_allowed,
     };
@@ -1939,6 +2004,7 @@ mod tests {
             }),
             author_association: Some("MEMBER".into()),
             performed_via_github_app: None,
+            body: "ordinary response".into(),
         }
     }
 
@@ -2091,6 +2157,7 @@ mod tests {
             user: None,
             author_association: Some("OWNER".into()),
             performed_via_github_app: None,
+            body: "clarification".into(),
         });
         assert!(
             !authorize_engagement(
@@ -2375,14 +2442,58 @@ mod tests {
     }
 
     #[test]
-    fn human_comment_on_needs_human_queues_triage() {
+    fn explicit_approval_on_needs_human_queues_triage() {
+        let mut approval = comment();
+        approval.body = "/donkeyspace approve".into();
         assert!(queue_triage(
+            "issue_comment",
+            "created",
+            "open",
+            Some("needs_human"),
+            Some(&approval),
+        ));
+    }
+
+    #[test]
+    fn ordinary_or_edited_comment_on_needs_human_does_not_resume() {
+        assert!(!queue_triage(
             "issue_comment",
             "created",
             "open",
             Some("needs_human"),
             Some(&comment()),
         ));
+        let mut approval = comment();
+        approval.body = "/donkeyspace approve".into();
+        assert!(!queue_triage(
+            "issue_comment",
+            "edited",
+            "open",
+            Some("needs_human"),
+            Some(&approval),
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_approval_commands() {
+        assert_eq!(
+            parse_human_approval_command(" /donkeyspace approve rtl/storage "),
+            Some(HumanApprovalAction::Approve {
+                target: Some("rtl/storage".into())
+            })
+        );
+        assert_eq!(
+            parse_human_approval_command(
+                "/donkeyspace revise architect\nSplit the register file from decode."
+            ),
+            Some(HumanApprovalAction::Revise {
+                target: Some("architect".into()),
+                feedback: "Split the register file from decode.".into()
+            })
+        );
+        assert!(parse_human_approval_command("/donkeyspace revise architect").is_none());
+        assert!(parse_human_approval_command("please /donkeyspace approve").is_none());
+        assert!(parse_human_approval_command("/donkeyspace approve too many").is_none());
     }
 
     #[test]
