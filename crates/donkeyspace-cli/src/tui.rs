@@ -1,7 +1,7 @@
 use crate::{
     CheckLevel, DEFAULT_API_PORT, DEFAULT_WEB_PORT, DeploymentStatus, DoctorReport,
-    GitHubAccessSubject, GitHubInstanceConfig, IngressMode, Instance, PendingGitHubApp,
-    PluginConnectOptions, PluginEnvironmentInput, RuntimeSource, SetupError,
+    GitHubAccessScope, GitHubAccessSubject, GitHubInstanceConfig, IngressMode, Instance,
+    PendingGitHubApp, PluginConnectOptions, PluginEnvironmentInput, RuntimeSource, SetupError,
     suggest_available_port,
 };
 use crossterm::{
@@ -73,6 +73,13 @@ enum GitHubAccessKind {
     Team,
 }
 
+fn other_access_scope(scope: GitHubAccessScope) -> GitHubAccessScope {
+    match scope {
+        GitHubAccessScope::Starters => GitHubAccessScope::Approvers,
+        GitHubAccessScope::Approvers => GitHubAccessScope::Starters,
+    }
+}
+
 enum TaskResult {
     Status(Result<DeploymentStatus, SetupError>),
     Doctor(Result<DoctorReport, SetupError>),
@@ -109,6 +116,7 @@ struct App {
     pending: Option<PendingGitHubApp>,
     installation_id: Option<u64>,
     access_repository: Option<String>,
+    access_scope: GitHubAccessScope,
     access_kind: GitHubAccessKind,
     confirm_remove: bool,
     continue_setup_after_access: bool,
@@ -167,6 +175,7 @@ impl App {
             pending,
             installation_id: None,
             access_repository: None,
+            access_scope: GitHubAccessScope::Starters,
             access_kind: GitHubAccessKind::User,
             confirm_remove: false,
             continue_setup_after_access: false,
@@ -209,6 +218,7 @@ impl App {
         self.screen = Screen::GitHubAccessRepositories;
         self.selected = 0;
         self.access_repository = None;
+        self.access_scope = GitHubAccessScope::Starters;
         self.confirm_remove = false;
         self.continue_setup_after_access = false;
         self.reset_messages();
@@ -672,7 +682,9 @@ fn handle_access_subjects(
         .clone()
         .ok_or_else(|| SetupError::Config("access repository is missing".into()))?;
     let instance = Instance::open(app.config_dir.clone())?;
-    let subjects = instance.github_access(&repository)?.to_vec();
+    let subjects = instance
+        .github_access_for_scope(&repository, app.access_scope)?
+        .to_vec();
     match key.code {
         KeyCode::Esc | KeyCode::Char('b') => {
             app.screen = Screen::GitHubAccessRepositories;
@@ -686,6 +698,12 @@ fn handle_access_subjects(
         KeyCode::Down if !subjects.is_empty() => {
             app.selected = (app.selected + 1).min(subjects.len() - 1);
             app.confirm_remove = false;
+        }
+        KeyCode::Tab | KeyCode::Char('t') => {
+            app.access_scope = other_access_scope(app.access_scope);
+            app.selected = 0;
+            app.confirm_remove = false;
+            app.reset_messages();
         }
         KeyCode::Char('a') => {
             app.screen = Screen::GitHubAccessType;
@@ -702,11 +720,12 @@ fn handle_access_subjects(
                 return Ok(());
             }
             let subject = subjects[app.selected].clone();
+            let scope = app.access_scope;
             app.busy = Some(format!("Removing {}…", subject.display_name()));
             let config_dir = app.config_dir.clone();
             tokio::task::spawn_blocking(move || {
                 let result = Instance::open(config_dir).and_then(|mut instance| {
-                    instance.remove_github_access(&repository, &subject)?;
+                    instance.remove_github_access_for_scope(&repository, &subject, scope)?;
                     Ok(format!(
                         "Removed {} from {repository}.",
                         subject.display_name()
@@ -789,19 +808,19 @@ fn handle_access_form(
                 .access_repository
                 .clone()
                 .ok_or_else(|| SetupError::Config("access repository is missing".into()))?;
+            let scope = app.access_scope;
             app.busy = Some(format!("Validating {}…", subject.display_name()));
             let config_dir = app.config_dir.clone();
             tokio::spawn(async move {
-                let result =
-                    match Instance::open(config_dir) {
-                        Ok(mut instance) => instance
-                            .add_github_access(&repository, subject)
-                            .await
-                            .map(|subject| {
-                                format!("Added {} to {repository}.", subject.display_name())
-                            }),
-                        Err(error) => Err(error),
-                    };
+                let result = match Instance::open(config_dir) {
+                    Ok(mut instance) => instance
+                        .add_github_access_for_scope(&repository, subject, scope)
+                        .await
+                        .map(|subject| {
+                            format!("Added {} to {repository}.", subject.display_name())
+                        }),
+                    Err(error) => Err(error),
+                };
                 let _ = sender.send(TaskResult::Access(result));
             });
         }
@@ -1612,13 +1631,21 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
             "Access        {}",
             config
                 .map(|config| {
-                    let configured = config
+                    let starters = config
                         .github_access
                         .values()
                         .filter(|subjects| !subjects.is_empty())
                         .count();
-                    let total = config.github_access.len();
-                    format!("{configured}/{total} repositories trusted")
+                    let approvers = config
+                        .github_approvers
+                        .values()
+                        .filter(|subjects| !subjects.is_empty())
+                        .count();
+                    let total = config
+                        .github_access
+                        .len()
+                        .max(config.github_approvers.len());
+                    format!("{starters}/{total} starters, {approvers}/{total} approvers")
                 })
                 .unwrap_or_else(|| "not configured".into())
         )),
@@ -1708,15 +1735,15 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
 fn render_access_repositories(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
     let repositories = configured_github_repositories(instance);
     let items = repositories.iter().map(|repository| {
-        let count = instance
+        let starters = instance
             .github_access(repository)
             .map(|subjects| subjects.len())
             .unwrap_or(0);
-        let status = if count == 0 {
-            "DENY ALL".into()
-        } else {
-            format!("{count} trusted")
-        };
+        let approvers = instance
+            .github_access_for_scope(repository, GitHubAccessScope::Approvers)
+            .map(|subjects| subjects.len())
+            .unwrap_or(0);
+        let status = format!("{starters} starters / {approvers} approvers");
         ListItem::new(format!("{repository:<40} {status}"))
     });
     let mut state = ListState::default();
@@ -1739,7 +1766,13 @@ fn render_access_repositories(frame: &mut Frame, area: Rect, app: &App, instance
 
 fn render_access_subjects(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
     let repository = app.access_repository.as_deref().unwrap_or("unknown");
-    let subjects = instance.github_access(repository).unwrap_or_default();
+    let subjects = instance
+        .github_access_for_scope(repository, app.access_scope)
+        .unwrap_or_default();
+    let scope_name = match app.access_scope {
+        GitHubAccessScope::Starters => "Job starters",
+        GitHubAccessScope::Approvers => "Human approvers",
+    };
     let items: Vec<ListItem> = if subjects.is_empty() {
         vec![ListItem::new(
             "DENY ALL — press a to add a trusted identity",
@@ -1758,7 +1791,7 @@ fn render_access_subjects(frame: &mut Frame, area: Rect, app: &App, instance: &I
         List::new(items)
             .block(
                 Block::default()
-                    .title(format!(" Trusted identities — {repository} "))
+                    .title(format!(" {scope_name} — {repository} "))
                     .borders(Borders::ALL),
             )
             .highlight_symbol("› ")
@@ -1767,7 +1800,7 @@ fn render_access_subjects(frame: &mut Frame, area: Rect, app: &App, instance: &I
         &mut state,
     );
     frame.render_widget(
-        Paragraph::new("a add  d remove  Esc repositories")
+        Paragraph::new("Tab/t switch list  a add  d remove  Esc repositories")
             .style(Style::default().fg(Color::Yellow)),
         Rect::new(
             area.x + 4,
@@ -2091,6 +2124,7 @@ mod tests {
             pending: None,
             installation_id: None,
             access_repository: None,
+            access_scope: GitHubAccessScope::Starters,
             access_kind: GitHubAccessKind::User,
             confirm_remove: false,
             continue_setup_after_access: false,
@@ -2136,6 +2170,18 @@ mod tests {
         assert_eq!(app.screen, Screen::GitHubAccessForm);
         assert_eq!(app.access_kind, GitHubAccessKind::Team);
         assert_eq!(app.fields, vec!["acme", ""]);
+    }
+
+    #[test]
+    fn github_access_lists_toggle_between_starters_and_approvers() {
+        assert_eq!(
+            other_access_scope(GitHubAccessScope::Starters),
+            GitHubAccessScope::Approvers
+        );
+        assert_eq!(
+            other_access_scope(GitHubAccessScope::Approvers),
+            GitHubAccessScope::Starters
+        );
     }
 
     #[test]

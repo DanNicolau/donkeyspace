@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use donkeyspace_cli::{
-    CodexLoginMethod, ConnectGitHubOptions, GitHubAccessSubject, Instance, PluginConnectOptions,
-    PluginEnvironmentInput, RuntimeSource, SetupError,
+    CodexLoginMethod, ConnectGitHubOptions, GitHubAccessScope, GitHubAccessSubject, Instance,
+    PluginConnectOptions, PluginEnvironmentInput, RuntimeSource, SetupError,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -78,8 +78,25 @@ enum ConfigureTarget {
 struct GitHubAccessArgs {
     #[arg(long)]
     repository: String,
+    #[arg(long, value_enum, default_value_t = GitHubAccessScopeArg::Starters)]
+    scope: GitHubAccessScopeArg,
     #[command(subcommand)]
     command: GitHubAccessCommand,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GitHubAccessScopeArg {
+    Starters,
+    Approvers,
+}
+
+impl From<GitHubAccessScopeArg> for GitHubAccessScope {
+    fn from(value: GitHubAccessScopeArg) -> Self {
+        match value {
+            GitHubAccessScopeArg::Starters => Self::Starters,
+            GitHubAccessScopeArg::Approvers => Self::Approvers,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -298,7 +315,8 @@ async fn run() -> Result<(), SetupError> {
             }
             ConfigureTarget::GithubAccess(args) => match args.command {
                 GitHubAccessCommand::List => {
-                    let subjects = instance.github_access(&args.repository)?;
+                    let subjects =
+                        instance.github_access_for_scope(&args.repository, args.scope.into())?;
                     if subjects.is_empty() {
                         println!("deny all: no trusted subjects configured");
                     }
@@ -308,20 +326,31 @@ async fn run() -> Result<(), SetupError> {
                 }
                 GitHubAccessCommand::Add(subject) => {
                     let subject = instance
-                        .add_github_access(&args.repository, subject.subject()?)
+                        .add_github_access_for_scope(
+                            &args.repository,
+                            subject.subject()?,
+                            args.scope.into(),
+                        )
                         .await?;
                     println!("added {} to {}", subject.display_name(), args.repository);
                 }
                 GitHubAccessCommand::Remove(subject) => {
                     let subject = subject.subject()?;
-                    instance.remove_github_access(&args.repository, &subject)?;
+                    instance.remove_github_access_for_scope(
+                        &args.repository,
+                        &subject,
+                        args.scope.into(),
+                    )?;
                     println!(
                         "removed {} from {}",
                         subject.display_name(),
                         args.repository
                     );
-                    if instance.github_access(&args.repository)?.is_empty() {
-                        println!("warning: repository now denies all engagement");
+                    if instance
+                        .github_access_for_scope(&args.repository, args.scope.into())?
+                        .is_empty()
+                    {
+                        println!("warning: repository now denies this access scope");
                     }
                 }
             },
@@ -423,6 +452,7 @@ mod tests {
             panic!("expected GitHub access command");
         };
         assert_eq!(args.repository, "acme/rtl");
+        assert!(matches!(args.scope, GitHubAccessScopeArg::Starters));
         let GitHubAccessCommand::Add(subject) = args.command else {
             panic!("expected add command");
         };
@@ -433,5 +463,24 @@ mod tests {
                 team_slug: "hardware".into(),
             }
         );
+
+        let approvers = Cli::try_parse_from([
+            "donkeyspace",
+            "configure",
+            "github-access",
+            "--repository",
+            "acme/rtl",
+            "--scope",
+            "approvers",
+            "list",
+        ])
+        .unwrap();
+        let Some(Command::Configure(ConfigureArgs {
+            target: ConfigureTarget::GithubAccess(args),
+        })) = approvers.command
+        else {
+            panic!("expected GitHub access command");
+        };
+        assert!(matches!(args.scope, GitHubAccessScopeArg::Approvers));
     }
 }

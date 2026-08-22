@@ -60,6 +60,8 @@ cargo run -p donkeyspace-cli -- init --source-tree .
 cargo run -p donkeyspace-cli -- connect github --repositories OWNER/REPOSITORY
 cargo run -p donkeyspace-cli -- configure github-access \
   --repository OWNER/REPOSITORY add --user GITHUB_LOGIN
+cargo run -p donkeyspace-cli -- configure github-access \
+  --repository OWNER/REPOSITORY --scope approvers add --user APPROVER_LOGIN
 cargo run -p donkeyspace-cli -- connect codex
 cargo run -p donkeyspace-cli -- doctor
 cargo run -p donkeyspace-cli -- up
