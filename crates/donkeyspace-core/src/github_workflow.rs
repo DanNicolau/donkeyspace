@@ -81,7 +81,7 @@ pub fn triage_github_issue_actions(
 }
 
 pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> Option<String> {
-    match result.outcome {
+    let body = match result.outcome {
         Outcome::NeedsInfo => {
             let questions = result
                 .questions
@@ -124,13 +124,15 @@ pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> O
             };
 
             Some(format!(
-                "donkeyspace needs human input before this workflow can continue.\n\nWhat needs attention:\n{reason}\n\nLatest result:\n{}{evidence}\n\nWhat to do:\nReview the reason and failed verification above, then comment on this issue with the decision, clarification, or correction. A human comment will requeue the workflow.\n\nCurrent state: `{}`",
+                "donkeyspace needs human input before this workflow can continue.\n\nWhat needs attention:\n{reason}\n\nLatest result:\n{}{evidence}\n\nWhat to do:\nUse the exact approval or revision command shown above. If no target-specific command is shown, use `/donkeyspace approve` to authorize continuation or `/donkeyspace revise` followed by feedback on subsequent lines. Only a newly created command comment from an authorized approver can requeue the workflow.\n\nCurrent state: `{}`",
                 result.summary,
                 workflow_label_text(target_state)
             ))
         }
         _ => None,
-    }
+    }?;
+
+    Some(format!("{body}\n\n<!-- donkeyspace-generated -->"))
 }
 
 fn workflow_label_text(state: WorkflowState) -> &'static str {
@@ -268,6 +270,7 @@ mod tests {
 
         assert!(body.contains("- How should this be verified?"));
         assert!(body.contains("Current state: `ai:needs-info`"));
+        assert!(body.contains("<!-- donkeyspace-generated -->"));
     }
 
     #[test]
@@ -300,7 +303,7 @@ mod tests {
         assert!(body.contains("handoff exceeded the policy limit"));
         assert!(body.contains("Failed verification:"));
         assert!(body.contains("`top-level simulation`: 31 cycle-alignment mismatches."));
-        assert!(body.contains("comment on this issue"));
+        assert!(body.contains("/donkeyspace approve"));
         assert!(body.contains("Current state: `ai:needs-human`"));
     }
 }

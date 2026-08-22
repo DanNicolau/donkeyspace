@@ -8,15 +8,16 @@ pub mod state;
 pub use fake_agent::{fake_triage_issue, workflow_state_for_outcome};
 pub use github_workflow::{GitHubIssueAction, triage_comment_body, triage_github_issue_actions};
 pub use plugin::{
-    McpServerDefinition, PluginAgent, PluginArtifact, PluginArtifactType, PluginBuild,
-    PluginEnvironmentVariable, PluginError, PluginFlow, PluginInstallation, PluginManifest,
-    PluginParameter, PluginResource, PluginResourceAssignment, PluginResourceSource, PluginRole,
-    PluginRuntime, PluginStage, PluginTask, PluginTaskScope, PluginValidator, PluginWorkItem,
-    PluginWorkItemRegistry,
+    McpServerDefinition, PluginAgent, PluginApprovalMode, PluginArtifact, PluginArtifactType,
+    PluginBuild, PluginEnvironmentVariable, PluginError, PluginFlow, PluginInstallation,
+    PluginManifest, PluginParameter, PluginResource, PluginResourceAssignment,
+    PluginResourceSource, PluginRole, PluginRuntime, PluginStage, PluginTask, PluginTaskScope,
+    PluginValidator, PluginWorkItem, PluginWorkItemRegistry,
 };
 pub use policy::{
-    AgentConfig, AgentRoleConfig, AutomationDecision, LifecyclePolicy, PluginFlowSelection, Policy,
-    PolicyError, StageAccessOverride, TaskAccessOverride,
+    AgentConfig, AgentRoleConfig, AutomationDecision, EngagementGate, EngagementPolicy,
+    EngagementRule, EngagementSelector, LifecyclePolicy, PluginFlowSelection, Policy, PolicyError,
+    RepositoryEngagementPolicy, StageAccessOverride, TaskAccessOverride,
 };
 pub use run_result::{
     AgentHandoff, Confidence, Outcome, PluginStageResult, PluginTaskResult, Risk, RunResult,

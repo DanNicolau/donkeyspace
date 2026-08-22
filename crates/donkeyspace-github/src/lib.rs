@@ -198,6 +198,13 @@ impl GitHubAuthConfig {
             Self::Pat { .. } => None,
         }
     }
+
+    pub fn app_id(&self) -> Option<u64> {
+        match self {
+            Self::App { app_id, .. } => Some(*app_id),
+            Self::Pat { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -227,6 +234,10 @@ impl std::fmt::Debug for GitHubCredentialProvider {
 impl GitHubCredentialProvider {
     pub fn new(config: GitHubAuthConfig) -> Result<Self, GitHubClientError> {
         Self::new_with_base_uri(config, None)
+    }
+
+    pub fn app_id(&self) -> Option<u64> {
+        self.config.app_id()
     }
 
     fn new_with_base_uri(
@@ -324,6 +335,22 @@ impl GitHubCredentialProvider {
         validate_installation_response(&installation)
     }
 
+    pub async fn validate_members_permission(&self) -> Result<(), GitHubClientError> {
+        if self.mode() == GitHubAuthMode::Pat {
+            return Ok(());
+        }
+        let installation_id = self
+            .installation_id()
+            .expect("App mode has installation id");
+        let app_client = self.app_client.as_ref().ok_or_else(|| {
+            GitHubClientError::InvalidAuthConfig("App client is unavailable".into())
+        })?;
+        let installation: Value = app_client
+            .get(format!("/app/installations/{installation_id}"), None::<&()>)
+            .await?;
+        validate_members_permission_response(&installation)
+    }
+
     pub async fn repositories(&self) -> Result<Vec<GitHubRepository>, GitHubClientError> {
         let mut repositories = Vec::new();
         for page in 1.. {
@@ -378,6 +405,18 @@ fn parse_repository(value: &Value) -> Result<GitHubRepository, GitHubClientError
         full_name,
         private: value["private"].as_bool().unwrap_or(false),
     })
+}
+
+fn required_string(
+    value: &Value,
+    field: &str,
+    resource: &str,
+) -> Result<String, GitHubClientError> {
+    value[field]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| GitHubClientError::InvalidResponse(format!("{resource} omitted `{field}`")))
 }
 
 pub async fn discover_installation_id(
@@ -453,6 +492,19 @@ fn validate_installation_response(installation: &Value) -> Result<(), GitHubClie
     Ok(())
 }
 
+fn validate_members_permission_response(installation: &Value) -> Result<(), GitHubClientError> {
+    if matches!(
+        installation["permissions"]["members"].as_str(),
+        Some("read" | "write")
+    ) {
+        Ok(())
+    } else {
+        Err(GitHubClientError::InvalidResponse(
+            "installation is missing `members: read` organization permission".into(),
+        ))
+    }
+}
+
 fn parse_id(name: &str, value: String) -> Result<u64, GitHubClientError> {
     value.parse().ok().filter(|id| *id > 0).ok_or_else(|| {
         GitHubClientError::InvalidAuthConfig(format!("{name} must be a positive integer"))
@@ -471,6 +523,12 @@ pub struct GitHubWorkItem {
     pub body: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubProjectedIssue {
+    pub id: i64,
+    pub number: i64,
 }
 
 impl GitHubClient {
@@ -537,12 +595,94 @@ impl GitHubClient {
         repo: &str,
         issue_number: i64,
         body: &str,
-    ) -> Result<(), GitHubClientError> {
-        self.client
+    ) -> Result<String, GitHubClientError> {
+        let comment = self
+            .client
             .issues(owner, repo)
             .create_comment(issue_number as u64, body)
             .await?;
-        Ok(())
+        Ok(comment.id.to_string())
+    }
+
+    pub async fn authenticated_login(&self) -> Result<String, GitHubClientError> {
+        Ok(self.client.current().user().await?.login)
+    }
+
+    pub async fn canonical_user_login(&self, username: &str) -> Result<String, GitHubClientError> {
+        let user: Value = self
+            .client
+            .get(format!("/users/{username}"), None::<&()>)
+            .await?;
+        required_string(&user, "login", "GitHub user")
+    }
+
+    pub async fn canonical_organization_login(
+        &self,
+        organization: &str,
+    ) -> Result<String, GitHubClientError> {
+        let organization: Value = self
+            .client
+            .get(format!("/orgs/{organization}"), None::<&()>)
+            .await?;
+        required_string(&organization, "login", "GitHub organization")
+    }
+
+    pub async fn canonical_team_slug(
+        &self,
+        organization: &str,
+        team_slug: &str,
+    ) -> Result<String, GitHubClientError> {
+        let team: Value = self
+            .client
+            .get(
+                format!("/orgs/{organization}/teams/{team_slug}"),
+                None::<&()>,
+            )
+            .await?;
+        required_string(&team, "slug", "GitHub team")
+    }
+
+    pub async fn collaborator_permission(
+        &self,
+        owner: &str,
+        repo: &str,
+        username: &str,
+    ) -> Result<String, GitHubClientError> {
+        let permission = self
+            .client
+            .repos(owner, repo)
+            .get_contributor_permission(username)
+            .send()
+            .await?;
+        Ok(permission.role_name)
+    }
+
+    pub async fn organization_member(
+        &self,
+        organization: &str,
+        username: &str,
+    ) -> Result<bool, GitHubClientError> {
+        Ok(self
+            .client
+            .orgs(organization)
+            .check_membership(username)
+            .await?)
+    }
+
+    pub async fn team_member(
+        &self,
+        organization: &str,
+        team_slug: &str,
+        username: &str,
+    ) -> Result<bool, GitHubClientError> {
+        let membership: Value = self
+            .client
+            .get(
+                format!("/orgs/{organization}/teams/{team_slug}/memberships/{username}"),
+                None::<&()>,
+            )
+            .await?;
+        Ok(membership.get("state").and_then(Value::as_str) == Some("active"))
     }
 
     pub async fn project_work_items(
@@ -551,7 +691,7 @@ impl GitHubClient {
         repo: &str,
         parent_issue_number: i64,
         work_items: &[GitHubWorkItem],
-    ) -> Result<BTreeMap<String, i64>, GitHubClientError> {
+    ) -> Result<BTreeMap<String, GitHubProjectedIssue>, GitHubClientError> {
         let mut projected = BTreeMap::<String, (i64, i64)>::new();
         for item in work_items {
             let issue: Value = self
@@ -598,7 +738,7 @@ impl GitHubClient {
         }
         Ok(projected
             .into_iter()
-            .map(|(id, (_, number))| (id, number))
+            .map(|(key, (id, number))| (key, GitHubProjectedIssue { id, number }))
             .collect())
     }
 
@@ -744,7 +884,7 @@ fn workflow_label_color(label: &str) -> &'static str {
 mod tests {
     use super::{
         GitHubAuthConfig, GitHubAuthMode, SignatureError, parse_repository, select_installation_id,
-        validate_installation_response, verify_signature,
+        validate_installation_response, validate_members_permission_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
     use http_body_util::Full;
@@ -890,6 +1030,26 @@ mod tests {
             serde_json::Value::Null,
         );
         validate_installation_response(&response).unwrap();
+    }
+
+    #[test]
+    fn members_permission_is_required_for_organization_access() {
+        assert!(
+            validate_members_permission_response(&installation(
+                json!({"members": "read"}),
+                serde_json::Value::Null,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_members_permission_response(&installation(
+                json!({"metadata": "read"}),
+                serde_json::Value::Null,
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("members: read")
+        );
     }
 
     #[test]

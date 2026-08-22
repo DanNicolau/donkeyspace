@@ -58,6 +58,10 @@ Initialize and inspect a local deployment:
 ```sh
 cargo run -p donkeyspace-cli -- init --source-tree .
 cargo run -p donkeyspace-cli -- connect github --repositories OWNER/REPOSITORY
+cargo run -p donkeyspace-cli -- configure github-access \
+  --repository OWNER/REPOSITORY add --user GITHUB_LOGIN
+cargo run -p donkeyspace-cli -- configure github-access \
+  --repository OWNER/REPOSITORY --scope approvers add --user APPROVER_LOGIN
 cargo run -p donkeyspace-cli -- connect codex
 cargo run -p donkeyspace-cli -- doctor
 cargo run -p donkeyspace-cli -- up
@@ -70,7 +74,8 @@ subcommand:
 cargo run -p donkeyspace-cli
 ```
 
-The TUI guides initialization, GitHub repository selection, Codex login,
+The TUI guides initialization, GitHub repository selection, per-repository
+trusted user/organization/team access, Codex login,
 diagnostics, and stack startup. Explicit subcommands remain available for
 scripts and non-interactive environments.
 
@@ -101,7 +106,9 @@ donkeyspace connect github --pat --repositories OWNER/REPOSITORY
 PATs remain user-linked. Do not configure App fields and
 `DONKEYSPACE_GITHUB_TOKEN` together.
 
-When the token is configured, the worker ensures every configured workflow, allow, and block label exists in GitHub repositories already seen by donkeyspace webhooks.
+When GitHub authentication is configured, the worker ensures every configured
+workflow, allow, and block label exists in repositories already seen by
+Donkeyspace.
 
 ### Webhook-free GitHub polling
 

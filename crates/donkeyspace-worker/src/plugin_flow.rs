@@ -1,11 +1,12 @@
 use donkeyspace_core::{
-    Confidence, Outcome, PluginArtifact, PluginArtifactType, PluginFlow, PluginFlowSelection,
-    PluginManifest, PluginParameter, PluginResourceAssignment, PluginResourceSource, PluginTask,
-    PluginTaskResult, PluginValidator, PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult,
-    TestResult, TestStatus,
+    Confidence, Outcome, PluginApprovalMode, PluginArtifact, PluginArtifactType, PluginFlow,
+    PluginFlowSelection, PluginManifest, PluginParameter, PluginResourceAssignment,
+    PluginResourceSource, PluginTask, PluginTaskResult, PluginValidator, PluginWorkItem,
+    PluginWorkItemRegistry, Risk, RunResult, TestResult, TestStatus,
 };
 use donkeyspace_db::{
-    JobRecord, PgPool, complete_job, create_waiting_job, fail_job, start_waiting_job,
+    JobRecord, PgPool, complete_job, create_waiting_job, fail_job,
+    record_github_managed_resource_for_workflow_item, start_waiting_job,
 };
 use donkeyspace_github::{GitHubClient, GitHubWorkItem};
 use futures::future::join_all;
@@ -29,7 +30,7 @@ pub struct LifecycleTracking<'a> {
     pub github: Option<&'a GitHubClient>,
 }
 
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 const MAX_RESOURCE_FILES: usize = 1_024;
 const MAX_RESOURCE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -58,6 +59,31 @@ struct HandoffCheckpoint {
     count: u32,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ApprovalTrigger {
+    Required,
+    AgentRequested,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PendingApproval {
+    key: TaskKey,
+    trigger: ApprovalTrigger,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum HumanDecision {
+    Approve {
+        target: Option<String>,
+    },
+    Revise {
+        target: Option<String>,
+        feedback: String,
+    },
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct LifecycleCheckpoint {
     version: u32,
@@ -73,6 +99,12 @@ struct LifecycleCheckpoint {
     projected_issues: BTreeMap<String, i64>,
     closed_projected_issues: BTreeSet<String>,
     resume_target: TaskKey,
+    #[serde(default)]
+    pending_approvals: Vec<PendingApproval>,
+    #[serde(default)]
+    start_approved: bool,
+    #[serde(default)]
+    revision_targets: Vec<TaskKey>,
 }
 
 pub async fn run(
@@ -305,11 +337,11 @@ async fn run_work_item_lifecycle(
         .pointer("/donkeyspace_resume")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let checkpoint = if is_resume {
+    let mut checkpoint = if is_resume {
         if checkpoint_path.is_file() {
             let checkpoint: LifecycleCheckpoint =
                 serde_json::from_str(&fs::read_to_string(&checkpoint_path)?)?;
-            if checkpoint.version != CHECKPOINT_VERSION {
+            if !matches!(checkpoint.version, 1 | CHECKPOINT_VERSION) {
                 return Err(format!(
                     "unsupported lifecycle checkpoint version {}",
                     checkpoint.version
@@ -327,6 +359,96 @@ async fn run_work_item_lifecycle(
         None
     };
 
+    let mut rerun_start = false;
+    if let Some(saved) = checkpoint.as_mut()
+        && !saved.pending_approvals.is_empty()
+    {
+        let decision_value = issue_input
+            .pointer("/donkeyspace_human_decision")
+            .cloned()
+            .ok_or("resumed approval checkpoint is missing a human decision")?;
+        let decision = serde_json::from_value::<HumanDecision>(decision_value)?;
+        let selected = match select_pending_approvals(&saved.pending_approvals, &decision) {
+            Ok(selected) => selected,
+            Err(error) => {
+                let result = pending_approval_result(
+                    &saved.pending_approvals,
+                    &saved.projected_issues,
+                    &format!("The approval command was not applied: {error}"),
+                );
+                saved.version = CHECKPOINT_VERSION;
+                saved.last_result = result.clone();
+                write_lifecycle_checkpoint(&checkpoint_path, saved)?;
+                return Ok(finish_result(
+                    result,
+                    saved.accumulated_tests.clone(),
+                    &saved.previous,
+                ));
+            }
+        };
+        let selected_keys = selected
+            .iter()
+            .map(|approval| approval.key.clone())
+            .collect::<BTreeSet<_>>();
+        let feedback = match &decision {
+            HumanDecision::Approve { .. } => "approved".to_string(),
+            HumanDecision::Revise { feedback, .. } => feedback.trim().to_string(),
+        };
+        for approval in &selected {
+            let is_start = approval.key.work_item.is_none() && approval.key.task == flow.start;
+            match (&decision, approval.trigger, is_start) {
+                (HumanDecision::Approve { .. }, ApprovalTrigger::Required, true) => {
+                    saved.start_approved = true;
+                }
+                (HumanDecision::Approve { .. }, ApprovalTrigger::Required, false) => {
+                    if !saved.completed_keys.contains(&approval.key) {
+                        saved.completed_keys.push(approval.key.clone());
+                    }
+                }
+                (HumanDecision::Revise { .. }, _, true) => {
+                    saved.start_approved = false;
+                    rerun_start = true;
+                }
+                (HumanDecision::Revise { .. }, _, false)
+                | (HumanDecision::Approve { .. }, ApprovalTrigger::AgentRequested, false) => {
+                    if !saved.revision_targets.contains(&approval.key) {
+                        saved.revision_targets.push(approval.key.clone());
+                    }
+                }
+                (HumanDecision::Approve { .. }, ApprovalTrigger::AgentRequested, true) => {
+                    rerun_start = true;
+                }
+            }
+            saved.previous.push(json!({
+                "human_response": feedback,
+                "human_decision": issue_input.pointer("/donkeyspace_human_decision"),
+                "resume_target": approval.key,
+            }));
+        }
+        saved
+            .pending_approvals
+            .retain(|approval| !selected_keys.contains(&approval.key));
+        if !saved.pending_approvals.is_empty() {
+            saved.version = CHECKPOINT_VERSION;
+            let result = pending_approval_result(
+                &saved.pending_approvals,
+                &saved.projected_issues,
+                "Some approvals remain pending.",
+            );
+            saved.last_result = result.clone();
+            write_lifecycle_checkpoint(&checkpoint_path, saved)?;
+            return Ok(finish_result(
+                result,
+                saved.accumulated_tests.clone(),
+                &saved.previous,
+            ));
+        }
+    }
+    let revision_targets = checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.revision_targets.clone())
+        .unwrap_or_default();
+
     let (
         mut previous,
         mut accumulated_tests,
@@ -334,12 +456,17 @@ async fn run_work_item_lifecycle(
         mut aggregate_risk,
         mut aggregate_confidence,
         mut last_result,
-    ) = if let Some(checkpoint) = &checkpoint {
+    ) = if let Some(checkpoint) = &checkpoint
+        && !rerun_start
+    {
         let mut previous = checkpoint.previous.clone();
-        previous.push(json!({
-            "human_response": issue_input.pointer("/comment/body").and_then(Value::as_str),
-            "resume_target": checkpoint.resume_target,
-        }));
+        if checkpoint.version == 1 {
+            previous.push(json!({
+                "human_response": issue_input.pointer("/comment/body").and_then(Value::as_str),
+                "human_decision": issue_input.pointer("/donkeyspace_human_decision"),
+                "resume_target": checkpoint.resume_target,
+            }));
+        }
         (
             previous,
             checkpoint.accumulated_tests.clone(),
@@ -349,10 +476,14 @@ async fn run_work_item_lifecycle(
             checkpoint.last_result.clone(),
         )
     } else {
-        let mut previous = Vec::<Value>::new();
+        let mut previous = checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.previous.clone())
+            .unwrap_or_default();
         if is_resume {
             previous.push(json!({
                 "human_response": issue_input.pointer("/comment/body").and_then(Value::as_str),
+                "human_decision": issue_input.pointer("/donkeyspace_human_decision"),
                 "resume_target": {"work_item": null, "task": flow.start},
             }));
         }
@@ -439,7 +570,23 @@ async fn run_work_item_lifecycle(
         .unwrap_or_default();
     if let Some(checkpoint) = &checkpoint {
         graph.restore_completed(&checkpoint.completed_keys);
-    } else {
+    }
+    let revision_keys = revision_targets
+        .iter()
+        .flat_map(|target| graph.restart_from(target))
+        .collect::<BTreeSet<_>>();
+    if checkpoint.is_none() || rerun_start {
+        if rerun_start
+            && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
+            && let (Some(owner), Some(repo), _) = github_coordinates
+        {
+            for issue_number in projected_issues.values() {
+                if let Err(error) = github.close_issue(owner, repo, *issue_number).await {
+                    tracing::warn!(%error, issue_number, "failed to close superseded projected issue");
+                }
+            }
+            projected_issues.clear();
+        }
         if flow.project_github_issues
             && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
@@ -462,12 +609,75 @@ async fn run_work_item_lifecycle(
                 .project_work_items(owner, repo, parent_issue_number, &work_items)
                 .await
             {
-                Ok(issues) => projected_issues = issues,
+                Ok(issues) => {
+                    if let Some(tracking) = &tracking
+                        && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
+                    {
+                        for (work_item, issue) in &issues {
+                            record_github_managed_resource_for_workflow_item(
+                                tracking.pool,
+                                workflow_item_id,
+                                "issue",
+                                &issue.id.to_string(),
+                                &json!({"work_item": work_item, "issue_number": issue.number}),
+                            )
+                            .await?;
+                        }
+                    }
+                    projected_issues = issues
+                        .into_iter()
+                        .map(|(work_item, issue)| (work_item, issue.number))
+                        .collect();
+                }
                 Err(error) => tracing::warn!(%error, "github work-item projection failed"),
             }
         }
-        if let Some(tracking) = &tracking {
-            for key in graph.keys() {
+    }
+
+    let start_approved = checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.start_approved)
+        && !rerun_start;
+    if flow.tasks[&flow.start].approval == PluginApprovalMode::Required && !start_approved {
+        let pending = vec![PendingApproval {
+            key: TaskKey {
+                work_item: None,
+                task: flow.start.clone(),
+            },
+            trigger: ApprovalTrigger::Required,
+        }];
+        let result = pending_approval_result(
+            &pending,
+            &projected_issues,
+            "The lifecycle start task completed successfully and requires approval before downstream work begins.",
+        );
+        write_lifecycle_checkpoint(
+            &checkpoint_path,
+            &LifecycleCheckpoint {
+                version: CHECKPOINT_VERSION,
+                attempt,
+                accumulated_tests: accumulated_tests.clone(),
+                previous: previous.clone(),
+                aggregate_risk,
+                aggregate_confidence,
+                last_result: result.clone(),
+                completed_keys: Vec::new(),
+                tracked_jobs: Vec::new(),
+                handoffs: Vec::new(),
+                projected_issues: projected_issues.clone(),
+                closed_projected_issues: BTreeSet::new(),
+                resume_target: pending[0].key.clone(),
+                pending_approvals: pending,
+                start_approved: false,
+                revision_targets: Vec::new(),
+            },
+        )?;
+        return Ok(finish_result(result, accumulated_tests, &previous));
+    }
+
+    if let Some(tracking) = &tracking {
+        for key in graph.keys() {
+            if !tracked_jobs.contains_key(key) || revision_keys.contains(key) {
                 let job = create_tracked_job(
                     tracking,
                     manifest,
@@ -612,6 +822,17 @@ async fn run_work_item_lifecycle(
         }
 
         let mut feedback = Vec::new();
+        let mut required_approvals = successful_executions
+            .iter()
+            .filter(|(key, execution)| {
+                execution.result.outcome == Outcome::Implemented
+                    && flow.tasks[&key.task].approval == PluginApprovalMode::Required
+            })
+            .map(|(key, _)| PendingApproval {
+                key: key.clone(),
+                trigger: ApprovalTrigger::Required,
+            })
+            .collect::<Vec<_>>();
         for (key, execution) in &successful_executions {
             accumulated_tests.extend(execution.result.tests.clone());
             aggregate_risk = max_risk(aggregate_risk, execution.result.risk);
@@ -629,7 +850,9 @@ async fn run_work_item_lifecycle(
         // parallel wave. A pause in one task must not discard independent work
         // that completed at the same time.
         for (key, execution) in &successful_executions {
-            if execution.result.outcome == Outcome::Implemented {
+            if execution.result.outcome == Outcome::Implemented
+                && flow.tasks[&key.task].approval != PluginApprovalMode::Required
+            {
                 graph.mark_completed(key);
             }
         }
@@ -690,7 +913,11 @@ async fn run_work_item_lifecycle(
                                 .cloned()
                                 .collect::<Vec<_>>();
                             for pending_key in pending_keys {
-                                if finished_jobs.remove(&pending_key) {
+                                if !required_approvals
+                                    .iter()
+                                    .any(|approval| approval.key == pending_key)
+                                    && finished_jobs.remove(&pending_key)
+                                {
                                     let job = create_tracked_job(
                                         tracking,
                                         manifest,
@@ -708,17 +935,19 @@ async fn run_work_item_lifecycle(
                         // A human decision authorizes a fresh bounded feedback
                         // cycle on the edge that caused the pause.
                         handoffs.insert(edge, 0);
-                        let mut result = execution.result;
-                        result.outcome = Outcome::NeedsHuman;
-                        result.human_review_reason = Some(format!(
-                            "handoff from `{}` to `{}` exceeded policy limit {max_handoffs}: {}\n\nPreserved checkpoint:\n- {} completed task(s) remain valid.\n- Existing block issues and workspace changes will be reused.\n- After a human comment, resume at `{}` for block `{}` and invalidate only that task and its dependents.",
+                        let lead = format!(
+                            "handoff from `{}` to `{}` exceeded policy limit {max_handoffs}: {}\n\nPreserved checkpoint:\n- {} completed task(s) remain valid.\n- Existing block issues and workspace changes will be reused.",
                             key.task,
                             handoff.target,
                             handoff.reason,
-                            graph.completed_keys().count(),
-                            resume_target.task,
-                            resume_target.work_item.as_deref().unwrap_or("workflow")
-                        ));
+                            graph.completed_keys().count()
+                        );
+                        required_approvals.push(PendingApproval {
+                            key: resume_target.clone(),
+                            trigger: ApprovalTrigger::AgentRequested,
+                        });
+                        let result =
+                            pending_approval_result(&required_approvals, &projected_issues, &lead);
                         write_lifecycle_checkpoint(
                             &checkpoint_path,
                             &LifecycleCheckpoint {
@@ -748,7 +977,10 @@ async fn run_work_item_lifecycle(
                                     .collect(),
                                 projected_issues: projected_issues.clone(),
                                 closed_projected_issues: closed_projected_issues.clone(),
-                                resume_target,
+                                resume_target: resume_target.clone(),
+                                pending_approvals: required_approvals,
+                                start_approved: true,
+                                revision_targets: Vec::new(),
                             },
                         )?;
                         return Ok(finish_result(result, accumulated_tests, &previous));
@@ -765,7 +997,11 @@ async fn run_work_item_lifecycle(
                             .cloned()
                             .collect::<Vec<_>>();
                         for pending_key in pending_keys {
-                            if finished_jobs.remove(&pending_key) {
+                            if !required_approvals
+                                .iter()
+                                .any(|approval| approval.key == pending_key)
+                                && finished_jobs.remove(&pending_key)
+                            {
                                 let job = create_tracked_job(
                                     tracking,
                                     manifest,
@@ -780,17 +1016,21 @@ async fn run_work_item_lifecycle(
                             }
                         }
                     }
-                    let mut result = execution.result;
-                    let original_reason = result
+                    let original_reason = execution
+                        .result
                         .human_review_reason
-                        .take()
-                        .unwrap_or_else(|| "task requested human judgment".to_string());
-                    result.human_review_reason = Some(format!(
-                        "{original_reason}\n\nPreserved checkpoint:\n- {} completed task(s) remain valid.\n- Existing block issues and workspace changes will be reused.\n- After a human comment, resume `{}` for block `{}` and invalidate only that task and its dependents.",
-                        graph.completed_keys().count(),
-                        resume_target.task,
-                        resume_target.work_item.as_deref().unwrap_or("workflow")
-                    ));
+                        .as_deref()
+                        .unwrap_or("task requested human judgment");
+                    let lead = format!(
+                        "{original_reason}\n\nPreserved checkpoint:\n- {} completed task(s) remain valid.\n- Existing block issues and workspace changes will be reused.",
+                        graph.completed_keys().count()
+                    );
+                    required_approvals.push(PendingApproval {
+                        key: resume_target.clone(),
+                        trigger: ApprovalTrigger::AgentRequested,
+                    });
+                    let result =
+                        pending_approval_result(&required_approvals, &projected_issues, &lead);
                     write_lifecycle_checkpoint(
                         &checkpoint_path,
                         &LifecycleCheckpoint {
@@ -820,7 +1060,10 @@ async fn run_work_item_lifecycle(
                                 .collect(),
                             projected_issues: projected_issues.clone(),
                             closed_projected_issues: closed_projected_issues.clone(),
-                            resume_target,
+                            resume_target: resume_target.clone(),
+                            pending_approvals: required_approvals,
+                            start_approved: true,
+                            revision_targets: Vec::new(),
                         },
                     )?;
                     return Ok(finish_result(result, accumulated_tests, &previous));
@@ -851,6 +1094,7 @@ async fn run_work_item_lifecycle(
                 work_item,
                 task: target,
             });
+            required_approvals.retain(|approval| !invalidated.contains(&approval.key));
             if let Some(tracking) = &tracking {
                 for invalidated_key in invalidated {
                     if finished_jobs.remove(&invalidated_key) {
@@ -868,6 +1112,49 @@ async fn run_work_item_lifecycle(
                     }
                 }
             }
+        }
+        if !required_approvals.is_empty() {
+            let result = pending_approval_result(
+                &required_approvals,
+                &projected_issues,
+                "The configured tasks completed successfully and require approval before their dependents can run.",
+            );
+            write_lifecycle_checkpoint(
+                &checkpoint_path,
+                &LifecycleCheckpoint {
+                    version: CHECKPOINT_VERSION,
+                    attempt,
+                    accumulated_tests: accumulated_tests.clone(),
+                    previous: previous.clone(),
+                    aggregate_risk,
+                    aggregate_confidence,
+                    last_result: result.clone(),
+                    completed_keys: graph.completed_keys().cloned().collect(),
+                    tracked_jobs: tracked_jobs
+                        .iter()
+                        .map(|(key, job_id)| TrackedJobCheckpoint {
+                            key: key.clone(),
+                            job_id: *job_id,
+                        })
+                        .collect(),
+                    handoffs: handoffs
+                        .iter()
+                        .map(|((work_item, from, to), count)| HandoffCheckpoint {
+                            work_item: work_item.clone(),
+                            from: from.clone(),
+                            to: to.clone(),
+                            count: *count,
+                        })
+                        .collect(),
+                    projected_issues: projected_issues.clone(),
+                    closed_projected_issues: closed_projected_issues.clone(),
+                    resume_target: required_approvals[0].key.clone(),
+                    pending_approvals: required_approvals,
+                    start_approved: true,
+                    revision_targets: Vec::new(),
+                },
+            )?;
+            return Ok(finish_result(result, accumulated_tests, &previous));
         }
         if let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), _) = github_coordinates
@@ -911,6 +1198,86 @@ fn write_lifecycle_checkpoint(
     }
     fs::write(path, serde_json::to_vec_pretty(checkpoint)?)?;
     Ok(())
+}
+
+fn approval_target(key: &TaskKey) -> String {
+    key.work_item
+        .as_ref()
+        .map(|work_item| format!("{}/{work_item}", key.task))
+        .unwrap_or_else(|| key.task.clone())
+}
+
+fn select_pending_approvals(
+    pending: &[PendingApproval],
+    decision: &HumanDecision,
+) -> Result<Vec<PendingApproval>, Box<dyn std::error::Error>> {
+    let target = match decision {
+        HumanDecision::Approve { target } | HumanDecision::Revise { target, .. } => {
+            target.as_deref()
+        }
+    };
+    if target == Some("all") {
+        if matches!(decision, HumanDecision::Revise { .. }) {
+            return Err("revision feedback must target one task".into());
+        }
+        return Ok(pending.to_vec());
+    }
+    if let Some(target) = target {
+        return pending
+            .iter()
+            .find(|approval| approval_target(&approval.key) == target)
+            .cloned()
+            .map(|approval| vec![approval])
+            .ok_or_else(|| format!("no pending approval matches `{target}`").into());
+    }
+    if pending.len() == 1 {
+        return Ok(pending.to_vec());
+    }
+    Err("an approval target is required when multiple tasks are pending".into())
+}
+
+fn pending_approval_result(
+    pending: &[PendingApproval],
+    projected_issues: &BTreeMap<String, i64>,
+    lead: &str,
+) -> RunResult {
+    let targets = pending
+        .iter()
+        .map(|approval| format!("- `{}`", approval_target(&approval.key)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let review_issues = if projected_issues.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nReview the projected work-item issues:\n{}",
+            projected_issues
+                .iter()
+                .map(|(item, number)| format!("- `{item}`: #{number}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let single = (pending.len() == 1).then(|| approval_target(&pending[0].key));
+    let commands = match single {
+        Some(target) => format!(
+            "`/donkeyspace approve {target}`\n\nOr request changes with `/donkeyspace revise {target}` followed by feedback on subsequent lines."
+        ),
+        None => "Approve everything with `/donkeyspace approve all`, approve one target with `/donkeyspace approve <task>`, or revise one target with `/donkeyspace revise <task>` followed by feedback on subsequent lines.".to_string(),
+    };
+    RunResult {
+        outcome: Outcome::NeedsHuman,
+        summary: format!("Awaiting approval for {} task(s).", pending.len()),
+        confidence: Confidence::High,
+        risk: Risk::Unknown,
+        questions: Vec::new(),
+        tests: Vec::new(),
+        changed_files: Vec::new(),
+        human_review_reason: Some(format!(
+            "{lead}\n\nPending approvals:\n{targets}{review_issues}\n\nWhat to do:\n{commands}"
+        )),
+        blocked_reason: None,
+    }
 }
 
 fn failed_task_result(reason: impl Into<String>) -> Value {
@@ -2318,5 +2685,76 @@ flows:
         }];
         assert!(validate_resources_used(&["guide".into()], &resources).is_ok());
         assert!(validate_resources_used(&["missing".into()], &resources).is_err());
+    }
+
+    #[test]
+    fn approval_selection_requires_a_target_for_parallel_tasks() {
+        let pending = vec![
+            PendingApproval {
+                key: TaskKey {
+                    task: "rtl".into(),
+                    work_item: Some("fifo".into()),
+                },
+                trigger: ApprovalTrigger::Required,
+            },
+            PendingApproval {
+                key: TaskKey {
+                    task: "rtl".into(),
+                    work_item: Some("storage".into()),
+                },
+                trigger: ApprovalTrigger::Required,
+            },
+        ];
+        assert!(
+            select_pending_approvals(&pending, &HumanDecision::Approve { target: None }).is_err()
+        );
+        let selected = select_pending_approvals(
+            &pending,
+            &HumanDecision::Approve {
+                target: Some("rtl/storage".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(approval_target(&selected[0].key), "rtl/storage");
+        assert_eq!(
+            select_pending_approvals(
+                &pending,
+                &HumanDecision::Approve {
+                    target: Some("all".into())
+                }
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn revision_requires_feedback_and_one_target() {
+        let pending = vec![PendingApproval {
+            key: TaskKey {
+                task: "architect".into(),
+                work_item: None,
+            },
+            trigger: ApprovalTrigger::Required,
+        }];
+        assert!(
+            select_pending_approvals(
+                &pending,
+                &HumanDecision::Revise {
+                    target: Some("all".into()),
+                    feedback: "change it".into(),
+                }
+            )
+            .is_err()
+        );
+        let result = pending_approval_result(&pending, &BTreeMap::new(), "Review required.");
+        assert_eq!(result.outcome, Outcome::NeedsHuman);
+        assert!(
+            result
+                .human_review_reason
+                .unwrap()
+                .contains("/donkeyspace approve architect")
+        );
     }
 }

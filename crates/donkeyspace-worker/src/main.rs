@@ -487,26 +487,6 @@ async fn execute_job(
 
     match running_job.role.as_str() {
         "triage" => {
-            if input_is_donkeyspace_comment(&running_job.input) {
-                let result_value = json!({
-                    "outcome": "blocked",
-                    "summary": "Ignored donkeyspace-generated comment webhook.",
-                    "confidence": "high",
-                    "risk": "unknown",
-                    "questions": [],
-                    "tests": [],
-                    "changed_files": [],
-                    "human_review_reason": null,
-                    "blocked_reason": "donkeyspace-generated comments do not trigger triage",
-                });
-                complete_job(pool, running_job.id, &result_value).await?;
-                tracing::info!(
-                    job_id = %running_job.id,
-                    "ignored donkeyspace-generated comment job"
-                );
-                return Ok(());
-            }
-
             let repository_context = match build_repository_context(
                 &running_job.input,
                 running_job.id,
@@ -1142,7 +1122,7 @@ async fn execute_developer_job(
                         "owner": owner,
                         "repo": repo,
                         "issue_number": issue_number,
-                        "body": format!("donkeyspace implementation lifecycle opened a pull request: {pull_request_url}"),
+                        "body": format!("donkeyspace implementation lifecycle opened a pull request: {pull_request_url}\n\n<!-- donkeyspace-generated -->"),
                     }),
                 },
             )
@@ -1309,7 +1289,10 @@ async fn execute_reviewer_job(
                     "owner": repository_owner(&running_job.input)?,
                     "repo": repository_name(&running_job.input)?,
                     "issue_number": pull_request_number(&running_job.input).unwrap_or_else(|| issue_number(&running_job.input).unwrap_or(0)),
-                    "body": reviewer_comment_body(&result, running_job.id, &repository_context),
+                    "body": format!(
+                        "{}\n\n<!-- donkeyspace-generated -->",
+                        reviewer_comment_body(&result, running_job.id, &repository_context)
+                    ),
                 }),
             },
         )
@@ -2647,7 +2630,10 @@ async fn create_repair_comment_action(
                 "owner": repository_owner(&running_job.input)?,
                 "repo": repository_name(&running_job.input)?,
                 "issue_number": pull_request_number(&running_job.input).unwrap_or_else(|| issue_number(&running_job.input).unwrap_or(0)),
-                "body": repair_comment_body(result, running_job.id),
+                "body": format!(
+                    "{}\n\n<!-- donkeyspace-generated -->",
+                    repair_comment_body(result, running_job.id)
+                ),
             }),
         },
     )
@@ -3035,15 +3021,6 @@ fn latest_comment(input: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn input_is_donkeyspace_comment(input: &serde_json::Value) -> bool {
-    input.pointer("/action").and_then(serde_json::Value::as_str) == Some("created")
-        && input
-            .pointer("/comment/body")
-            .and_then(serde_json::Value::as_str)
-            .map(|body| body.trim_start().starts_with("donkeyspace "))
-            .unwrap_or(false)
-}
-
 fn input_issue_is_closed(input: &serde_json::Value) -> bool {
     input
         .pointer("/issue/state")
@@ -3063,8 +3040,9 @@ async fn process_outbound_actions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for action in list_pending_outbound_actions(pool, 20).await? {
         match execute_outbound_action(client, &action).await {
-            Ok(()) => {
-                mark_outbound_action_completed(pool, action.id).await?;
+            Ok(provider_resource_id) => {
+                mark_outbound_action_completed(pool, action.id, provider_resource_id.as_deref())
+                    .await?;
                 tracing::info!(
                     action_id = action.id,
                     action_type = action.action_type,
@@ -3090,8 +3068,8 @@ async fn process_outbound_actions(
 async fn execute_outbound_action(
     client: &GitHubClient,
     action: &OutboundActionRecord,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match action.action_type.as_str() {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let provider_resource_id = match action.action_type.as_str() {
         "issue.add_label" => {
             let payload: AddLabelPayload = serde_json::from_value(action.payload.clone())?;
             client
@@ -3102,6 +3080,7 @@ async fn execute_outbound_action(
                     &payload.label,
                 )
                 .await?;
+            None
         }
         "issue.remove_labels" => {
             let payload: RemoveLabelsPayload = serde_json::from_value(action.payload.clone())?;
@@ -3110,10 +3089,11 @@ async fn execute_outbound_action(
                     .remove_issue_label(&payload.owner, &payload.repo, payload.issue_number, &label)
                     .await?;
             }
+            None
         }
         "issue.create_comment" => {
             let payload: CreateCommentPayload = serde_json::from_value(action.payload.clone())?;
-            client
+            let comment_id = client
                 .create_issue_comment(
                     &payload.owner,
                     &payload.repo,
@@ -3121,13 +3101,14 @@ async fn execute_outbound_action(
                     &payload.body,
                 )
                 .await?;
+            Some(comment_id)
         }
         unsupported => {
             return Err(format!("unsupported outbound action type: {unsupported}").into());
         }
-    }
+    };
 
-    Ok(())
+    Ok(provider_resource_id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3157,35 +3138,15 @@ struct CreateCommentPayload {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_run_input, command_summary, conventional_commit_title, input_is_donkeyspace_comment,
-        input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
-        normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
-        required_check_failure_summary, reviewer_changed_files, reviewer_comment_body, run_git,
-        stage_changed_files, token_usage_exceeded_triage_result,
+        agent_run_input, command_summary, conventional_commit_title, input_issue_is_closed,
+        merge_refused_unrelated_histories, non_empty_string, normalize_reviewer_result,
+        parse_porcelain_status, policy_managed_labels, required_check_failure_summary,
+        reviewer_changed_files, reviewer_comment_body, run_git, stage_changed_files,
+        token_usage_exceeded_triage_result,
     };
     use donkeyspace_core::{Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus};
     use serde_json::json;
     use uuid::Uuid;
-
-    #[test]
-    fn detects_generated_comment_job() {
-        assert!(input_is_donkeyspace_comment(&json!({
-            "action": "created",
-            "comment": {
-                "body": "donkeyspace triage needs clarification before this issue can move to implementation."
-            }
-        })));
-    }
-
-    #[test]
-    fn human_comment_job_is_not_generated() {
-        assert!(!input_is_donkeyspace_comment(&json!({
-            "action": "created",
-            "comment": {
-                "body": "Here are the reproduction steps."
-            }
-        })));
-    }
 
     #[test]
     fn closed_issue_input_is_not_eligible_for_agent_work() {

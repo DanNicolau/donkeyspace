@@ -1,7 +1,7 @@
 # Installation and authentication
 
 The `donkeyspace` CLI and TUI share one reusable setup control plane.
-Instance configuration uses `schema_version = 3` and lives under
+Instance configuration uses `schema_version = 4` and lives under
 `$XDG_CONFIG_HOME/donkeyspace` or `~/.config/donkeyspace` by default. Pass
 `--config-dir` to select a different instance.
 
@@ -20,8 +20,9 @@ the operations home screen. Use arrow keys or Tab to move, Enter to continue,
 Space to select repositories or toggle webhook ingress, Esc to go back, and
 `q` to leave the home screen.
 
-The wizard creates or resumes the local-build instance, connects GitHub and
-Codex, runs `doctor`, and offers to start the stack when required checks pass.
+The wizard creates or resumes the local-build instance, connects GitHub,
+configures per-repository trusted identities, connects Codex, runs `doctor`,
+and offers to start the stack when required checks pass.
 The home screen refreshes Compose service state every two seconds and provides
 Doctor, Start, Stop, and authentication reconfiguration actions. Stop preserves
 all volumes. Live logs and destructive reset remain explicit CLI operations.
@@ -45,6 +46,7 @@ The equivalent non-interactive commands are:
 cargo build --bin donkeyspace
 donkeyspace init --source-tree /path/to/donkeyspace
 donkeyspace connect github --repositories OWNER/REPOSITORY
+donkeyspace configure github-access --repository OWNER/REPOSITORY add --user GITHUB_LOGIN
 donkeyspace connect codex --method chatgpt
 donkeyspace doctor
 donkeyspace up
@@ -87,8 +89,9 @@ separate mode `0600` files. The manifest requests only:
 
 - metadata: read;
 - contents: write;
-- issues: write; and
-- pull requests: write.
+- issues: write;
+- pull requests: write; and
+- members: read.
 
 The App is created under the personal account by default. Organization owners
 can pass `--organization ORGANIZATION` to use the organization manifest route.
@@ -99,8 +102,16 @@ repositories must belong to that one owner.
 The TUI presents the same manifest flow as its primary option. After App
 installation it fetches every repository accessible to the installation and
 shows a checkbox list; one or more repositories from the configured owner must
-be selected. Existing-App import and deprecated PAT authentication are under
-the Advanced choices.
+be selected. It then provides per-repository user, owner-organization, and
+owner-team access management. Existing-App import and deprecated PAT
+authentication are under the Advanced choices.
+
+`Members: read` is used only to verify organization and team membership. An
+existing App without it can still use explicit user rules. To enable organization
+or team rules, the App owner adds the permission under
+`https://github.com/settings/apps/APP-SLUG/permissions`, then the organization
+owner approves the update under
+`https://github.com/organizations/ORGANIZATION/settings/installations`.
 
 If the process stops after manifest conversion but before repository selection,
 the TUI resumes from a private `pending-github.json` record on its next launch.
@@ -127,6 +138,7 @@ DONKEYSPACE_GITHUB_APP_ID
 DONKEYSPACE_GITHUB_INSTALLATION_ID
 DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE
 DONKEYSPACE_WEBHOOK_SECRET_FILE
+DONKEYSPACE_GITHUB_REPOSITORIES
 DONKEYSPACE_GITHUB_TOKEN  # deprecated PAT mode only
 ```
 
@@ -134,13 +146,36 @@ App and PAT values are mutually exclusive. The default Compose file binds the
 API and dashboard to localhost, does not publish PostgreSQL, and does not mount
 the Docker socket. The installer writes the configured host bindings through
 `DONKEYSPACE_API_PORT` and `DONKEYSPACE_WEB_PORT`; container-internal ports stay
-fixed. Use `docker-compose.dev.yml` for Vite hot reload. The setup
-control plane generates a private overlay and mounts the Docker socket only on
-the worker when a plugin flow is active.
+fixed. Use `docker-compose.dev.yml` for Vite hot reload. The setup control plane
+generates a private effective policy and plugin overlay, and mounts the Docker
+socket only on the worker when a plugin flow is active.
 The checked-in `.donkeyspace/compose-placeholder` is not a key or webhook
 secret; it only lets an unauthenticated Compose configuration parse. Runtime
 credentials are stored outside the source tree by default, and
 `.donkeyspace/secrets/` is ignored as a defense against accidental commits.
+
+## GitHub engagement access
+
+Each selected repository has separate job-starter and human-approver lists.
+Both start empty for new installations and fail closed. Manage them
+interactively from **Manage GitHub access** or headlessly:
+
+```sh
+donkeyspace configure github-access --repository OWNER/REPOSITORY list
+donkeyspace configure github-access --repository OWNER/REPOSITORY add --user USER
+donkeyspace configure github-access --repository OWNER/REPOSITORY add --organization OWNER
+donkeyspace configure github-access --repository OWNER/REPOSITORY add --team OWNER/TEAM-SLUG
+donkeyspace configure github-access --repository OWNER/REPOSITORY remove --user USER
+donkeyspace configure github-access --repository OWNER/REPOSITORY --scope approvers list
+donkeyspace configure github-access --repository OWNER/REPOSITORY --scope approvers add --team OWNER/TEAM-SLUG
+```
+
+Organization and team entries must belong to the repository owner. Changes are
+saved outside the source tree and recreate a running API service automatically;
+already queued or running jobs continue. Removing the final entry returns that
+scope to deny-all. `doctor` fails until every selected repository has at least
+one job starter and one human approver. Schema-v4 instances initially copy
+their existing trusted identities into both independent lists.
 
 ## Codex
 

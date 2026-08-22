@@ -95,6 +95,7 @@ flows:
       architect:
         role: architect
         write: [docs/design]
+        approval: required
       rtl:
         role: rtl
         scope: work_item
@@ -293,6 +294,12 @@ aggregate checkout is published only after the graph completes.
 
 ## Feedback and human routing
 
+Every task accepts `approval: none|required` and defaults to `none`. With
+`required`, an `implemented` result is preserved but does not satisfy graph
+dependencies until an authorized human approves it. The same setting works on
+the lifecycle start task and work-item tasks. Agents may still return
+`needs_human` dynamically regardless of this setting.
+
 An `implemented` result completes a task. DV or synthesis can return
 `needs_changes` with an allowed handoff:
 
@@ -324,10 +331,16 @@ before publication.
 pausing, donkeyspace writes a versioned handoff checkpoint in the coordinator's
 durable workspace. It records completed graph nodes, child jobs, projected
 GitHub issues, handoff counters, test evidence, and the exact task to resume.
-The GitHub comment explains what decision is needed and what work will be
-preserved. A human reply requeues the same coordinator UUID, reuses the
+The GitHub comment explains what decision is needed, the exact approval command,
+and what work will be preserved. An explicit `/donkeyspace approve` or
+`/donkeyspace revise` reply requeues the same coordinator UUID, reuses the
 checkout and projected block issues, and restarts only the target task and its
 downstream dependents. Successful parallel siblings remain complete.
+
+The reply must first pass the policy's `needs_human_resume` engagement rule;
+denied replies leave the coordinator paused. Projected issue IDs are registered
+as Donkeyspace-managed resources so their webhook or polling events cannot
+start an independent lifecycle.
 
 ## Filesystem isolation
 

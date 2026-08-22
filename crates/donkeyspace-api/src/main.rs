@@ -7,22 +7,32 @@ use axum::{
     routing::{get, post},
 };
 use donkeyspace_core::{
-    AgentRole, LabelState, PluginManifest, Policy, WorkflowState, normalize_workflow_labels,
+    AgentRole, EngagementGate, EngagementSelector, LabelState, PluginManifest, Policy,
+    WorkflowState, normalize_workflow_labels,
 };
 use donkeyspace_db::{
-    DbConfig, JobRecord, PgPool, PullRequestInput, RepositoryInput, WorkflowItemInput,
-    acquire_job_lease, active_job_exists_for_workflow_item, apply_migrations, connect, create_job,
-    create_retry_job, get_job, get_workflow_item_by_issue_number, get_workflow_item_state,
-    latest_workflow_job_input, list_job_command_results, list_job_outbound_actions,
-    list_job_transitions, list_jobs, list_open_managed_pull_requests_for_base,
-    list_recent_outbound_actions, record_state_transition, record_webhook_delivery,
-    repair_job_exists_for_pr_base, resume_latest_paused_job, reviewer_job_exists_for_pr_head,
-    upsert_pull_request, upsert_repository, upsert_workflow_item,
+    DbConfig, EngagementDecisionInput, JobRecord, PgPool, PullRequestInput, RepositoryInput,
+    WorkflowItemInput, acquire_job_lease, active_job_exists_for_workflow_item, apply_migrations,
+    connect, create_job, create_retry_job, get_job, get_workflow_item_by_issue_number,
+    get_workflow_item_state, github_managed_resource_exists, latest_workflow_job_input,
+    list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
+    list_open_managed_pull_requests_for_base, list_recent_engagement_decisions,
+    list_recent_outbound_actions, pending_outbound_comment_exists, record_engagement_decision,
+    record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
+    resume_latest_paused_job, reviewer_job_exists_for_pr_head, upsert_pull_request,
+    upsert_repository, upsert_workflow_item,
 };
 use donkeyspace_github::{GitHubClient, GitHubCredentialProvider};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use std::{env, fs, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env, fs,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -33,6 +43,9 @@ struct AppState {
     github_auth: Option<GitHubCredentialProvider>,
     pool: Option<PgPool>,
     policy: Policy,
+    github_token_owner: Option<String>,
+    configured_repositories: Vec<PolledRepository>,
+    verification_cache: Arc<Mutex<HashMap<String, (Instant, String)>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +74,18 @@ struct GitHubIngressEvent {
     payload: Value,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum HumanApprovalAction {
+    Approve {
+        target: Option<String>,
+    },
+    Revise {
+        target: Option<String>,
+        feedback: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
@@ -79,6 +104,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let github_auth = GitHubCredentialProvider::from_env()?;
+    let github_token_owner = match github_auth.as_ref() {
+        Some(provider) if provider.installation_id().is_none() => {
+            Some(provider.client().authenticated_login().await?)
+        }
+        _ => None,
+    };
+    let configured_repositories = parse_polled_repositories(
+        &env::var("DONKEYSPACE_GITHUB_REPOSITORIES").unwrap_or_default(),
+    )?;
     let state = Arc::new(AppState {
         webhook_secret: load_optional_secret(
             "DONKEYSPACE_WEBHOOK_SECRET",
@@ -87,6 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         github_auth,
         pool,
         policy,
+        github_token_owner,
+        configured_repositories,
+        verification_cache: Arc::new(Mutex::new(HashMap::new())),
     });
 
     start_github_poller(state.clone())?;
@@ -95,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/api/runs", get(api_runs))
         .route("/api/outbound-actions", get(api_outbound_actions))
+        .route("/api/engagement-decisions", get(api_engagement_decisions))
         .route("/api/runs/{id}", get(api_run))
         .route("/api/runs/{id}/transitions", get(api_run_transitions))
         .route("/api/runs/{id}/lease", post(api_lease_run))
@@ -245,7 +283,7 @@ async fn poll_github_events(
             let body = serde_json::to_vec(&ingress.payload)?;
             match persist_github_webhook(
                 pool,
-                &state.policy,
+                state,
                 ingress.event_name,
                 &ingress.delivery_id,
                 &body,
@@ -310,8 +348,12 @@ fn github_poll_event_to_ingress(
     let repository = json!({
         "name": repository.get("name")?,
         "default_branch": repository.get("default_branch")?,
-        "owner": {"login": repository.pointer("/owner/login")?},
+        "owner": {
+            "login": repository.pointer("/owner/login")?,
+            "type": repository.pointer("/owner/type").cloned().unwrap_or(Value::Null),
+        },
     });
+    let sender = event.get("actor")?;
     let (event_name, payload) = match event_type {
         "IssuesEvent" => (
             "issues",
@@ -320,6 +362,7 @@ fn github_poll_event_to_ingress(
                 "repository": repository,
                 "issue": source.get("issue")?,
                 "label": source.get("label").cloned().unwrap_or(Value::Null),
+                "sender": sender,
             }),
         ),
         "IssueCommentEvent" => (
@@ -329,6 +372,7 @@ fn github_poll_event_to_ingress(
                 "repository": repository,
                 "issue": source.get("issue")?,
                 "comment": source.get("comment")?,
+                "sender": sender,
             }),
         ),
         "PullRequestEvent" => (
@@ -469,6 +513,28 @@ async fn api_outbound_actions(State(state): State<Arc<AppState>>) -> impl IntoRe
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError::new("failed to list outbound actions")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_engagement_decisions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+
+    match list_recent_engagement_decisions(pool, 100).await {
+        Ok(decisions) => Json(decisions).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list engagement decisions");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to list engagement decisions")),
             )
                 .into_response()
         }
@@ -636,6 +702,11 @@ async fn github_webhook(
         }
     }
 
+    if !webhook_repository_allowed(&state.configured_repositories, &body) {
+        tracing::warn!("github webhook repository is not configured");
+        return StatusCode::FORBIDDEN;
+    }
+
     let Some(pool) = &state.pool else {
         tracing::info!(
             event,
@@ -646,7 +717,7 @@ async fn github_webhook(
         return StatusCode::ACCEPTED;
     };
 
-    match persist_github_webhook(pool, &state.policy, event, delivery, &body).await {
+    match persist_github_webhook(pool, &state, event, delivery, &body).await {
         Ok(WebhookPersistOutcome::Ignored) => StatusCode::ACCEPTED,
         Ok(WebhookPersistOutcome::Duplicate) => StatusCode::OK,
         Ok(WebhookPersistOutcome::Queued(job)) => {
@@ -665,6 +736,23 @@ fn webhook_installation_matches(expected: u64, body: &[u8]) -> bool {
         .ok()
         .and_then(|payload| payload.pointer("/installation/id").and_then(Value::as_u64))
         == Some(expected)
+}
+
+fn webhook_repository_allowed(configured: &[PolledRepository], body: &[u8]) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let owner = payload
+        .pointer("/repository/owner/login")
+        .and_then(Value::as_str);
+    let name = payload.pointer("/repository/name").and_then(Value::as_str);
+    configured.iter().any(|repository| {
+        owner.is_some_and(|owner| repository.owner.eq_ignore_ascii_case(owner))
+            && name.is_some_and(|name| repository.name.eq_ignore_ascii_case(name))
+    })
 }
 
 fn init_tracing() {
@@ -725,21 +813,23 @@ fn lifecycle_start_role(policy: &Policy) -> Result<Option<String>, Box<dyn std::
 
 async fn persist_github_webhook(
     pool: &PgPool,
-    policy: &Policy,
+    state: &AppState,
     event: &str,
     delivery: &str,
     body: &[u8],
 ) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
     match event {
         "issues" | "issue_comment" => {
-            persist_issue_webhook(pool, policy, event, delivery, body).await
+            persist_issue_webhook(pool, state, event, delivery, body).await
         }
-        "pull_request" => persist_pull_request_webhook(pool, policy, event, delivery, body).await,
-        "push" => persist_push_webhook(pool, policy, event, delivery, body).await,
+        "pull_request" => {
+            persist_pull_request_webhook(pool, &state.policy, event, delivery, body).await
+        }
+        "push" => persist_push_webhook(pool, &state.policy, event, delivery, body).await,
         _ => {
             let payload: Value = serde_json::from_slice(body)?;
             let inserted = record_webhook_delivery(pool, None, delivery, event, &payload).await?;
-            Ok(if inserted {
+            Ok(if inserted.is_some() {
                 WebhookPersistOutcome::Ignored
             } else {
                 WebhookPersistOutcome::Duplicate
@@ -750,13 +840,14 @@ async fn persist_github_webhook(
 
 async fn persist_issue_webhook(
     pool: &PgPool,
-    policy: &Policy,
+    app_state: &AppState,
     event: &str,
     delivery: &str,
     body: &[u8],
 ) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
+    let policy = &app_state.policy;
     let payload: GitHubIssueWebhook = serde_json::from_slice(body)?;
-    let payload_value: Value = serde_json::from_slice(body)?;
+    let mut payload_value: Value = serde_json::from_slice(body)?;
     let repository_id = upsert_repository(
         pool,
         &RepositoryInput {
@@ -769,24 +860,24 @@ async fn persist_issue_webhook(
                 .as_ref()
                 .map(|_| payload.repository.owner.login.clone()),
             provider: "github".to_string(),
-            owner: payload.repository.owner.login,
-            name: payload.repository.name,
-            default_branch: payload.repository.default_branch,
+            owner: payload.repository.owner.login.clone(),
+            name: payload.repository.name.clone(),
+            default_branch: payload.repository.default_branch.clone(),
         },
     )
     .await?;
 
     let inserted =
         record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
-    if !inserted {
+    let Some(webhook_delivery_id) = inserted else {
         return Ok(WebhookPersistOutcome::Duplicate);
-    }
+    };
 
     let labels = payload
         .issue
         .labels
-        .into_iter()
-        .map(|label| label.name)
+        .iter()
+        .map(|label| label.name.clone())
         .collect::<Vec<_>>();
     let label_state = normalize_workflow_labels(&labels, &policy.workflow.state_labels);
     let label_state_name = match &label_state {
@@ -834,26 +925,6 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
-    if is_projected_work_item(&payload.issue.body) {
-        tracing::info!(
-            issue_number = payload.issue.number,
-            "projected plugin work-item issue did not queue an independent lifecycle"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let automation_decision = policy.automation_decision_for_labels(&labels);
-    if !automation_decision.is_allowed() {
-        tracing::info!(
-            event,
-            action = payload.action,
-            issue_number = payload.issue.number,
-            reason = automation_decision.reason(),
-            "policy did not allow agent work"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
     if !should_queue_triage(
         event,
         &payload.action,
@@ -873,6 +944,146 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
+    let human_approval = if current_state.as_deref() == Some("needs_human") {
+        payload
+            .comment
+            .as_ref()
+            .and_then(|comment| parse_human_approval_command(&comment.body))
+    } else {
+        None
+    };
+
+    let gate = engagement_gate(event, current_state.as_deref())
+        .ok_or("queueable github event has no engagement gate")?;
+    let managed_resource = if let Some(comment) = &payload.comment {
+        let registered = match comment.id {
+            Some(comment_id) => {
+                github_managed_resource_exists(
+                    pool,
+                    repository_id,
+                    "issue_comment",
+                    &comment_id.to_string(),
+                )
+                .await?
+            }
+            None => false,
+        };
+        let pending = match payload_value
+            .pointer("/comment/body")
+            .and_then(Value::as_str)
+        {
+            Some(body) => pending_outbound_comment_exists(pool, workflow_item_id, body).await?,
+            None => false,
+        };
+        registered || pending
+    } else {
+        let created_by_this_app = app_state
+            .github_auth
+            .as_ref()
+            .and_then(GitHubCredentialProvider::app_id)
+            .zip(payload.issue.performed_via_github_app.as_ref())
+            .is_some_and(|(configured, actual)| configured == actual.id);
+        (is_projected_work_item(&payload.issue.body) && created_by_this_app)
+            || github_managed_resource_exists(
+                pool,
+                repository_id,
+                "issue",
+                &payload.issue.id.to_string(),
+            )
+            .await?
+    };
+    if managed_resource {
+        record_engagement_decision(
+            pool,
+            &EngagementDecisionInput {
+                webhook_delivery_id,
+                workflow_item_id: Some(workflow_item_id),
+                gate: gate.as_str().into(),
+                disposition: "system_generated".into(),
+                actor: payload
+                    .sender
+                    .as_ref()
+                    .and_then(|actor| serde_json::to_value(actor).ok()),
+                matched_selector: None,
+                reason: "donkeyspace-managed github resource cannot trigger agent work".into(),
+            },
+        )
+        .await?;
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
+    let automation_decision = policy.automation_decision_for_labels(&labels);
+    if !automation_decision.is_allowed() {
+        record_engagement_decision(
+            pool,
+            &EngagementDecisionInput {
+                webhook_delivery_id,
+                workflow_item_id: Some(workflow_item_id),
+                gate: gate.as_str().into(),
+                disposition: "denied".into(),
+                actor: payload
+                    .sender
+                    .as_ref()
+                    .and_then(|actor| serde_json::to_value(actor).ok()),
+                matched_selector: None,
+                reason: automation_decision.reason(),
+            },
+        )
+        .await?;
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+
+    let authorization = authorize_engagement(app_state, gate, &labels, &payload).await;
+    let audit = record_engagement_decision(
+        pool,
+        &EngagementDecisionInput {
+            webhook_delivery_id,
+            workflow_item_id: Some(workflow_item_id),
+            gate: gate.as_str().into(),
+            disposition: if authorization.allowed {
+                "allowed"
+            } else {
+                "denied"
+            }
+            .into(),
+            actor: payload
+                .sender
+                .as_ref()
+                .and_then(|actor| serde_json::to_value(actor).ok()),
+            matched_selector: authorization.matched_selector.clone(),
+            reason: authorization.reason.clone(),
+        },
+    )
+    .await?;
+    if !authorization.allowed {
+        tracing::info!(
+            event,
+            action = payload.action,
+            issue_number = payload.issue.number,
+            reason = authorization.reason,
+            "engagement authorization denied agent work"
+        );
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
+    if let Value::Object(map) = &mut payload_value {
+        map.insert(
+            "donkeyspace_engagement".into(),
+            json!({
+                "decision_id": audit.id,
+                "gate": gate.as_str(),
+                "actor": payload.sender,
+                "matched_selector": authorization.matched_selector,
+                "reason": authorization.reason,
+            }),
+        );
+        if let Some(action) = human_approval {
+            map.insert(
+                "donkeyspace_human_decision".into(),
+                serde_json::to_value(action).expect("approval action serializes"),
+            );
+        }
+    }
+
     if active_job_exists_for_workflow_item(pool, workflow_item_id).await? {
         tracing::info!(
             event,
@@ -883,13 +1094,7 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
-    if event == "issue_comment"
-        && current_state.as_deref() == Some(WorkflowState::NeedsHuman.as_str())
-        && payload
-            .comment
-            .as_ref()
-            .map(is_human_comment)
-            .unwrap_or(false)
+    if gate == EngagementGate::NeedsHumanResume
         && let Some(job) = resume_latest_paused_job(pool, workflow_item_id, &payload_value).await?
     {
         record_state_transition(
@@ -898,7 +1103,10 @@ async fn persist_issue_webhook(
             Some(job.id),
             current_state.as_deref(),
             "lifecycle_resumed",
-            "resumed paused plugin lifecycle from human comment",
+            &format!(
+                "resumed paused plugin lifecycle from authorized github event; engagement decision {}",
+                audit.id
+            ),
         )
         .await?;
         return Ok(WebhookPersistOutcome::Queued(job));
@@ -913,7 +1121,10 @@ async fn persist_issue_webhook(
         Some(job.id),
         current_state.as_deref(),
         &format!("{initial_role}_queued"),
-        &format!("queued {initial_role} job from github webhook"),
+        &format!(
+            "queued {initial_role} job from github webhook; engagement decision {}",
+            audit.id
+        ),
     )
     .await?;
 
@@ -954,7 +1165,7 @@ async fn persist_pull_request_webhook(
 
     let inserted =
         record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
-    if !inserted {
+    if inserted.is_none() {
         return Ok(WebhookPersistOutcome::Duplicate);
     }
 
@@ -1093,7 +1304,7 @@ async fn persist_push_webhook(
 
     let inserted =
         record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
-    if !inserted {
+    if inserted.is_none() {
         return Ok(WebhookPersistOutcome::Duplicate);
     }
     if policy.lifecycle.plugin.is_some() {
@@ -1190,28 +1401,344 @@ fn should_queue_triage(
         return false;
     }
 
+    if current_state == Some("needs_human") {
+        return event == "issue_comment"
+            && action == "created"
+            && comment
+                .is_some_and(|comment| parse_human_approval_command(&comment.body).is_some());
+    }
+
     match (event, action) {
         ("issues", "opened" | "edited" | "reopened") => true,
         ("issues", "labeled") => {
             changed_label
                 .map(|label| allow_labels.iter().any(|allowed| allowed == label))
                 .unwrap_or(false)
-                && matches!(
-                    current_state,
-                    None | Some("needs_info" | "needs_human" | "blocked")
-                )
+                && matches!(current_state, None | Some("needs_info" | "blocked"))
         }
         ("issue_comment", "created" | "edited") => {
             matches!(
                 current_state,
-                Some(state)
-                    if matches!(
-                        state,
-                        "needs_info" | "needs_human" | "blocked"
-                    )
-            ) && comment.map(is_human_comment).unwrap_or(false)
+                Some(state) if matches!(state, "needs_info" | "blocked")
+            ) && comment.is_some()
         }
         _ => false,
+    }
+}
+
+fn parse_human_approval_command(body: &str) -> Option<HumanApprovalAction> {
+    let mut lines = body.lines();
+    let first = lines.find(|line| !line.trim().is_empty())?.trim();
+    let mut parts = first.split_whitespace();
+    if parts.next()? != "/donkeyspace" {
+        return None;
+    }
+    let action = parts.next()?;
+    let target = parts.next().map(str::to_string);
+    if parts.next().is_some()
+        || target
+            .as_deref()
+            .is_some_and(|value| !valid_approval_target(value))
+    {
+        return None;
+    }
+    match action {
+        "approve" => Some(HumanApprovalAction::Approve { target }),
+        "revise" => {
+            let feedback = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+            (!feedback.is_empty()).then_some(HumanApprovalAction::Revise { target, feedback })
+        }
+        _ => None,
+    }
+}
+
+fn valid_approval_target(value: &str) -> bool {
+    value == "all"
+        || (!value.is_empty()
+            && value.matches('/').count() <= 1
+            && value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
+            }))
+}
+
+fn engagement_gate(event: &str, current_state: Option<&str>) -> Option<EngagementGate> {
+    match current_state {
+        Some("needs_info") => Some(EngagementGate::NeedsInfoResume),
+        Some("blocked") => Some(EngagementGate::BlockedResume),
+        Some("needs_human") => Some(EngagementGate::NeedsHumanResume),
+        _ if event == "issues" => Some(EngagementGate::Initial),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct AuthorizationDecision {
+    allowed: bool,
+    reason: String,
+    matched_selector: Option<Value>,
+}
+
+async fn authorize_engagement(
+    state: &AppState,
+    gate: EngagementGate,
+    labels: &[String],
+    payload: &GitHubIssueWebhook,
+) -> AuthorizationDecision {
+    let Some(actor) = payload.sender.as_ref() else {
+        return AuthorizationDecision {
+            allowed: false,
+            reason: "github event is missing sender identity".into(),
+            matched_selector: None,
+        };
+    };
+    if actor.login.trim().is_empty() {
+        return AuthorizationDecision {
+            allowed: false,
+            reason: "github event sender identity has no login".into(),
+            matched_selector: None,
+        };
+    }
+    if payload
+        .comment
+        .as_ref()
+        .is_some_and(|comment| comment.id.is_none())
+    {
+        return AuthorizationDecision {
+            allowed: false,
+            reason: "github comment event is missing comment identity".into(),
+            matched_selector: None,
+        };
+    }
+    let repository = format!(
+        "{}/{}",
+        payload.repository.owner.login, payload.repository.name
+    );
+    let rule = state
+        .policy
+        .workflow
+        .engagement
+        .rule(gate, Some(&repository));
+    let missing_labels = rule
+        .required_labels
+        .iter()
+        .filter(|required| !labels.iter().any(|label| label == *required))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_labels.is_empty() {
+        return AuthorizationDecision {
+            allowed: false,
+            reason: format!(
+                "missing required engagement labels: {}",
+                missing_labels.join(", ")
+            ),
+            matched_selector: None,
+        };
+    }
+
+    let (content_actor, content_association) = match payload.comment.as_ref() {
+        Some(comment) => (comment.user.as_ref(), comment.author_association.as_deref()),
+        None => (
+            payload.issue.user.as_ref(),
+            payload.issue.author_association.as_deref(),
+        ),
+    };
+    let author_association = if content_actor
+        .is_some_and(|content_actor| actor.login.eq_ignore_ascii_case(&content_actor.login))
+    {
+        content_association
+    } else {
+        None
+    };
+    let performed_app = payload
+        .comment
+        .as_ref()
+        .and_then(|comment| comment.performed_via_github_app.as_ref())
+        .or(payload.issue.performed_via_github_app.as_ref());
+    let mut failures = Vec::new();
+
+    for selector in &rule.allow {
+        let result: Result<bool, String> = match selector {
+            EngagementSelector::TokenOwner => Ok(state
+                .github_token_owner
+                .as_ref()
+                .map(|login| login.eq_ignore_ascii_case(&actor.login))
+                .unwrap_or(false)),
+            EngagementSelector::AnyUser => Ok(actor.kind.as_deref() == Some("User")),
+            EngagementSelector::User { login } => Ok(
+                actor.kind.as_deref() == Some("User") && actor.login.eq_ignore_ascii_case(login)
+            ),
+            EngagementSelector::IssueAuthor => Ok(payload
+                .issue
+                .user
+                .as_ref()
+                .is_some_and(|author| actor.login.eq_ignore_ascii_case(&author.login))),
+            EngagementSelector::RepositoryOwner => Ok(payload.repository.owner.kind.as_deref()
+                != Some("Organization")
+                && actor
+                    .login
+                    .eq_ignore_ascii_case(&payload.repository.owner.login)),
+            EngagementSelector::RepositoryOrganizationMember => {
+                if payload.repository.owner.kind.as_deref() != Some("Organization") {
+                    Ok(false)
+                } else {
+                    verify_organization_member(state, &payload.repository.owner.login, &actor.login)
+                        .await
+                }
+            }
+            EngagementSelector::OrganizationMember { organization } => {
+                verify_organization_member(state, organization, &actor.login).await
+            }
+            EngagementSelector::TeamMember {
+                organization,
+                team_slug,
+            } => verify_team_member(state, organization, team_slug, &actor.login).await,
+            EngagementSelector::AuthorAssociation { association } => {
+                Ok(author_association == Some(association.as_str()))
+            }
+            EngagementSelector::CollaboratorPermission { minimum } => {
+                verify_collaborator_permission(
+                    state,
+                    &payload.repository.owner.login,
+                    &payload.repository.name,
+                    &actor.login,
+                )
+                .await
+                .map(|actual| permission_rank(&actual) >= permission_rank(minimum))
+            }
+            EngagementSelector::Bot { login } => {
+                Ok(actor.kind.as_deref() == Some("Bot") && actor.login.eq_ignore_ascii_case(login))
+            }
+            EngagementSelector::GitHubApp { id, slug } => Ok(performed_app
+                .map(|app| {
+                    id.map(|expected| app.id == expected).unwrap_or(false)
+                        || slug
+                            .as_ref()
+                            .map(|expected| app.slug.eq_ignore_ascii_case(expected))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)),
+        };
+
+        match result {
+            Ok(true) => {
+                return AuthorizationDecision {
+                    allowed: true,
+                    reason: format!("actor matched engagement selector `{selector:?}`"),
+                    matched_selector: serde_json::to_value(selector).ok(),
+                };
+            }
+            Ok(false) => failures.push(format!("`{selector:?}` did not match")),
+            Err(error) => failures.push(format!("`{selector:?}` could not be verified: {error}")),
+        }
+    }
+
+    AuthorizationDecision {
+        allowed: false,
+        reason: if failures.is_empty() {
+            "engagement rule has no allowed identities".into()
+        } else {
+            failures.join("; ")
+        },
+        matched_selector: None,
+    }
+}
+
+async fn verify_organization_member(
+    state: &AppState,
+    organization: &str,
+    actor: &str,
+) -> Result<bool, String> {
+    let key = format!("org:{organization}:{actor}").to_ascii_lowercase();
+    if let Some(value) = verification_cache_get(state, &key).await {
+        return Ok(value == "true");
+    }
+    let result = match &state.github_auth {
+        Some(provider) => provider
+            .client()
+            .organization_member(organization, actor)
+            .await
+            .map_err(|error| error.to_string()),
+        None => Err("github credentials are unavailable".into()),
+    }?;
+    verification_cache_put(state, key, result.to_string()).await;
+    Ok(result)
+}
+
+async fn verify_team_member(
+    state: &AppState,
+    organization: &str,
+    team_slug: &str,
+    actor: &str,
+) -> Result<bool, String> {
+    let key = format!("team:{organization}:{team_slug}:{actor}").to_ascii_lowercase();
+    if let Some(value) = verification_cache_get(state, &key).await {
+        return Ok(value == "true");
+    }
+    let result = match &state.github_auth {
+        Some(provider) => provider
+            .client()
+            .team_member(organization, team_slug, actor)
+            .await
+            .map_err(|error| error.to_string()),
+        None => Err("github credentials are unavailable".into()),
+    }?;
+    verification_cache_put(state, key, result.to_string()).await;
+    Ok(result)
+}
+
+async fn verify_collaborator_permission(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    actor: &str,
+) -> Result<String, String> {
+    let key = format!("permission:{owner}:{repo}:{actor}").to_ascii_lowercase();
+    if let Some(value) = verification_cache_get(state, &key).await {
+        return Ok(value);
+    }
+    let result = match &state.github_auth {
+        Some(provider) => provider
+            .client()
+            .collaborator_permission(owner, repo, actor)
+            .await
+            .map_err(|error| error.to_string()),
+        None => Err("github credentials are unavailable".into()),
+    }?;
+    verification_cache_put(state, key, result.clone()).await;
+    Ok(result)
+}
+
+async fn verification_cache_get(state: &AppState, key: &str) -> Option<String> {
+    let cache = state.verification_cache.lock().await;
+    cache.get(key).and_then(|(created_at, value)| {
+        (created_at.elapsed() < Duration::from_secs(300)).then(|| value.clone())
+    })
+}
+
+async fn verification_cache_put(state: &AppState, key: String, value: String) {
+    let mut cache = state.verification_cache.lock().await;
+    if cache.len() >= 1_024 {
+        cache.retain(|_, (created_at, _)| created_at.elapsed() < Duration::from_secs(300));
+        if cache.len() >= 1_024
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (created_at, _))| *created_at)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, (Instant::now(), value));
+}
+
+fn permission_rank(permission: &str) -> u8 {
+    match permission {
+        "admin" => 5,
+        "maintain" => 4,
+        "write" | "push" => 3,
+        "triage" => 2,
+        "read" | "pull" => 1,
+        _ => 0,
     }
 }
 
@@ -1243,14 +1770,6 @@ fn can_retry_job(job: &JobRecord) -> bool {
             .and_then(|result| result.get("outcome").and_then(Value::as_str)),
         Some("blocked" | "needs_human")
     )
-}
-
-fn is_human_comment(comment: &GitHubComment) -> bool {
-    !comment_is_from_donkeyspace(comment)
-}
-
-fn comment_is_from_donkeyspace(comment: &GitHubComment) -> bool {
-    comment.body.trim_start().starts_with("donkeyspace ")
 }
 
 fn pull_request_is_managed(pull_request: &GitHubPullRequest) -> bool {
@@ -1308,6 +1827,8 @@ struct GitHubIssueWebhook {
     label: Option<GitHubLabel>,
     #[serde(default)]
     installation: Option<GitHubInstallation>,
+    #[serde(default)]
+    sender: Option<GitHubActor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1344,6 +1865,8 @@ struct GitHubRepository {
 #[derive(Debug, Deserialize)]
 struct GitHubOwner {
     login: String,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1354,6 +1877,12 @@ struct GitHubIssue {
     #[serde(default, deserialize_with = "deserialize_null_default")]
     body: String,
     labels: Vec<GitHubLabel>,
+    #[serde(default)]
+    user: Option<GitHubActor>,
+    #[serde(default)]
+    author_association: Option<String>,
+    #[serde(default)]
+    performed_via_github_app: Option<GitHubAppIdentity>,
 }
 
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -1371,7 +1900,32 @@ struct GitHubLabel {
 
 #[derive(Debug, Deserialize)]
 struct GitHubComment {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    user: Option<GitHubActor>,
+    #[serde(default)]
+    author_association: Option<String>,
+    #[serde(default)]
+    performed_via_github_app: Option<GitHubAppIdentity>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     body: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubActor {
+    #[serde(default)]
+    login: String,
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GitHubAppIdentity {
+    id: u64,
+    slug: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1425,14 +1979,211 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubComment, GitHubIssueWebhook, JobRecord, can_retry_job, comment_is_from_donkeyspace,
+        AppState, GitHubActor, GitHubAppIdentity, GitHubComment, GitHubIssue, GitHubIssueWebhook,
+        GitHubLabel, GitHubOwner, GitHubRepository, HumanApprovalAction, JobRecord,
+        PolledRepository, authorize_engagement, can_retry_job, engagement_gate,
         extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
-        issue_number_from_donkeyspace_branch, parse_polled_repositories, polled_repository_input,
-        should_queue_reviewer, should_queue_triage, webhook_installation_matches,
+        issue_number_from_donkeyspace_branch, parse_human_approval_command,
+        parse_polled_repositories, permission_rank, polled_repository_input, should_queue_reviewer,
+        should_queue_triage, webhook_installation_matches, webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
+    use donkeyspace_core::{EngagementGate, EngagementSelector, Policy};
     use serde_json::json;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::Mutex;
     use uuid::Uuid;
+
+    fn comment() -> GitHubComment {
+        GitHubComment {
+            id: Some(1),
+            user: Some(GitHubActor {
+                login: "human".into(),
+                id: Some(1),
+                kind: Some("User".into()),
+            }),
+            author_association: Some("MEMBER".into()),
+            performed_via_github_app: None,
+            body: "ordinary response".into(),
+        }
+    }
+
+    fn engagement_state(selectors: Vec<EngagementSelector>) -> AppState {
+        let mut policy =
+            Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        policy.workflow.engagement.default.allow = selectors;
+        policy.workflow.engagement.initial = None;
+        AppState {
+            webhook_secret: None,
+            github_auth: None,
+            pool: None,
+            policy,
+            github_token_owner: Some("maintainer".into()),
+            configured_repositories: Vec::new(),
+            verification_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn engagement_payload(sender: GitHubActor) -> GitHubIssueWebhook {
+        GitHubIssueWebhook {
+            action: "opened".into(),
+            repository: GitHubRepository {
+                name: "repo".into(),
+                default_branch: "main".into(),
+                owner: GitHubOwner {
+                    login: "acme".into(),
+                    kind: Some("Organization".into()),
+                },
+            },
+            issue: GitHubIssue {
+                id: 7,
+                number: 7,
+                state: "open".into(),
+                body: "work".into(),
+                labels: vec![GitHubLabel { name: "ai".into() }],
+                user: Some(GitHubActor {
+                    login: "author".into(),
+                    id: Some(2),
+                    kind: Some("User".into()),
+                }),
+                author_association: Some("NONE".into()),
+                performed_via_github_app: None,
+            },
+            comment: None,
+            label: None,
+            installation: None,
+            sender: Some(sender),
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_default_allows_only_authenticated_token_owner() {
+        let state = engagement_state(vec![EngagementSelector::TokenOwner]);
+        let allowed = authorize_engagement(
+            &state,
+            EngagementGate::Initial,
+            &["ai".into()],
+            &engagement_payload(GitHubActor {
+                login: "maintainer".into(),
+                id: Some(1),
+                kind: Some("User".into()),
+            }),
+        )
+        .await;
+        let denied = authorize_engagement(
+            &state,
+            EngagementGate::Initial,
+            &["ai".into()],
+            &engagement_payload(GitHubActor {
+                login: "outsider".into(),
+                id: Some(3),
+                kind: Some("User".into()),
+            }),
+        )
+        .await;
+        let mut missing_actor = engagement_payload(GitHubActor {
+            login: "unused".into(),
+            id: None,
+            kind: None,
+        });
+        missing_actor.sender = None;
+        let missing_actor = authorize_engagement(
+            &state,
+            EngagementGate::Initial,
+            &["ai".into()],
+            &missing_actor,
+        )
+        .await;
+
+        assert!(allowed.allowed);
+        assert!(!denied.allowed);
+        assert!(!missing_actor.allowed);
+        assert!(missing_actor.reason.contains("missing sender"));
+    }
+
+    #[tokio::test]
+    async fn github_app_selector_uses_verified_app_metadata() {
+        let state = engagement_state(vec![EngagementSelector::GitHubApp {
+            id: None,
+            slug: Some("trusted-app".into()),
+        }]);
+        let mut payload = engagement_payload(GitHubActor {
+            login: "trusted-app[bot]".into(),
+            id: Some(4),
+            kind: Some("Bot".into()),
+        });
+        payload.issue.performed_via_github_app = Some(GitHubAppIdentity {
+            id: 10,
+            slug: "trusted-app".into(),
+        });
+
+        assert!(
+            authorize_engagement(&state, EngagementGate::Initial, &["ai".into()], &payload)
+                .await
+                .allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn selectors_requiring_content_authors_fail_closed_when_they_are_missing() {
+        let issue_author_state = engagement_state(vec![EngagementSelector::IssueAuthor]);
+        let mut issue_payload = engagement_payload(GitHubActor {
+            login: "author".into(),
+            id: Some(2),
+            kind: Some("User".into()),
+        });
+        issue_payload.issue.user = None;
+        assert!(
+            !authorize_engagement(
+                &issue_author_state,
+                EngagementGate::Initial,
+                &["ai".into()],
+                &issue_payload,
+            )
+            .await
+            .allowed
+        );
+
+        let association_state = engagement_state(vec![EngagementSelector::AuthorAssociation {
+            association: "OWNER".into(),
+        }]);
+        let mut comment_payload = engagement_payload(GitHubActor {
+            login: "commenter".into(),
+            id: Some(3),
+            kind: Some("User".into()),
+        });
+        comment_payload.comment = Some(GitHubComment {
+            id: Some(9),
+            user: None,
+            author_association: Some("OWNER".into()),
+            performed_via_github_app: None,
+            body: "clarification".into(),
+        });
+        assert!(
+            !authorize_engagement(
+                &association_state,
+                EngagementGate::NeedsInfoResume,
+                &["ai".into()],
+                &comment_payload,
+            )
+            .await
+            .allowed
+        );
+    }
+
+    #[test]
+    fn state_and_permission_ordering_are_explicit() {
+        assert_eq!(
+            engagement_gate("issue_comment", Some("needs_human")),
+            Some(EngagementGate::NeedsHumanResume)
+        );
+        assert_eq!(
+            engagement_gate("issues", Some("blocked")),
+            Some(EngagementGate::BlockedResume)
+        );
+        assert!(permission_rank("maintain") > permission_rank("write"));
+        assert!(permission_rank("triage") > permission_rank("read"));
+    }
 
     #[test]
     fn parses_polled_repository_list() {
@@ -1492,6 +2243,23 @@ mod tests {
     }
 
     #[test]
+    fn webhook_repository_must_be_selected_when_scope_is_configured() {
+        let configured = vec![PolledRepository {
+            owner: "acme".into(),
+            name: "rtl".into(),
+        }];
+        assert!(webhook_repository_allowed(
+            &configured,
+            br#"{"repository":{"owner":{"login":"ACME"},"name":"RTL"}}"#
+        ));
+        assert!(!webhook_repository_allowed(
+            &configured,
+            br#"{"repository":{"owner":{"login":"acme"},"name":"other"}}"#
+        ));
+        assert!(webhook_repository_allowed(&[], br#"{}"#));
+    }
+
+    #[test]
     fn adapts_polled_issue_event_to_webhook_shape() {
         let repository = json!({
             "name": "rtl",
@@ -1501,6 +2269,7 @@ mod tests {
         let event = json!({
             "id": "12345",
             "type": "IssuesEvent",
+            "actor": {"login": "alice", "id": 1, "type": "User"},
             "payload": {
                 "action": "opened",
                 "issue": {"id": 7, "number": 3, "state": "open", "labels": []}
@@ -1512,6 +2281,7 @@ mod tests {
         assert_eq!(ingress.delivery_id, "github-poll:acme/rtl:12345");
         assert_eq!(ingress.payload["repository"]["default_branch"], "main");
         assert_eq!(ingress.payload["issue"]["number"], 3);
+        assert_eq!(ingress.payload["sender"]["login"], "alice");
     }
 
     #[test]
@@ -1545,6 +2315,7 @@ mod tests {
         let event = json!({
             "id": "12346",
             "type": "IssuesEvent",
+            "actor": {"login": "alice", "id": 1, "type": "User"},
             "payload": {
                 "action": "labeled",
                 "issue": {"id": 7, "number": 3, "state": "open", "labels": [{"name": "ai"}]},
@@ -1566,6 +2337,7 @@ mod tests {
         let event = json!({
             "id": "67890",
             "type": "PushEvent",
+            "actor": {"login": "alice", "id": 1, "type": "User"},
             "payload": {"ref": "refs/heads/main", "head": "abc123"}
         });
 
@@ -1654,9 +2426,7 @@ mod tests {
             "created",
             "open",
             Some("needs_info"),
-            Some(&GitHubComment {
-                body: "Here are the reproduction steps.".to_string(),
-            }),
+            Some(&comment()),
         ));
     }
 
@@ -1667,23 +2437,63 @@ mod tests {
             "created",
             "open",
             Some("blocked"),
-            Some(&GitHubComment {
-                body: "I added the missing detail.".to_string(),
-            }),
+            Some(&comment()),
         ));
     }
 
     #[test]
-    fn human_comment_on_needs_human_queues_triage() {
+    fn explicit_approval_on_needs_human_queues_triage() {
+        let mut approval = comment();
+        approval.body = "/donkeyspace approve".into();
         assert!(queue_triage(
             "issue_comment",
             "created",
             "open",
             Some("needs_human"),
-            Some(&GitHubComment {
-                body: "N+2 is acceptable and makes sense.".to_string(),
-            }),
+            Some(&approval),
         ));
+    }
+
+    #[test]
+    fn ordinary_or_edited_comment_on_needs_human_does_not_resume() {
+        assert!(!queue_triage(
+            "issue_comment",
+            "created",
+            "open",
+            Some("needs_human"),
+            Some(&comment()),
+        ));
+        let mut approval = comment();
+        approval.body = "/donkeyspace approve".into();
+        assert!(!queue_triage(
+            "issue_comment",
+            "edited",
+            "open",
+            Some("needs_human"),
+            Some(&approval),
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_approval_commands() {
+        assert_eq!(
+            parse_human_approval_command(" /donkeyspace approve rtl/storage "),
+            Some(HumanApprovalAction::Approve {
+                target: Some("rtl/storage".into())
+            })
+        );
+        assert_eq!(
+            parse_human_approval_command(
+                "/donkeyspace revise architect\nSplit the register file from decode."
+            ),
+            Some(HumanApprovalAction::Revise {
+                target: Some("architect".into()),
+                feedback: "Split the register file from decode.".into()
+            })
+        );
+        assert!(parse_human_approval_command("/donkeyspace revise architect").is_none());
+        assert!(parse_human_approval_command("please /donkeyspace approve").is_none());
+        assert!(parse_human_approval_command("/donkeyspace approve too many").is_none());
     }
 
     #[test]
@@ -1693,9 +2503,7 @@ mod tests {
             "edited",
             "open",
             Some("blocked"),
-            Some(&GitHubComment {
-                body: "Updated with more details.".to_string(),
-            }),
+            Some(&comment()),
         ));
     }
 
@@ -1706,9 +2514,7 @@ mod tests {
             "created",
             "open",
             Some("ready"),
-            Some(&GitHubComment {
-                body: "Looks good.".to_string(),
-            }),
+            Some(&comment()),
         ));
     }
 
@@ -1724,23 +2530,14 @@ mod tests {
     }
 
     #[test]
-    fn donkeyspace_comment_does_not_queue_triage() {
-        assert!(!queue_triage(
+    fn comment_body_prefix_is_not_used_for_trigger_classification() {
+        assert!(queue_triage(
             "issue_comment",
             "created",
             "open",
             Some("blocked"),
-            Some(&GitHubComment {
-                body: "donkeyspace triage needs clarification before this issue can move to implementation.".to_string(),
-            }),
+            Some(&comment()),
         ));
-    }
-
-    #[test]
-    fn detects_donkeyspace_generated_comment_after_whitespace() {
-        assert!(comment_is_from_donkeyspace(&GitHubComment {
-            body: "\n  donkeyspace marked this issue ready for agent implementation.".to_string(),
-        }));
     }
 
     #[test]
