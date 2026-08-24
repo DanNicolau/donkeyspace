@@ -353,7 +353,7 @@ fn github_poll_event_to_ingress(
             "type": repository.pointer("/owner/type").cloned().unwrap_or(Value::Null),
         },
     });
-    let sender = event.get("actor")?;
+    let sender = polled_event_sender(event)?;
     let (event_name, payload) = match event_type {
         "IssuesEvent" => (
             "issues",
@@ -399,6 +399,46 @@ fn github_poll_event_to_ingress(
         delivery_id: format!("github-poll:{owner}/{repo}:{event_id}"),
         payload,
     })
+}
+
+fn polled_event_sender(event: &Value) -> Option<Value> {
+    let mut sender = event.get("actor")?.clone();
+    if sender.get("type").and_then(Value::as_str).is_some() {
+        return Some(sender);
+    }
+
+    let matching_content_actor = [
+        event.pointer("/payload/comment/user"),
+        event.pointer("/payload/issue/user"),
+        event.pointer("/payload/pull_request/user"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| github_identities_match(&sender, candidate));
+
+    if let Some(kind) = matching_content_actor
+        .and_then(|actor| actor.get("type"))
+        .and_then(Value::as_str)
+        && let Value::Object(sender) = &mut sender
+    {
+        sender.insert("type".into(), Value::String(kind.to_string()));
+    }
+
+    Some(sender)
+}
+
+fn github_identities_match(left: &Value, right: &Value) -> bool {
+    match (
+        left.get("id").and_then(Value::as_u64),
+        right.get("id").and_then(Value::as_u64),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => left
+            .get("login")
+            .and_then(Value::as_str)
+            .zip(right.get("login").and_then(Value::as_str))
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right)),
+    }
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -1984,8 +2024,9 @@ mod tests {
         PolledRepository, authorize_engagement, can_retry_job, engagement_gate,
         extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
         issue_number_from_donkeyspace_branch, parse_human_approval_command,
-        parse_polled_repositories, permission_rank, polled_repository_input, should_queue_reviewer,
-        should_queue_triage, webhook_installation_matches, webhook_repository_allowed,
+        parse_polled_repositories, permission_rank, polled_event_sender, polled_repository_input,
+        should_queue_reviewer, should_queue_triage, webhook_installation_matches,
+        webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
     use donkeyspace_core::{EngagementGate, EngagementSelector, Policy};
@@ -2282,6 +2323,51 @@ mod tests {
         assert_eq!(ingress.payload["repository"]["default_branch"], "main");
         assert_eq!(ingress.payload["issue"]["number"], 3);
         assert_eq!(ingress.payload["sender"]["login"], "alice");
+    }
+
+    #[test]
+    fn restores_missing_polled_sender_type_from_matching_issue_author() {
+        let repository = json!({
+            "name": "rtl",
+            "default_branch": "main",
+            "owner": {"login": "acme", "type": "Organization"}
+        });
+        let event = json!({
+            "id": "12346",
+            "type": "IssuesEvent",
+            "actor": {"login": "alice", "id": 1},
+            "payload": {
+                "action": "labeled",
+                "issue": {
+                    "id": 7,
+                    "number": 3,
+                    "state": "open",
+                    "labels": [{"name": "ai"}],
+                    "user": {"login": "alice", "id": 1, "type": "User"}
+                },
+                "label": {"name": "ai"}
+            }
+        });
+
+        let ingress = github_poll_event_to_ingress("acme", "rtl", &repository, &event).unwrap();
+
+        assert_eq!(ingress.payload["sender"]["type"], "User");
+    }
+
+    #[test]
+    fn does_not_copy_sender_type_from_a_different_issue_author() {
+        let event = json!({
+            "actor": {"login": "maintainer", "id": 1},
+            "payload": {
+                "issue": {
+                    "user": {"login": "author", "id": 2, "type": "User"}
+                }
+            }
+        });
+
+        let sender = polled_event_sender(&event).unwrap();
+
+        assert!(sender.get("type").is_none());
     }
 
     #[test]
