@@ -154,6 +154,20 @@ secret; it only lets an unauthenticated Compose configuration parse. Runtime
 credentials are stored outside the source tree by default, and
 `.donkeyspace/secrets/` is ignored as a defense against accidental commits.
 
+### SELinux hosts
+
+The Compose files label host bind mounts for container access on
+SELinux-enforcing Fedora, RHEL, CentOS Stream, Rocky Linux, and AlmaLinux
+hosts. Policy and plugin paths use the shared `z` label because both the API
+and worker mount them. A host-backed Codex home uses the private `Z` label and
+the setup CLI configures it automatically. Named volumes require no relabeling.
+Do not add `z` or `Z` to the Docker socket mount.
+
+If startup still reports `Permission denied (os error 13)`, confirm whether
+SELinux denied the access with `getenforce` and
+`sudo ausearch -m AVC -ts recent`. Avoid disabling SELinux or broadly changing
+file modes; correct the specific bind mount label instead.
+
 ## GitHub engagement access
 
 Each selected repository has separate job-starter and human-approver lists.

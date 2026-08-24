@@ -253,8 +253,10 @@ impl Instance {
         }
         write_secret(&policy_path, serde_yaml::to_string(&policy)?.as_bytes())?;
 
-        let plugin_mount = format!("{}:/plugins/{mount_id}:ro", plugin.source_path.display());
-        let policy_mount = format!("{}:/run/donkeyspace/policy.yml:ro", policy_path.display());
+        // Both the API and worker consume these bind mounts, so use the shared
+        // SELinux relabel option (`z`) rather than the private option (`Z`).
+        let plugin_mount = format!("{}:/plugins/{mount_id}:ro,z", plugin.source_path.display());
+        let policy_mount = format!("{}:/run/donkeyspace/policy.yml:ro,z", policy_path.display());
         let worker_environment = BTreeMap::from([(
             "DONKEYSPACE_POLICY_PATH",
             "/run/donkeyspace/policy.yml".into(),
@@ -417,6 +419,8 @@ mod tests {
         let overlay = fs::read_to_string(instance.plugin_overlay_path()).unwrap();
         let policy = fs::read_to_string(directory.join("effective-policy.yml")).unwrap();
         assert!(overlay.contains("/var/run/docker.sock"));
+        assert!(overlay.contains(":/plugins/example-plugin:ro,z"));
+        assert!(overlay.contains(":/run/donkeyspace/policy.yml:ro,z"));
         assert!(overlay.contains("plugin_env_0"));
         assert!(!overlay.contains("do-not-serialize"));
         assert!(policy.contains("replacement"));

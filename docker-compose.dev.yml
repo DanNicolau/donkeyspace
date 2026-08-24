@@ -7,6 +7,6 @@ services:
     environment:
       DONKEYSPACE_API_PROXY_TARGET: http://api:8080
     volumes:
-      - .:/app
+      - .:/app:z
     ports: !override
       - "127.0.0.1:${DONKEYSPACE_WEB_PORT:-5173}:5173"
