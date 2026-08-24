@@ -79,7 +79,7 @@ services:
     build:
       context: ./web
     ports:
-      - "127.0.0.1:${DONKEYSPACE_WEB_PORT:-5173}:80"
+      - "0.0.0.0:${DONKEYSPACE_WEB_PORT:-5173}:80"
     depends_on:
       api:
         condition: service_started
