@@ -35,7 +35,7 @@ services:
     ports:
       - "127.0.0.1:${DONKEYSPACE_API_PORT:-8080}:8080"
     volumes:
-      - ${DONKEYSPACE_POLICY_SOURCE:-./.donkeyspace/policy.yml}:/run/donkeyspace/policy.yml:ro
+      - ${DONKEYSPACE_POLICY_SOURCE:-./.donkeyspace/policy.yml}:/run/donkeyspace/policy.yml:ro,z
     secrets:
       - github_private_key
       - github_webhook_secret
@@ -65,8 +65,8 @@ services:
       DONKEYSPACE_REPAIR_RECONCILE_LIMIT: ${DONKEYSPACE_REPAIR_RECONCILE_LIMIT:-1}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     volumes:
-      - ${DONKEYSPACE_POLICY_SOURCE:-./.donkeyspace/policy.yml}:/run/donkeyspace/policy.yml:ro
-      - ${DONKEYSPACE_CODEX_HOME_SOURCE:-codex-home}:/root/.codex
+      - ${DONKEYSPACE_POLICY_SOURCE:-./.donkeyspace/policy.yml}:/run/donkeyspace/policy.yml:ro,z
+      - ${DONKEYSPACE_CODEX_HOME_SOURCE:-codex-home}:/root/.codex${DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX:-}
       - donkeyspace-workspaces:/workspaces
     secrets:
       - github_private_key

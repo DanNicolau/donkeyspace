@@ -2,4 +2,4 @@ services:
   worker:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${DONKEYSPACE_PLUGINS_DIR:-../plugins}:/plugins:ro
+      - ${DONKEYSPACE_PLUGINS_DIR:-../plugins}:/plugins:ro,Z

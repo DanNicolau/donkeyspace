@@ -1313,6 +1313,10 @@ impl Instance {
                 "DONKEYSPACE_CODEX_HOME_SOURCE={}",
                 codex_home.display()
             ));
+            // A connected Codex home is a host bind mount, not the named-volume
+            // default. Give it a private SELinux label so Codex credentials are
+            // readable inside the worker on enforcing hosts.
+            lines.push("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:Z".into());
         }
         if let Some(github) = &config.github {
             match github {
@@ -2343,7 +2347,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory = env::temp_dir().join(format!("donkeyspace-port-env-test-{unique}"));
-        let instance = Instance {
+        let mut instance = Instance {
             directory: directory.clone(),
             config: Some(InstanceConfig {
                 schema_version: SCHEMA_VERSION,
@@ -2367,6 +2371,14 @@ mod tests {
         assert!(environment.contains("DONKEYSPACE_API_PORT=18080\n"));
         assert!(environment.contains("DONKEYSPACE_WEB_PORT=15173\n"));
         assert!(environment.contains("DONKEYSPACE_POLICY_SOURCE="));
+        assert!(!environment.contains("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX"));
+
+        instance.config.as_mut().unwrap().codex_home = Some("/tmp/codex-home".into());
+        instance
+            .write_compose_env(instance.config().unwrap())
+            .unwrap();
+        let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
+        assert!(environment.contains("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:Z\n"));
         fs::remove_dir_all(directory).unwrap();
     }
 
