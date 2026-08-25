@@ -1049,6 +1049,7 @@ async fn execute_developer_job(
     let base_branch = repository_default_branch(&running_job.input);
     let changed_files =
         git_changed_files_since(&repo_path, &format!("origin/{base_branch}")).await?;
+    let uncommitted_files = git_changed_files(&repo_path).await?;
     if changed_files.is_empty() {
         publish_job_attempt(
             &publication_context,
@@ -1151,7 +1152,7 @@ async fn execute_developer_job(
         &repo_path,
         &workspace,
         github_token,
-        &changed_files,
+        &uncommitted_files,
         &branch_name,
         &commit_title,
         &commit_body,
@@ -2594,7 +2595,7 @@ async fn push_developer_branch(
     repo_path: &Path,
     workspace_path: &Path,
     github_token: Option<&str>,
-    changed_files: &[String],
+    uncommitted_files: &[String],
     branch_name: &str,
     commit_title: &str,
     commit_body: &str,
@@ -2611,16 +2612,18 @@ async fn push_developer_branch(
     if current_branch.trim() != branch_name {
         run_git(repo_path, &["checkout", "-b", branch_name], None, None).await?;
     }
-    stage_changed_files(repo_path, changed_files).await?;
-    let staged = run_git(repo_path, &["diff", "--cached", "--name-only"], None, None).await?;
-    if !staged.trim().is_empty() {
-        run_git(
-            repo_path,
-            &["commit", "-m", commit_title, "-m", commit_body],
-            None,
-            None,
-        )
-        .await?;
+    if !uncommitted_files.is_empty() {
+        stage_changed_files(repo_path, uncommitted_files).await?;
+        let staged = run_git(repo_path, &["diff", "--cached", "--name-only"], None, None).await?;
+        if !staged.trim().is_empty() {
+            run_git(
+                repo_path,
+                &["commit", "-m", commit_title, "-m", commit_body],
+                None,
+                None,
+            )
+            .await?;
+        }
     }
     let push_ref = format!("HEAD:refs/heads/{branch_name}");
     run_git(
@@ -3494,9 +3497,9 @@ struct UpsertCommentPayload {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_run_input, command_summary, conventional_commit_title, git_changed_files_since,
-        input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
-        normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
+        agent_run_input, command_summary, conventional_commit_title, git_changed_files,
+        git_changed_files_since, input_issue_is_closed, merge_refused_unrelated_histories,
+        non_empty_string, normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
         required_check_failure_summary, reviewer_changed_files, reviewer_comment_body, run_git,
         stage_changed_files, token_usage_exceeded_triage_result,
     };
@@ -3845,6 +3848,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(changed, vec!["README.md".to_string()]);
+
+        std::fs::remove_dir_all(repo_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_checkpoint_rename_is_not_returned_as_uncommitted_work() {
+        let repo_path =
+            std::env::temp_dir().join(format!("donkeyspace-checkpoint-rename-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(repo_path.join("tests")).unwrap();
+
+        run_git(&repo_path, &["init"], None, None).await.unwrap();
+        run_git(
+            &repo_path,
+            &["config", "user.name", "Donkeyspace Test"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        run_git(
+            &repo_path,
+            &["config", "user.email", "test@example.invalid"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::write(repo_path.join("tests/count_typical.vec"), "base\n").unwrap();
+        run_git(&repo_path, &["add", "tests/count_typical.vec"], None, None)
+            .await
+            .unwrap();
+        run_git(&repo_path, &["commit", "-m", "initial"], None, None)
+            .await
+            .unwrap();
+        run_git(
+            &repo_path,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        run_git(
+            &repo_path,
+            &["checkout", "-b", "donkeyspace/issue-41-test"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        std::fs::rename(
+            repo_path.join("tests/count_typical.vec"),
+            repo_path.join("tests/count_down_typical.vec"),
+        )
+        .unwrap();
+        run_git(&repo_path, &["add", "-A"], None, None)
+            .await
+            .unwrap();
+        run_git(
+            &repo_path,
+            &["commit", "-m", "checkpoint rename"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pr_files = git_changed_files_since(&repo_path, "origin/main")
+            .await
+            .unwrap();
+        assert!(pr_files.contains(&"tests/count_down_typical.vec".to_string()));
+        assert!(pr_files.contains(&"tests/count_typical.vec".to_string()));
+        assert!(git_changed_files(&repo_path).await.unwrap().is_empty());
 
         std::fs::remove_dir_all(repo_path).unwrap();
     }

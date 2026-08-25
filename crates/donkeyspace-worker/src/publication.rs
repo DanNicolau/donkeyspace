@@ -167,7 +167,12 @@ pub async fn publish_attempt(
             &mut manifest,
         )?;
     }
-    redact_diagnostic_tree(&diagnostic_root, context.token, attempt.redactions)?;
+    let child_tasks = collect_child_task_diagnostics(
+        attempt.task_root,
+        &diagnostic_root,
+        &mut budget,
+        &mut manifest,
+    )?;
     fs::write(
         diagnostic_root.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
@@ -181,9 +186,11 @@ pub async fn publish_attempt(
                 "max_file_bytes": MAX_DIAGNOSTIC_FILE_BYTES,
                 "max_total_bytes": MAX_DIAGNOSTIC_TOTAL_BYTES,
             },
+            "child_tasks": child_tasks,
             "files": manifest,
         }))?,
     )?;
+    redact_diagnostic_tree(&diagnostic_root, context.token, attempt.redactions)?;
     git(&local_repo, &["add", "-A"], None, None).await?;
     let diagnostic_relative = diagnostic_root.strip_prefix(&local_repo)?.to_string_lossy();
     git(
@@ -604,6 +611,59 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+fn collect_child_task_diagnostics(
+    task_root: &Path,
+    diagnostic_root: &Path,
+    budget: &mut DiagnosticBudget,
+    manifest: &mut Vec<Value>,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    let mut summaries = Vec::new();
+    for (source_name, target_name) in [
+        ("plugin-tasks", "child-tasks"),
+        ("plugin-stages", "child-stages"),
+    ] {
+        let source_root = task_root.join(source_name);
+        if !source_root.is_dir() {
+            continue;
+        }
+        let mut entries = fs::read_dir(&source_root)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let task_name = entry.file_name().to_string_lossy().into_owned();
+            let source_diagnostics = entry.path().join(".donkeyspace");
+            let result_path = source_diagnostics.join("run-result.json");
+            let parsed_result = fs::read_to_string(&result_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            if let Some(parsed) = &parsed_result {
+                summaries.push(json!({
+                    "task": task_name,
+                    "outcome": parsed.pointer("/result/outcome").cloned().unwrap_or(Value::Null),
+                    "summary": parsed.pointer("/result/summary").cloned().unwrap_or(Value::Null),
+                    "blocked_reason": parsed.pointer("/result/blocked_reason").cloned().unwrap_or(Value::Null),
+                    "changed_files": parsed.pointer("/result/changed_files").cloned().unwrap_or_else(|| json!([])),
+                    "tests": parsed.pointer("/result/tests").cloned().unwrap_or_else(|| json!([])),
+                }));
+            }
+            let target = diagnostic_root
+                .join(target_name)
+                .join(safe_segment(&task_name));
+            for name in ["run-result.json", "agent.stdout.log", "agent.stderr.log"] {
+                copy_diagnostic_file(
+                    &source_diagnostics.join(name),
+                    &target.join(name),
+                    budget,
+                    manifest,
+                )?;
+            }
+        }
+    }
+    Ok(summaries)
+}
+
 #[derive(Default)]
 struct DiagnosticBudget {
     files: usize,
@@ -835,6 +895,66 @@ mod tests {
                 .iter()
                 .any(|entry| { entry["reason"] == "binary" && entry["sha256"].as_str().is_some() })
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn coordinator_diagnostics_include_successful_child_results_and_logs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("donkeyspace-child-diagnostics-{unique}"));
+        let task_diagnostics =
+            root.join("workspace/plugin-tasks/0300-dv-counter_detect/.donkeyspace");
+        let diagnostic_root = root.join("published");
+        fs::create_dir_all(&task_diagnostics).unwrap();
+        fs::create_dir_all(&diagnostic_root).unwrap();
+        fs::write(
+            task_diagnostics.join("run-result.json"),
+            serde_json::to_vec_pretty(&json!({
+                "result": {
+                    "outcome": "implemented",
+                    "summary": "12/12 DV tests passed",
+                    "blocked_reason": null,
+                    "changed_files": ["src/dv/counter_detect/testbench.mk"],
+                    "tests": [{"name": "make run", "status": "passed"}]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(task_diagnostics.join("agent.stdout.log"), "DV complete\n").unwrap();
+        fs::write(task_diagnostics.join("agent.stderr.log"), "").unwrap();
+
+        let mut budget = DiagnosticBudget::default();
+        let mut manifest = Vec::new();
+        let summaries = collect_child_task_diagnostics(
+            &root.join("workspace"),
+            &diagnostic_root,
+            &mut budget,
+            &mut manifest,
+        )
+        .unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["outcome"], "implemented");
+        assert_eq!(summaries[0]["summary"], "12/12 DV tests passed");
+        assert_eq!(summaries[0]["tests"][0]["status"], "passed");
+        assert!(
+            diagnostic_root
+                .join("child-tasks/0300-dv-counter_detect/run-result.json")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read_to_string(
+                diagnostic_root.join("child-tasks/0300-dv-counter_detect/agent.stdout.log")
+            )
+            .unwrap(),
+            "DV complete\n"
+        );
+        assert_eq!(budget.files, 3);
+
         fs::remove_dir_all(root).unwrap();
     }
 }
