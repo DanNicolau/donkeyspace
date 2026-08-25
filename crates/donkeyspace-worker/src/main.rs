@@ -7,11 +7,12 @@ use donkeyspace_core::{
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
     acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
-    create_job, create_outbound_action, fail_job, list_github_repositories,
-    list_github_repositories_for_installation, list_pending_outbound_actions,
-    list_ready_developer_candidates, list_repair_candidates, mark_job_running,
-    mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
-    record_state_transition, update_workflow_item_state,
+    create_job, create_outbound_action, fail_job, get_job, list_github_repositories,
+    list_github_repositories_for_installation, list_pending_agent_publications,
+    list_pending_outbound_actions, list_ready_developer_candidates, list_repair_candidates,
+    mark_job_running, mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
+    record_state_transition, set_checkpoint_pull_request, unpublished_agent_publications_exist,
+    update_workflow_item_state,
 };
 use donkeyspace_github::{
     GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubCredentialProvider,
@@ -34,9 +35,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod llm_triage;
 mod plugin_flow;
 mod plugin_task_graph;
+mod publication;
 mod repo_context;
 
 use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
+use publication::{
+    AttemptPublication, PublicationContext, publish_attempt, publish_checkpoint,
+    push_existing_publication, queue_publication_status,
+};
 use repo_context::{
     RepoContextConfig, build_repository_context, cleanup_repository_context,
     enrich_input_with_repository_context, workspace_path, write_askpass_script,
@@ -250,6 +256,7 @@ async fn poll_once(
     }
 
     if let Some(github_token) = github_token.filter(|token| !token.trim().is_empty()) {
+        process_pending_publications(pool, github_token, repo_context_config).await?;
         let client = configured_github_client(github_token)?;
         ensure_policy_labels(pool, policy, &client, label_synced_repositories).await?;
         process_outbound_actions(pool, &client).await?;
@@ -258,6 +265,57 @@ async fn poll_once(
     }
 
     Ok(())
+}
+
+async fn process_pending_publications(
+    pool: &donkeyspace_db::PgPool,
+    github_token: &str,
+    repo_context_config: &RepoContextConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for publication in list_pending_agent_publications(pool, 20).await? {
+        let workspace = workspace_path(publication.coordinator_job_id, repo_context_config);
+        let push_succeeded = if let Err(error) =
+            push_existing_publication(pool, Some(github_token), &workspace, &publication).await
+        {
+            tracing::warn!(publication_id = publication.id, %error, "agent publication failed");
+            false
+        } else {
+            true
+        };
+        if let Err(error) = queue_publication_status(pool, &publication).await {
+            tracing::warn!(publication_id = publication.id, %error, "publication status comment queue failed");
+        }
+        if push_succeeded
+            && !unpublished_agent_publications_exist(pool, publication.coordinator_job_id).await?
+            && get_job(pool, publication.coordinator_job_id)
+                .await?
+                .is_some_and(|job| matches!(job.status.as_str(), "completed" | "failed"))
+        {
+            let _ = cleanup_repository_context(publication.coordinator_job_id, repo_context_config);
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_published_workspace(
+    pool: &donkeyspace_db::PgPool,
+    coordinator_job_id: uuid::Uuid,
+    repo_context_config: &RepoContextConfig,
+) {
+    match unpublished_agent_publications_exist(pool, coordinator_job_id).await {
+        Ok(false) => {
+            let _ = cleanup_repository_context(coordinator_job_id, repo_context_config);
+        }
+        Ok(true) => tracing::warn!(
+            job_id = %coordinator_job_id,
+            "preserving workspace for failed agent publication retry"
+        ),
+        Err(error) => tracing::warn!(
+            job_id = %coordinator_job_id,
+            %error,
+            "could not determine publication cleanup state; preserving workspace"
+        ),
+    }
 }
 
 async fn ensure_policy_labels(
@@ -553,7 +611,7 @@ async fn execute_job(
             let result_value = serde_json::to_value(&result)?;
             let workflow_state = workflow_state_for_outcome(result.outcome);
             complete_job(pool, running_job.id, &result_value).await?;
-            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
             if let Some(workflow_item_id) = running_job.workflow_item_id {
                 update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
@@ -786,7 +844,7 @@ async fn execute_developer_job(
                 "implementation execution failed",
             )
             .await?;
-            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
             tracing::warn!(job_id = %running_job.id, "implementation repository context failed");
             return Ok(());
         }
@@ -842,6 +900,31 @@ async fn execute_developer_job(
 
     let enriched_input =
         enrich_input_with_repository_context(&running_job.input, repository_context.clone());
+    let publication_owner = repository_owner(&running_job.input)?;
+    let publication_repo = repository_name(&running_job.input)?;
+    let publication_workspace = workspace_path(running_job.id, repo_context_config);
+    let publication_context = PublicationContext {
+        pool,
+        coordinator_job_id: running_job.id,
+        workflow_item_id: running_job.workflow_item_id,
+        issue_number: issue_number(&running_job.input).unwrap_or(0),
+        owner: &publication_owner,
+        repo: &publication_repo,
+        workspace_path: &publication_workspace,
+        token: github_token,
+    };
+    if let Err(error) = publish_checkpoint(
+        &publication_context,
+        &repository_checkout_path(&repository_context)?,
+        &format!(
+            "chore(donkeyspace): start issue #{}",
+            publication_context.issue_number
+        ),
+    )
+    .await
+    {
+        tracing::warn!(job_id = %running_job.id, %error, "initial issue branch publication failed");
+    }
     let plugin_github_client = github_token
         .filter(|token| !token.trim().is_empty())
         .map(configured_github_client)
@@ -857,6 +940,7 @@ async fn execute_developer_job(
                     pool,
                     coordinator: &running_job,
                     github: plugin_github_client.as_ref(),
+                    publication: Some(publication_context),
                 }),
             )
             .await
@@ -874,6 +958,18 @@ async fn execute_developer_job(
     let mut result = match developer_result {
         Ok(result) => result,
         Err(error) => {
+            if lifecycle_selection.is_none() {
+                publish_job_attempt(
+                    &publication_context,
+                    &repository_checkout_path(&repository_context)?,
+                    &publication_workspace,
+                    &running_job,
+                    "developer",
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+            }
             fail_role_job(
                 pool,
                 &running_job,
@@ -882,13 +978,25 @@ async fn execute_developer_job(
                 "implementation execution failed",
             )
             .await?;
-            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
             tracing::warn!(job_id = %running_job.id, "implementation job failed");
             return Ok(());
         }
     };
 
     if result.outcome != Outcome::Implemented {
+        if lifecycle_selection.is_none() {
+            publish_job_attempt(
+                &publication_context,
+                &repository_checkout_path(&repository_context)?,
+                &publication_workspace,
+                &running_job,
+                "developer",
+                Some(result.outcome),
+                &result.summary,
+            )
+            .await;
+        }
         let result_value = serde_json::to_value(&result)?;
         let workflow_state = workflow_state_for_outcome(result.outcome);
         let paused = result.outcome == Outcome::NeedsHuman && lifecycle_selection.is_some();
@@ -896,7 +1004,7 @@ async fn execute_developer_job(
             pause_job(pool, running_job.id, &result_value).await?;
         } else {
             complete_job(pool, running_job.id, &result_value).await?;
-            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         }
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
@@ -938,8 +1046,20 @@ async fn execute_developer_job(
     }
 
     let repo_path = repository_checkout_path(&repository_context)?;
-    let changed_files = git_changed_files(&repo_path).await?;
+    let base_branch = repository_default_branch(&running_job.input);
+    let changed_files =
+        git_changed_files_since(&repo_path, &format!("origin/{base_branch}")).await?;
     if changed_files.is_empty() {
+        publish_job_attempt(
+            &publication_context,
+            &repo_path,
+            &publication_workspace,
+            &running_job,
+            "developer",
+            Some(Outcome::Failed),
+            "implementation returned implemented without repository changes",
+        )
+        .await;
         fail_role_job(
             pool,
             &running_job,
@@ -948,13 +1068,14 @@ async fn execute_developer_job(
             "implementation execution failed",
         )
         .await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         return Ok(());
     }
 
     result.changed_files = changed_files.clone();
     let required_check_results =
         run_required_commands(pool, policy, running_job.id, &repo_path).await?;
+    write_required_check_diagnostics(&publication_workspace, &required_check_results).await?;
     let required_checks_failed = required_check_results
         .iter()
         .any(|check| check.status == TestStatus::Failed);
@@ -963,9 +1084,22 @@ async fn execute_developer_job(
         result.outcome = Outcome::Failed;
         result.summary = "Implementation failed required checks.".to_string();
         result.blocked_reason = Some(required_check_failure_summary(&result.tests));
+        publish_job_attempt(
+            &publication_context,
+            &repo_path,
+            &publication_workspace,
+            &running_job,
+            "required-checks",
+            Some(Outcome::Failed),
+            result
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("required checks failed"),
+        )
+        .await;
         let result_value = serde_json::to_value(&result)?;
         fail_job(pool, running_job.id, &result_value).await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
             update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str())
@@ -1012,7 +1146,6 @@ async fn execute_developer_job(
     let branch_name = developer_branch_name(issue_num, running_job.id);
     let commit_title = conventional_commit_title(&running_job.input, &changed_files);
     let commit_body = developer_commit_body(&running_job, &result, &changed_files);
-    let base_branch = repository_default_branch(&running_job.input);
     let workspace = workspace_path(running_job.id, repo_context_config);
     if let Err(error) = push_developer_branch(
         &repo_path,
@@ -1025,6 +1158,16 @@ async fn execute_developer_job(
     )
     .await
     {
+        publish_job_attempt(
+            &publication_context,
+            &repo_path,
+            &publication_workspace,
+            &running_job,
+            "developer-push",
+            Some(Outcome::Failed),
+            &error.to_string(),
+        )
+        .await;
         fail_role_job(
             pool,
             &running_job,
@@ -1033,8 +1176,11 @@ async fn execute_developer_job(
             "implementation execution failed",
         )
         .await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         return Ok(());
+    }
+    if let Err(error) = publish_checkpoint(&publication_context, &repo_path, &commit_title).await {
+        tracing::warn!(job_id = %running_job.id, %error, "final issue branch publication record failed");
     }
 
     let pull_request = async {
@@ -1070,14 +1216,21 @@ async fn execute_developer_job(
                 "implementation execution failed",
             )
             .await?;
-            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
             return Ok(());
         }
     };
 
+    if let Some(publication) =
+        set_checkpoint_pull_request(pool, running_job.id, &pull_request_url).await?
+        && let Err(error) = queue_publication_status(pool, &publication).await
+    {
+        tracing::warn!(job_id = %running_job.id, %error, "final publication status queue failed");
+    }
+
     let result_value = serde_json::to_value(&result)?;
     complete_job(pool, running_job.id, &result_value).await?;
-    let _ = cleanup_repository_context(running_job.id, repo_context_config);
+    cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
         let workflow_state = workflow_state_for_outcome(result.outcome);
@@ -1377,7 +1530,7 @@ async fn execute_repair_job(
         };
         let result_value = serde_json::to_value(&result)?;
         complete_job(pool, running_job.id, &result_value).await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
             update_workflow_item_state(pool, workflow_item_id, WorkflowState::PrOpen.as_str())
@@ -1411,6 +1564,20 @@ async fn execute_repair_job(
         .await?;
     }
 
+    let repair_owner = repository_owner(&running_job.input)?;
+    let repair_repo_name = repository_name(&running_job.input)?;
+    let repair_publication = PublicationContext {
+        pool,
+        coordinator_job_id: running_job.id,
+        workflow_item_id: running_job.workflow_item_id,
+        issue_number: issue_number(&running_job.input).unwrap_or(0),
+        owner: &repair_owner,
+        repo: &repair_repo_name,
+        workspace_path: &repair_input.workspace_path,
+        token: github_token,
+    };
+    let repair_repo_path = repository_checkout_path(&repair_input.repository_context)?;
+
     let repair_result = run_agent_repair(
         pool,
         policy,
@@ -1422,6 +1589,16 @@ async fn execute_repair_job(
     let mut result = match repair_result {
         Ok(result) => result,
         Err(error) => {
+            publish_job_attempt(
+                &repair_publication,
+                &repair_repo_path,
+                &repair_input.workspace_path,
+                &running_job,
+                "repair",
+                None,
+                &error.to_string(),
+            )
+            .await;
             fail_role_job(
                 pool,
                 &running_job,
@@ -1430,17 +1607,27 @@ async fn execute_repair_job(
                 "repair execution failed",
             )
             .await?;
-            let _ = cleanup_repository_context(running_job.id, repo_context_config);
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
             tracing::warn!(job_id = %running_job.id, "repair job failed");
             return Ok(());
         }
     };
 
     if result.outcome != Outcome::Implemented {
+        publish_job_attempt(
+            &repair_publication,
+            &repair_repo_path,
+            &repair_input.workspace_path,
+            &running_job,
+            "repair",
+            Some(result.outcome),
+            &result.summary,
+        )
+        .await;
         let workflow_state = workflow_state_for_outcome(result.outcome);
         let result_value = serde_json::to_value(&result)?;
         complete_job(pool, running_job.id, &result_value).await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
             update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
@@ -1478,6 +1665,16 @@ async fn execute_repair_job(
 
     let repo_path = repository_checkout_path(&repair_input.repository_context)?;
     if conflict_markers_present(&repo_path)? {
+        publish_job_attempt(
+            &repair_publication,
+            &repo_path,
+            &repair_input.workspace_path,
+            &running_job,
+            "repair",
+            Some(Outcome::Failed),
+            "repair agent left merge conflict markers in the checkout",
+        )
+        .await;
         fail_role_job(
             pool,
             &running_job,
@@ -1486,12 +1683,22 @@ async fn execute_repair_job(
             "repair conflict markers remain",
         )
         .await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         return Ok(());
     }
 
     let changed_files = git_changed_files(&repo_path).await?;
     if changed_files.is_empty() {
+        publish_job_attempt(
+            &repair_publication,
+            &repo_path,
+            &repair_input.workspace_path,
+            &running_job,
+            "repair",
+            Some(Outcome::Failed),
+            "repair agent returned implemented without repository changes",
+        )
+        .await;
         fail_role_job(
             pool,
             &running_job,
@@ -1500,13 +1707,14 @@ async fn execute_repair_job(
             "repair execution failed",
         )
         .await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         return Ok(());
     }
 
     result.changed_files = changed_files.clone();
     let required_check_results =
         run_required_commands(pool, policy, running_job.id, &repo_path).await?;
+    write_required_check_diagnostics(&repair_input.workspace_path, &required_check_results).await?;
     let required_checks_failed = required_check_results
         .iter()
         .any(|check| check.status == TestStatus::Failed);
@@ -1515,9 +1723,22 @@ async fn execute_repair_job(
         result.outcome = Outcome::Failed;
         result.summary = "Repair failed required checks.".to_string();
         result.blocked_reason = Some(required_check_failure_summary(&result.tests));
+        publish_job_attempt(
+            &repair_publication,
+            &repo_path,
+            &repair_input.workspace_path,
+            &running_job,
+            "repair-required-checks",
+            Some(Outcome::Failed),
+            result
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("required checks failed"),
+        )
+        .await;
         let result_value = serde_json::to_value(&result)?;
         fail_job(pool, running_job.id, &result_value).await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
             update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str())
@@ -1569,6 +1790,16 @@ async fn execute_repair_job(
     )
     .await
     {
+        publish_job_attempt(
+            &repair_publication,
+            &repo_path,
+            &repair_input.workspace_path,
+            &running_job,
+            "repair-push",
+            Some(Outcome::Failed),
+            &error.to_string(),
+        )
+        .await;
         fail_role_job(
             pool,
             &running_job,
@@ -1577,7 +1808,7 @@ async fn execute_repair_job(
             "repair push failed",
         )
         .await?;
-        let _ = cleanup_repository_context(running_job.id, repo_context_config);
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         tracing::warn!(job_id = %running_job.id, "repair push failed");
         return Ok(());
     }
@@ -1756,6 +1987,7 @@ async fn run_agent_developer(
     )?;
     let command_result = run_agent_command(&command).await?;
     record_agent_command_result(pool, running_job.id, "developer agent", &command_result).await?;
+    write_command_logs(&donkeyspace_path, &command_result).await?;
 
     if command_result.status != AgentCommandStatus::Passed {
         return Err(format!(
@@ -1833,6 +2065,7 @@ async fn run_agent_repair(
         AgentCommand::from_parts(&policy.agents.repair.command, &workspace_path, &result_path)?;
     let command_result = run_agent_command(&command).await?;
     record_agent_command_result(pool, running_job.id, "repair agent", &command_result).await?;
+    write_command_logs(&donkeyspace_path, &command_result).await?;
 
     if command_result.status != AgentCommandStatus::Passed {
         return Err(format!(
@@ -1843,6 +2076,37 @@ async fn run_agent_repair(
     }
 
     Ok(read_run_result(&result_path).await?)
+}
+
+async fn write_command_logs(
+    donkeyspace_path: &Path,
+    result: &donkeyspace_runner::AgentCommandResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio_fs::write(
+        donkeyspace_path.join("agent.stdout.log"),
+        truncate_chars(&result.stdout, 1_000_000),
+    )
+    .await?;
+    tokio_fs::write(
+        donkeyspace_path.join("agent.stderr.log"),
+        truncate_chars(&result.stderr, 1_000_000),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn write_required_check_diagnostics(
+    workspace_path: &Path,
+    results: &[TestResult],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let donkeyspace_path = workspace_path.join(".donkeyspace");
+    tokio_fs::create_dir_all(&donkeyspace_path).await?;
+    tokio_fs::write(
+        donkeyspace_path.join("required-checks.json"),
+        serde_json::to_vec_pretty(results)?,
+    )
+    .await?;
+    Ok(())
 }
 
 struct RepairInput {
@@ -2262,6 +2526,70 @@ async fn git_changed_files(repo_path: &Path) -> Result<Vec<String>, Box<dyn std:
     Ok(parse_porcelain_status(&output))
 }
 
+async fn git_changed_files_since(
+    repo_path: &Path,
+    base_ref: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let diff = run_git(
+        repo_path,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=ACDMRTUXB",
+            base_ref,
+            "--",
+        ],
+        None,
+        None,
+    )
+    .await?;
+    let status = run_git(repo_path, &["status", "--porcelain"], None, None).await?;
+    let mut files = diff
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .chain(parse_porcelain_status(&status))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+async fn publish_job_attempt(
+    context: &PublicationContext<'_>,
+    repo_path: &Path,
+    workspace_path: &Path,
+    job: &JobRecord,
+    task: &str,
+    outcome: Option<Outcome>,
+    reason: &str,
+) {
+    let changed_files = git_changed_files(repo_path).await.unwrap_or_default();
+    if let Err(error) = publish_attempt(
+        context,
+        repo_path,
+        &AttemptPublication {
+            job_id: Some(job.id),
+            task,
+            work_item: None,
+            attempt: 1,
+            outcome,
+            task_root: workspace_path,
+            write_roots: &changed_files,
+            diagnostics: &[],
+            reason,
+            related_issue_number: None,
+            redactions: &[],
+        },
+    )
+    .await
+    {
+        tracing::warn!(job_id = %job.id, %error, "job forensic publication failed");
+    }
+}
+
 async fn push_developer_branch(
     repo_path: &Path,
     workspace_path: &Path,
@@ -2279,15 +2607,21 @@ async fn push_developer_branch(
     write_askpass_script(&askpass_path)?;
 
     configure_git_author(repo_path).await?;
-    run_git(repo_path, &["checkout", "-b", branch_name], None, None).await?;
+    let current_branch = run_git(repo_path, &["branch", "--show-current"], None, None).await?;
+    if current_branch.trim() != branch_name {
+        run_git(repo_path, &["checkout", "-b", branch_name], None, None).await?;
+    }
     stage_changed_files(repo_path, changed_files).await?;
-    run_git(
-        repo_path,
-        &["commit", "-m", commit_title, "-m", commit_body],
-        None,
-        None,
-    )
-    .await?;
+    let staged = run_git(repo_path, &["diff", "--cached", "--name-only"], None, None).await?;
+    if !staged.trim().is_empty() {
+        run_git(
+            repo_path,
+            &["commit", "-m", commit_title, "-m", commit_body],
+            None,
+            None,
+        )
+        .await?;
+    }
     let push_ref = format!("HEAD:refs/heads/{branch_name}");
     run_git(
         repo_path,
@@ -3103,6 +3437,19 @@ async fn execute_outbound_action(
                 .await?;
             Some(comment_id)
         }
+        "issue.upsert_comment" => {
+            let payload: UpsertCommentPayload = serde_json::from_value(action.payload.clone())?;
+            let comment_id = client
+                .upsert_issue_comment(
+                    &payload.owner,
+                    &payload.repo,
+                    payload.issue_number,
+                    &payload.marker,
+                    &payload.body,
+                )
+                .await?;
+            Some(comment_id)
+        }
         unsupported => {
             return Err(format!("unsupported outbound action type: {unsupported}").into());
         }
@@ -3135,14 +3482,23 @@ struct CreateCommentPayload {
     body: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpsertCommentPayload {
+    owner: String,
+    repo: String,
+    issue_number: i64,
+    marker: String,
+    body: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_run_input, command_summary, conventional_commit_title, input_issue_is_closed,
-        merge_refused_unrelated_histories, non_empty_string, normalize_reviewer_result,
-        parse_porcelain_status, policy_managed_labels, required_check_failure_summary,
-        reviewer_changed_files, reviewer_comment_body, run_git, stage_changed_files,
-        token_usage_exceeded_triage_result,
+        agent_run_input, command_summary, conventional_commit_title, git_changed_files_since,
+        input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
+        normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
+        required_check_failure_summary, reviewer_changed_files, reviewer_comment_body, run_git,
+        stage_changed_files, token_usage_exceeded_triage_result,
     };
     use donkeyspace_core::{Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus};
     use serde_json::json;
@@ -3421,6 +3777,76 @@ mod tests {
                 "new.md".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn committed_checkpoint_changes_are_visible_to_pr_handoff() {
+        let repo_path =
+            std::env::temp_dir().join(format!("donkeyspace-checkpoint-diff-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+
+        run_git(&repo_path, &["init"], None, None).await.unwrap();
+        run_git(
+            &repo_path,
+            &["config", "user.name", "Donkeyspace Test"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        run_git(
+            &repo_path,
+            &["config", "user.email", "test@example.invalid"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::write(repo_path.join("README.md"), "base\n").unwrap();
+        run_git(&repo_path, &["add", "README.md"], None, None)
+            .await
+            .unwrap();
+        run_git(&repo_path, &["commit", "-m", "initial"], None, None)
+            .await
+            .unwrap();
+        run_git(
+            &repo_path,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        run_git(
+            &repo_path,
+            &["checkout", "-b", "donkeyspace/issue-35-test"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(repo_path.join("README.md"), "implemented\n").unwrap();
+        run_git(&repo_path, &["add", "README.md"], None, None)
+            .await
+            .unwrap();
+        run_git(&repo_path, &["commit", "-m", "checkpoint"], None, None)
+            .await
+            .unwrap();
+        assert!(
+            run_git(&repo_path, &["status", "--porcelain"], None, None)
+                .await
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+
+        let changed = git_changed_files_since(&repo_path, "origin/main")
+            .await
+            .unwrap();
+        assert_eq!(changed, vec!["README.md".to_string()]);
+
+        std::fs::remove_dir_all(repo_path).unwrap();
     }
 
     #[tokio::test]

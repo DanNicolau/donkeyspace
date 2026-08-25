@@ -23,11 +23,15 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::plugin_task_graph::{TaskGraph, TaskKey};
+use crate::publication::{
+    AttemptPublication, PublicationContext, publish_attempt, publish_checkpoint,
+};
 
 pub struct LifecycleTracking<'a> {
     pub pool: &'a PgPool,
     pub coordinator: &'a JobRecord,
     pub github: Option<&'a GitHubClient>,
+    pub publication: Option<PublicationContext<'a>>,
 }
 
 const CHECKPOINT_VERSION: u32 = 2;
@@ -174,6 +178,16 @@ pub async fn run(
             &parameters,
             &manifest.parameters,
         )?;
+        let diagnostics = expand_artifacts(&stage.diagnostics, &parameters, None)?;
+        if let Some(diagnostic) = diagnostics.iter().find(|diagnostic| {
+            !covered(&diagnostic.path, &read_roots) && !covered(&diagnostic.path, &write_roots)
+        }) {
+            return Err(format!(
+                "stage `{stage_name}` diagnostic `{}` is outside its declared roots",
+                diagnostic.path
+            )
+            .into());
+        }
         for root in read_roots.iter().chain(&write_roots) {
             copy_root(repo_path, &stage_repo, root)?;
         }
@@ -216,49 +230,121 @@ pub async fn run(
             .image
             .as_deref()
             .unwrap_or(&manifest.runtime.default_image);
-        let output = run_container(
+        let output = match run_container(
             image,
             &agent.command,
             &stage_root,
             &selection.environment,
             &agent.environment,
         )
-        .await?;
-        if !output.status.success() {
-            return Err(format!(
-                "plugin stage `{stage_name}` exited {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                publish_serial_stage_attempt(
+                    tracking.as_ref(),
+                    selection,
+                    &stage_name,
+                    attempt,
+                    &stage_root,
+                    repo_path,
+                    &write_roots,
+                    &diagnostics,
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        write_agent_log(&donkeyspace.join("agent.stdout.log"), &output.stdout)?;
+        write_agent_log(&donkeyspace.join("agent.stderr.log"), &output.stderr)?;
+        let stage_execution = async {
+            if !output.status.success() {
+                return Err(format!(
+                    "plugin stage `{stage_name}` exited {:?}: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+                .into());
+            }
+            let raw = fs::read_to_string(&result_path)?;
+            let mut stage_result: PluginTaskResult = serde_json::from_str(&raw)?;
+            validate_resources_used(&stage_result.resources_used, &resources)?;
+            validate_changed_files(&stage_result.result.changed_files, &write_roots)?;
+            if is_publishable(stage_result.result.outcome) {
+                verify_resources(&stage_root, &resources)?;
+                validate_artifacts(
+                    &stage_repo,
+                    &expand_artifacts(&stage.artifacts, &parameters, None)?,
+                    &write_roots,
+                )?;
+                let validator_results = run_validators(
+                    &stage.validators,
+                    image,
+                    &stage_root,
+                    &selection.environment,
+                    &agent.environment,
+                )
+                .await?;
+                apply_validator_results(&mut stage_result.result, validator_results);
+            }
+            stage_result.result.validate_for_orchestration()?;
+            Ok::<_, Box<dyn std::error::Error>>(stage_result)
         }
-        let raw = fs::read_to_string(&result_path)?;
-        let mut stage_result: PluginTaskResult = serde_json::from_str(&raw)?;
-        validate_resources_used(&stage_result.resources_used, &resources)?;
-        validate_changed_files(&stage_result.result.changed_files, &write_roots)?;
-        let publish_changes = is_publishable(stage_result.result.outcome);
-        if publish_changes {
-            verify_resources(&stage_root, &resources)?;
-            validate_artifacts(
-                &stage_repo,
-                &expand_artifacts(&stage.artifacts, &parameters, None)?,
-                &write_roots,
-            )?;
-            let validator_results = run_validators(
-                &stage.validators,
-                image,
-                &stage_root,
-                &selection.environment,
-                &agent.environment,
-            )
-            .await?;
-            apply_validator_results(&mut stage_result.result, validator_results);
-        }
-        stage_result.result.validate_for_orchestration()?;
+        .await;
+        let stage_result = match stage_execution {
+            Ok(stage_result) => stage_result,
+            Err(error) => {
+                publish_serial_stage_attempt(
+                    tracking.as_ref(),
+                    selection,
+                    &stage_name,
+                    attempt,
+                    &stage_root,
+                    repo_path,
+                    &write_roots,
+                    &diagnostics,
+                    None,
+                    &error.to_string(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
         if is_publishable(stage_result.result.outcome) {
             for root in &write_roots {
                 replace_root(&stage_repo, repo_path, root)?;
             }
+            if let Some(publication) = tracking
+                .as_ref()
+                .and_then(|tracking| tracking.publication.as_ref())
+                && let Err(error) = publish_checkpoint(
+                    publication,
+                    repo_path,
+                    &format!(
+                        "chore(donkeyspace): checkpoint {} for issue #{}",
+                        stage_name, publication.issue_number
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(%error, stage = stage_name, "plugin stage checkpoint failed");
+            }
+        } else {
+            publish_serial_stage_attempt(
+                tracking.as_ref(),
+                selection,
+                &stage_name,
+                attempt,
+                &stage_root,
+                repo_path,
+                &write_roots,
+                &diagnostics,
+                Some(stage_result.result.outcome),
+                &stage_result.result.summary,
+            )
+            .await;
         }
         accumulated_tests.extend(stage_result.result.tests.clone());
         previous.push(json!({"stage": stage_name, "attempt": attempt, "outcome": stage_result.result.outcome, "summary": stage_result.result.summary}));
@@ -489,7 +575,7 @@ async fn run_work_item_lifecycle(
         }
         let mut accumulated_tests = Vec::<TestResult>::new();
         let attempt = 1u32;
-        let planner = execute_task(
+        let planner_execution = execute_task(
             selection,
             manifest,
             &flow.start,
@@ -503,12 +589,69 @@ async fn run_work_item_lifecycle(
             parameters,
             plugin_root,
         )
-        .await?;
+        .await;
+        let planner = match planner_execution {
+            Ok(planner) => planner,
+            Err(error) => {
+                let reason = error.to_string();
+                publish_task_attempt(
+                    tracking.as_ref(),
+                    selection,
+                    &flow.start,
+                    &flow.tasks[&flow.start],
+                    None,
+                    attempt,
+                    workspace_path,
+                    repo_path,
+                    parameters,
+                    &manifest.parameters,
+                    tracking.as_ref().map(|tracking| tracking.coordinator.id),
+                    None,
+                    &reason,
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+        };
         accumulated_tests.extend(planner.result.tests.clone());
         let aggregate_risk = planner.result.risk;
         let aggregate_confidence = planner.result.confidence;
         previous.push(task_summary(&flow.start, None, attempt, &planner.result));
+        if planner.result.outcome == Outcome::Implemented
+            && let Some(publication) = tracking
+                .as_ref()
+                .and_then(|tracking| tracking.publication.as_ref())
+            && let Err(error) = publish_checkpoint(
+                publication,
+                repo_path,
+                &format!(
+                    "chore(donkeyspace): checkpoint {} for issue #{}",
+                    flow.start, publication.issue_number
+                ),
+            )
+            .await
+        {
+            tracing::warn!(%error, task = flow.start, "plugin checkpoint publication failed");
+        }
         if planner.result.outcome != Outcome::Implemented {
+            publish_task_attempt(
+                tracking.as_ref(),
+                selection,
+                &flow.start,
+                &flow.tasks[&flow.start],
+                None,
+                attempt,
+                workspace_path,
+                repo_path,
+                parameters,
+                &manifest.parameters,
+                tracking.as_ref().map(|tracking| tracking.coordinator.id),
+                Some(planner.result.outcome),
+                &planner.result.summary,
+                None,
+            )
+            .await;
             return Ok(finish_result(planner.result, accumulated_tests, &previous));
         }
         (
@@ -758,6 +901,11 @@ async fn run_work_item_lifecycle(
             }
             return Err("plugin lifecycle exceeded 64 task waves".into());
         }
+        let task_attempts = ready
+            .iter()
+            .enumerate()
+            .map(|(offset, key)| (key.clone(), attempt * 100 + offset as u32))
+            .collect::<BTreeMap<_, _>>();
         let executions = join_all(ready.iter().enumerate().map(|(offset, key)| {
             let work_item = key
                 .work_item
@@ -781,8 +929,8 @@ async fn run_work_item_lifecycle(
         .await;
 
         let mut successful_executions = Vec::new();
-        let mut first_execution_error = None;
-        for (key, execution) in ready.into_iter().zip(executions) {
+        let mut execution_errors = Vec::new();
+        for (offset, (key, execution)) in ready.into_iter().zip(executions).enumerate() {
             match execution {
                 Ok(execution) => {
                     if let Some(tracking) = &tracking {
@@ -797,18 +945,88 @@ async fn run_work_item_lifecycle(
                     successful_executions.push((key, execution));
                 }
                 Err(error) => {
+                    let reason = error.to_string();
                     if let Some(tracking) = &tracking {
-                        let result = failed_task_result(error.to_string());
+                        let result = failed_task_result(reason.clone());
                         fail_job(tracking.pool, tracked_jobs[&key], &result).await?;
-                        finished_jobs.insert(key);
+                        finished_jobs.insert(key.clone());
                     }
-                    if first_execution_error.is_none() {
-                        first_execution_error = Some(error);
-                    }
+                    execution_errors.push((key, attempt * 100 + offset as u32, reason));
                 }
             }
         }
-        if let Some(error) = first_execution_error {
+        if successful_executions
+            .iter()
+            .any(|(_, execution)| execution.result.outcome == Outcome::Implemented)
+            && let Some(publication) = tracking
+                .as_ref()
+                .and_then(|tracking| tracking.publication.as_ref())
+            && let Err(error) = publish_checkpoint(
+                publication,
+                repo_path,
+                &format!(
+                    "chore(donkeyspace): checkpoint task wave for issue #{}",
+                    publication.issue_number
+                ),
+            )
+            .await
+        {
+            tracing::warn!(%error, "plugin task-wave checkpoint publication failed");
+        }
+        for (key, execution) in &successful_executions {
+            if execution.result.outcome == Outcome::Implemented {
+                continue;
+            }
+            let work_item = key
+                .work_item
+                .as_deref()
+                .and_then(|id| registry.work_items.iter().find(|item| item.id == id));
+            publish_task_attempt(
+                tracking.as_ref(),
+                selection,
+                &key.task,
+                &flow.tasks[&key.task],
+                work_item,
+                task_attempts[key],
+                workspace_path,
+                repo_path,
+                parameters,
+                &manifest.parameters,
+                tracking.as_ref().map(|_| tracked_jobs[key]),
+                Some(execution.result.outcome),
+                &execution.result.summary,
+                key.work_item
+                    .as_deref()
+                    .and_then(|work_item| projected_issues.get(work_item).copied()),
+            )
+            .await;
+        }
+        for (key, task_attempt, reason) in &execution_errors {
+            let work_item = key
+                .work_item
+                .as_deref()
+                .and_then(|id| registry.work_items.iter().find(|item| item.id == id));
+            publish_task_attempt(
+                tracking.as_ref(),
+                selection,
+                &key.task,
+                &flow.tasks[&key.task],
+                work_item,
+                *task_attempt,
+                workspace_path,
+                repo_path,
+                parameters,
+                &manifest.parameters,
+                tracking.as_ref().map(|_| tracked_jobs[key]),
+                None,
+                reason,
+                key.work_item
+                    .as_deref()
+                    .and_then(|work_item| projected_issues.get(work_item).copied()),
+            )
+            .await;
+        }
+        if let Some((_, _, error)) = execution_errors.into_iter().next() {
             if let Some(tracking) = &tracking {
                 fail_unfinished_tracked_jobs(
                     tracking,
@@ -818,7 +1036,7 @@ async fn run_work_item_lifecycle(
                 )
                 .await?;
             }
-            return Err(error);
+            return Err(error.into());
         }
 
         let mut feedback = Vec::new();
@@ -1406,12 +1624,12 @@ async fn execute_task(
     plugin_root: &Path,
 ) -> Result<PluginTaskResult, Box<dyn std::error::Error>> {
     let role = &manifest.roles[&task.role];
-    let item_suffix = work_item
-        .map(|item| format!("-{}", item.id))
-        .unwrap_or_default();
-    let task_root = workspace_path
-        .join("plugin-tasks")
-        .join(format!("{attempt:04}-{task_name}{item_suffix}"));
+    let task_root = task_attempt_root(
+        workspace_path,
+        task_name,
+        work_item.map(|item| item.id.as_str()),
+        attempt,
+    );
     let task_repo = task_root.join("repo");
     fs::create_dir_all(&task_repo)?;
     let declared_read = expand_templates(&task.read, parameters, work_item)?;
@@ -1424,6 +1642,16 @@ async fn execute_task(
         parameters,
         &manifest.parameters,
     )?;
+    let diagnostics = expand_artifacts(&task.diagnostics, parameters, work_item)?;
+    if let Some(diagnostic) = diagnostics.iter().find(|diagnostic| {
+        !covered(&diagnostic.path, &read_roots) && !covered(&diagnostic.path, &write_roots)
+    }) {
+        return Err(format!(
+            "task `{task_name}` diagnostic `{}` is outside its declared roots",
+            diagnostic.path
+        )
+        .into());
+    }
     for root in read_roots.iter().chain(&write_roots) {
         copy_root(repo_path, &task_repo, root)?;
     }
@@ -1472,6 +1700,8 @@ async fn execute_task(
         &role.environment,
     )
     .await?;
+    write_agent_log(&donkeyspace.join("agent.stdout.log"), &output.stdout)?;
+    write_agent_log(&donkeyspace.join("agent.stderr.log"), &output.stderr)?;
     if !output.status.success() {
         return Err(format!(
             "plugin task `{task_name}` exited {:?}: {}",
@@ -1505,6 +1735,164 @@ async fn execute_task(
         }
     }
     Ok(task_result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_task_attempt(
+    tracking: Option<&LifecycleTracking<'_>>,
+    selection: &PluginFlowSelection,
+    task_name: &str,
+    task: &PluginTask,
+    work_item: Option<&PluginWorkItem>,
+    attempt: u32,
+    workspace_path: &Path,
+    aggregate_repo: &Path,
+    parameters: &BTreeMap<String, Value>,
+    parameter_definitions: &BTreeMap<String, PluginParameter>,
+    job_id: Option<Uuid>,
+    outcome: Option<Outcome>,
+    reason: &str,
+    related_issue_number: Option<i64>,
+) {
+    let Some(publication) = tracking.and_then(|tracking| tracking.publication.as_ref()) else {
+        return;
+    };
+    let result = async {
+        let declared_read = expand_templates(&task.read, parameters, work_item)?;
+        let declared_write = expand_templates(&task.write, parameters, work_item)?;
+        let (_, write_roots) = resolve_access(
+            selection,
+            task_name,
+            &declared_read,
+            &declared_write,
+            parameters,
+            parameter_definitions,
+        )?;
+        let diagnostics = expand_artifacts(&task.diagnostics, parameters, work_item)?;
+        let redactions = selection
+            .environment
+            .values()
+            .filter_map(|source| {
+                if Path::new(source).is_absolute() {
+                    fs::read_to_string(source).ok()
+                } else {
+                    env::var(source).ok()
+                }
+            })
+            .map(|value| value.trim_end().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let task_root = task_attempt_root(
+            workspace_path,
+            task_name,
+            work_item.map(|item| item.id.as_str()),
+            attempt,
+        );
+        publish_attempt(
+            publication,
+            aggregate_repo,
+            &AttemptPublication {
+                job_id,
+                task: task_name,
+                work_item: work_item.map(|item| item.id.as_str()),
+                attempt,
+                outcome,
+                task_root: &task_root,
+                write_roots: &write_roots,
+                diagnostics: &diagnostics,
+                reason,
+                related_issue_number,
+                redactions: &redactions,
+            },
+        )
+        .await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, task = task_name, ?outcome, "forensic attempt publication failed");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_serial_stage_attempt(
+    tracking: Option<&LifecycleTracking<'_>>,
+    selection: &PluginFlowSelection,
+    stage_name: &str,
+    attempt: u32,
+    stage_root: &Path,
+    aggregate_repo: &Path,
+    write_roots: &[String],
+    diagnostics: &[PluginArtifact],
+    outcome: Option<Outcome>,
+    reason: &str,
+) {
+    let Some(publication) = tracking.and_then(|tracking| tracking.publication.as_ref()) else {
+        return;
+    };
+    let redactions = configured_environment_redactions(selection);
+    if let Err(error) = publish_attempt(
+        publication,
+        aggregate_repo,
+        &AttemptPublication {
+            job_id: tracking.map(|tracking| tracking.coordinator.id),
+            task: stage_name,
+            work_item: None,
+            attempt,
+            outcome,
+            task_root: stage_root,
+            write_roots,
+            diagnostics,
+            reason,
+            related_issue_number: None,
+            redactions: &redactions,
+        },
+    )
+    .await
+    {
+        tracing::warn!(%error, stage = stage_name, ?outcome, "plugin stage forensic publication failed");
+    }
+}
+
+fn configured_environment_redactions(selection: &PluginFlowSelection) -> Vec<String> {
+    selection
+        .environment
+        .values()
+        .filter_map(|source| {
+            if Path::new(source).is_absolute() {
+                fs::read_to_string(source).ok()
+            } else {
+                env::var(source).ok()
+            }
+        })
+        .map(|value| value.trim_end().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn task_attempt_root(
+    workspace_path: &Path,
+    task_name: &str,
+    work_item: Option<&str>,
+    attempt: u32,
+) -> PathBuf {
+    let item_suffix = work_item.map(|item| format!("-{item}")).unwrap_or_default();
+    workspace_path
+        .join("plugin-tasks")
+        .join(format!("{attempt:04}-{task_name}{item_suffix}"))
+}
+
+fn write_agent_log(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_LOG_CHARS: usize = 1_000_000;
+    let mut value = String::from_utf8_lossy(bytes)
+        .chars()
+        .take(MAX_LOG_CHARS)
+        .collect::<String>();
+    if bytes.len() > value.len() {
+        value.push_str("\n[truncated]\n");
+    }
+    fs::write(path, value)?;
+    Ok(())
 }
 
 fn expand_templates(
@@ -2072,6 +2460,34 @@ async fn run_container(
             "--mount",
             &format!("type=volume,src={volume},dst=/root/.codex"),
         ]);
+    }
+    if let Ok(source) = env::var("DONKEYSPACE_OSS_TOOLS_PATH") {
+        let source = source.trim();
+        if !source.is_empty() {
+            let source_path = Path::new(source);
+            if !source_path.is_absolute() || source.contains(',') {
+                return Err(
+                    "DONKEYSPACE_OSS_TOOLS_PATH must be an absolute path without commas".into(),
+                );
+            }
+            docker.args([
+                "--mount",
+                &format!("type=bind,src={source},dst=/mnt/oss-tools,readonly"),
+            ]);
+        }
+    }
+    if let Ok(source) = env::var("DONKEYSPACE_TECH_PATH") {
+        let source = source.trim();
+        if !source.is_empty() {
+            let source_path = Path::new(source);
+            if !source_path.is_absolute() || source.contains(',') {
+                return Err("DONKEYSPACE_TECH_PATH must be an absolute path without commas".into());
+            }
+            docker.args([
+                "--mount",
+                &format!("type=bind,src={source},dst=/mnt/tech,readonly"),
+            ]);
+        }
     }
     for name in allowed {
         if let Some(source) = configured.get(name) {

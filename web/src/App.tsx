@@ -68,6 +68,21 @@ type CommandResult = {
 type RunDetail = {
   job: Run;
   command_results: CommandResult[];
+  publications: AgentPublication[];
+};
+
+type AgentPublication = {
+  id: number;
+  kind: string;
+  branch_name: string;
+  commit_sha: string;
+  html_url: string;
+  task: string | null;
+  work_item: string | null;
+  attempt: number | null;
+  outcome: string | null;
+  status: string;
+  last_error: string | null;
 };
 
 const placeholderRuns: Run[] = [
@@ -126,6 +141,14 @@ async function retryRun(id: string): Promise<Run> {
   }
 
   return response.json();
+}
+
+async function retryPublication(id: number): Promise<void> {
+  const response = await fetch(`/api/publications/${id}/retry`, { method: "POST" });
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.error ?? `Failed to retry publication: ${response.status}`);
+  }
 }
 
 export function App() {
@@ -238,13 +261,17 @@ function RunCommandResults({ runId }: { runId: string }) {
     retry: 1
   });
   const commandResults = detailQuery.data?.command_results ?? [];
+  const publications = detailQuery.data?.publications ?? [];
 
-  if (!commandResults.length) {
+  if (!commandResults.length && !publications.length) {
     return null;
   }
 
   return (
     <div className="command-results">
+      {publications.map((publication) => (
+        <RunPublication key={publication.id} publication={publication} runId={runId} />
+      ))}
       {commandResults.map((result) => (
         <div className="command-result" key={result.id}>
           <div>
@@ -258,6 +285,59 @@ function RunCommandResults({ runId }: { runId: string }) {
           {result.summary ? <pre>{result.summary}</pre> : null}
         </div>
       ))}
+    </div>
+  );
+}
+
+function RunPublication({
+  publication,
+  runId
+}: {
+  publication: AgentPublication;
+  runId: string;
+}) {
+  const queryClient = useQueryClient();
+  const retryMutation = useMutation({
+    mutationFn: () => retryPublication(publication.id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["run-detail", runId] });
+    }
+  });
+  const label = publication.task
+    ? `${publication.task}${publication.work_item ? `/${publication.work_item}` : ""}`
+    : "Accepted checkpoint";
+
+  return (
+    <div className="command-result publication-result">
+      <div>
+        <strong>{label}</strong>
+        <a href={publication.html_url} rel="noreferrer" target="_blank">
+          {publication.branch_name}
+        </a>
+        <code>{publication.commit_sha.slice(0, 12)}</code>
+      </div>
+      <span data-status={publication.status}>
+        {publication.kind} · {publication.status}
+      </span>
+      {publication.outcome ? <p>Outcome: {publication.outcome}</p> : null}
+      {publication.last_error ? <pre>{publication.last_error}</pre> : null}
+      {publication.status === "failed" ? (
+        <button
+          className="retry-button"
+          disabled={retryMutation.isPending}
+          onClick={() => retryMutation.mutate()}
+          type="button"
+        >
+          {retryMutation.isPending ? "Retrying…" : "Retry branch push"}
+        </button>
+      ) : null}
+      {retryMutation.isError ? (
+        <p className="retry-status" role="status">
+          {retryMutation.error instanceof Error
+            ? retryMutation.error.message
+            : "Failed to retry publication"}
+        </p>
+      ) : null}
     </div>
   );
 }

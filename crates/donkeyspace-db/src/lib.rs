@@ -202,6 +202,46 @@ pub struct OutboundActionRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPublicationInput {
+    pub coordinator_job_id: Uuid,
+    pub job_id: Option<Uuid>,
+    pub workflow_item_id: Option<i64>,
+    pub kind: String,
+    pub branch_name: String,
+    pub commit_sha: String,
+    pub html_url: String,
+    pub local_repo_path: String,
+    pub task: Option<String>,
+    pub work_item: Option<String>,
+    pub attempt: Option<i32>,
+    pub outcome: Option<String>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct AgentPublicationRecord {
+    pub id: i64,
+    pub coordinator_job_id: Uuid,
+    pub job_id: Option<Uuid>,
+    pub workflow_item_id: Option<i64>,
+    pub kind: String,
+    pub branch_name: String,
+    pub commit_sha: String,
+    pub html_url: String,
+    #[serde(skip_serializing)]
+    pub local_repo_path: String,
+    pub task: Option<String>,
+    pub work_item: Option<String>,
+    pub attempt: Option<i32>,
+    pub outcome: Option<String>,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngagementDecisionInput {
     pub webhook_delivery_id: i64,
     pub workflow_item_id: Option<i64>,
@@ -1033,6 +1073,184 @@ pub async fn create_outbound_action(
     .await?;
 
     Ok(action)
+}
+
+pub async fn upsert_agent_publication(
+    pool: &PgPool,
+    input: &AgentPublicationInput,
+) -> Result<AgentPublicationRecord, DbError> {
+    Ok(sqlx::query_as::<_, AgentPublicationRecord>(
+        r#"
+        INSERT INTO agent_publications (
+            coordinator_job_id, job_id, workflow_item_id, kind, branch_name,
+            commit_sha, html_url, local_repo_path, task, work_item, attempt, outcome, metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (coordinator_job_id, branch_name) DO UPDATE SET
+            job_id = EXCLUDED.job_id,
+            workflow_item_id = EXCLUDED.workflow_item_id,
+            commit_sha = EXCLUDED.commit_sha,
+            html_url = EXCLUDED.html_url,
+            local_repo_path = EXCLUDED.local_repo_path,
+            task = EXCLUDED.task,
+            work_item = EXCLUDED.work_item,
+            attempt = EXCLUDED.attempt,
+            outcome = EXCLUDED.outcome,
+            metadata = EXCLUDED.metadata,
+            status = 'pending',
+            last_error = NULL,
+            updated_at = now()
+        RETURNING *
+        "#,
+    )
+    .bind(input.coordinator_job_id)
+    .bind(input.job_id)
+    .bind(input.workflow_item_id)
+    .bind(&input.kind)
+    .bind(&input.branch_name)
+    .bind(&input.commit_sha)
+    .bind(&input.html_url)
+    .bind(&input.local_repo_path)
+    .bind(&input.task)
+    .bind(&input.work_item)
+    .bind(input.attempt)
+    .bind(&input.outcome)
+    .bind(&input.metadata)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn list_agent_publications_for_run(
+    pool: &PgPool,
+    job_id: Uuid,
+    coordinator_job_id: Option<Uuid>,
+) -> Result<Vec<AgentPublicationRecord>, DbError> {
+    Ok(sqlx::query_as::<_, AgentPublicationRecord>(
+        r#"
+        SELECT * FROM agent_publications
+        WHERE coordinator_job_id = COALESCE($2, $1)
+           OR job_id = $1
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(job_id)
+    .bind(coordinator_job_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn get_agent_publication(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<AgentPublicationRecord>, DbError> {
+    Ok(sqlx::query_as::<_, AgentPublicationRecord>(
+        "SELECT * FROM agent_publications WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn list_pending_agent_publications(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<AgentPublicationRecord>, DbError> {
+    Ok(sqlx::query_as::<_, AgentPublicationRecord>(
+        r#"
+        SELECT * FROM agent_publications
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn mark_agent_publication_published(pool: &PgPool, id: i64) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        UPDATE agent_publications
+        SET status = 'published', last_error = NULL, updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_agent_publication_failed(
+    pool: &PgPool,
+    id: i64,
+    error: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        UPDATE agent_publications
+        SET status = 'failed', last_error = $2, updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn retry_agent_publication(pool: &PgPool, id: i64) -> Result<bool, DbError> {
+    Ok(sqlx::query(
+        r#"
+        UPDATE agent_publications
+        SET status = 'pending', last_error = NULL, updated_at = now()
+        WHERE id = $1 AND status = 'failed'
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+pub async fn unpublished_agent_publications_exist(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM agent_publications
+            WHERE coordinator_job_id = $1 AND status <> 'published'
+        )
+        "#,
+    )
+    .bind(coordinator_job_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn set_checkpoint_pull_request(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+    pull_request_url: &str,
+) -> Result<Option<AgentPublicationRecord>, DbError> {
+    Ok(sqlx::query_as::<_, AgentPublicationRecord>(
+        r#"
+        UPDATE agent_publications
+        SET metadata = jsonb_set(metadata, '{pull_request_url}', to_jsonb($2::text), true),
+            updated_at = now()
+        WHERE coordinator_job_id = $1 AND kind = 'checkpoint'
+        RETURNING *
+        "#,
+    )
+    .bind(coordinator_job_id)
+    .bind(pull_request_url)
+    .fetch_optional(pool)
+    .await?)
 }
 
 pub async fn create_command_result(

@@ -197,6 +197,10 @@ pub struct PluginTask {
     pub resources: Vec<PluginResourceAssignment>,
     #[serde(default)]
     pub artifacts: Vec<PluginArtifact>,
+    /// Optional text diagnostics to preserve on a forensic attempt branch.
+    /// Unlike publishable artifacts, these never enter the aggregate checkout.
+    #[serde(default)]
+    pub diagnostics: Vec<PluginArtifact>,
     #[serde(default)]
     pub validators: Vec<PluginValidator>,
     #[serde(default)]
@@ -423,6 +427,14 @@ impl PluginManifest {
                         )));
                     }
                     validate_filesystem_template(&artifact.path, &self.parameters, true)?;
+                }
+                for diagnostic in &task.diagnostics {
+                    if diagnostic.path.contains(['*', '?', '[', ']']) {
+                        return Err(PluginError::Invalid(format!(
+                            "task `{task_name}` diagnostic paths must be exact"
+                        )));
+                    }
+                    validate_filesystem_template(&diagnostic.path, &self.parameters, true)?;
                 }
                 for validator in &task.validators {
                     if validator.name.trim().is_empty() || validator.command.is_empty() {

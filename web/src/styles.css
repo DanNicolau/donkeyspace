@@ -193,6 +193,15 @@ a {
   overflow-wrap: anywhere;
 }
 
+.publication-result a {
+  color: #78b7ff;
+  overflow-wrap: anywhere;
+}
+
+.publication-result p {
+  margin: 0;
+}
+
 .command-result span {
   color: #68736a;
   font-size: 12px;

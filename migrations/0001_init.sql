@@ -169,3 +169,32 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS outbound_actions_status_idx ON outbound_actions(status);
 CREATE INDEX IF NOT EXISTS outbound_actions_job_id_idx ON outbound_actions(job_id);
+
+CREATE TABLE IF NOT EXISTS agent_publications (
+    id BIGSERIAL PRIMARY KEY,
+    coordinator_job_id UUID NOT NULL REFERENCES jobs(id),
+    job_id UUID REFERENCES jobs(id),
+    workflow_item_id BIGINT REFERENCES workflow_items(id),
+    kind TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    html_url TEXT NOT NULL,
+    local_repo_path TEXT NOT NULL,
+    task TEXT,
+    work_item TEXT,
+    attempt INTEGER,
+    outcome TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (coordinator_job_id, branch_name)
+);
+
+CREATE INDEX IF NOT EXISTS agent_publications_coordinator_idx
+    ON agent_publications(coordinator_job_id, created_at);
+CREATE INDEX IF NOT EXISTS agent_publications_job_idx
+    ON agent_publications(job_id, created_at);
+CREATE INDEX IF NOT EXISTS agent_publications_status_idx
+    ON agent_publications(status, updated_at);

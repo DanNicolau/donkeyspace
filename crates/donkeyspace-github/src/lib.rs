@@ -604,6 +604,40 @@ impl GitHubClient {
         Ok(comment.id.to_string())
     }
 
+    pub async fn upsert_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+        marker: &str,
+        body: &str,
+    ) -> Result<String, GitHubClientError> {
+        let comments: Vec<Value> = self
+            .client
+            .get(
+                format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100"),
+                None::<&()>,
+            )
+            .await?;
+        if let Some(comment_id) = comments.iter().find_map(|comment| {
+            comment["body"]
+                .as_str()
+                .filter(|body| body.contains(marker))
+                .and_then(|_| comment["id"].as_i64())
+        }) {
+            let updated: Value = self
+                .client
+                .patch(
+                    format!("/repos/{owner}/{repo}/issues/comments/{comment_id}"),
+                    Some(&serde_json::json!({"body": body})),
+                )
+                .await?;
+            return Ok(updated["id"].as_i64().unwrap_or(comment_id).to_string());
+        }
+        self.create_issue_comment(owner, repo, issue_number, body)
+            .await
+    }
+
     pub async fn authenticated_login(&self) -> Result<String, GitHubClientError> {
         Ok(self.client.current().user().await?.login)
     }

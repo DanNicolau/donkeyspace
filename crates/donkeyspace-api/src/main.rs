@@ -15,11 +15,12 @@ use donkeyspace_db::{
     WorkflowItemInput, acquire_job_lease, active_job_exists_for_workflow_item, apply_migrations,
     connect, create_job, create_retry_job, get_job, get_workflow_item_by_issue_number,
     get_workflow_item_state, github_managed_resource_exists, latest_workflow_job_input,
-    list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
-    list_open_managed_pull_requests_for_base, list_recent_engagement_decisions,
-    list_recent_outbound_actions, pending_outbound_comment_exists, record_engagement_decision,
-    record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
-    resume_latest_paused_job, reviewer_job_exists_for_pr_head, upsert_pull_request,
+    list_agent_publications_for_run, list_job_command_results, list_job_outbound_actions,
+    list_job_transitions, list_jobs, list_open_managed_pull_requests_for_base,
+    list_recent_engagement_decisions, list_recent_outbound_actions,
+    pending_outbound_comment_exists, record_engagement_decision, record_state_transition,
+    record_webhook_delivery, repair_job_exists_for_pr_base, resume_latest_paused_job,
+    retry_agent_publication, reviewer_job_exists_for_pr_head, upsert_pull_request,
     upsert_repository, upsert_workflow_item,
 };
 use donkeyspace_github::{GitHubClient, GitHubCredentialProvider};
@@ -137,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/runs/{id}/transitions", get(api_run_transitions))
         .route("/api/runs/{id}/lease", post(api_lease_run))
         .route("/api/runs/{id}/retry", post(api_retry_run))
+        .route("/api/publications/{id}/retry", post(api_retry_publication))
         .route("/webhooks/github", post(github_webhook))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -517,11 +519,30 @@ async fn api_run(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> im
                 }
             };
 
+            let coordinator_job_id = job
+                .input
+                .pointer("/plugin_execution/coordinator_run_id")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let publications =
+                match list_agent_publications_for_run(pool, id, coordinator_job_id).await {
+                    Ok(publications) => publications,
+                    Err(error) => {
+                        tracing::error!(%error, %id, "failed to fetch agent publications");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiError::new("failed to fetch run publications")),
+                        )
+                            .into_response();
+                    }
+                };
+
             Json(RunDetail {
                 job,
                 transitions,
                 outbound_actions,
                 command_results,
+                publications,
             })
             .into_response()
         }
@@ -697,6 +718,42 @@ async fn api_retry_run(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError::new("failed to retry run")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_retry_publication(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+    if !state.policy.dashboard.allow_retry {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new("publication retries are disabled by policy")),
+        )
+            .into_response();
+    }
+    match retry_agent_publication(pool, id).await {
+        Ok(true) => StatusCode::ACCEPTED.into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(ApiError::new("only failed publications can be retried")),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, publication_id = id, "failed to retry publication");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to retry publication")),
             )
                 .into_response()
         }
@@ -2001,6 +2058,7 @@ struct RunDetail {
     transitions: Vec<donkeyspace_db::StateTransitionRecord>,
     outbound_actions: Vec<donkeyspace_db::OutboundActionRecord>,
     command_results: Vec<donkeyspace_db::CommandResultRecord>,
+    publications: Vec<donkeyspace_db::AgentPublicationRecord>,
 }
 
 #[derive(Debug, Serialize)]

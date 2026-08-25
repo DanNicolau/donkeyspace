@@ -266,6 +266,12 @@ standard test results. A missing or wrong-type artifact, modified resource, or
 failed validator publishes nothing. Artifact and validator checks are skipped
 for non-publishable outcomes such as `needs_changes`.
 
+Tasks may also declare optional forensic `diagnostics` using the same exact
+file-or-directory shape. Diagnostic paths must be inside a declared read or
+write root. They are collected only into a bounded, text-only attempt branch
+when the task does not complete successfully; they never enter the aggregate
+checkout or final pull request branch.
+
 ## Work-item registry
 
 The planner writes the JSON file configured by `work_items_path`:
@@ -350,6 +356,14 @@ aggregate checkout. Absolute paths, parent traversal, and reported changes
 outside write roots fail closed. Repository policy can narrow task access with
 `task_access_overrides` (`stage_access_overrides` is a compatibility alias); it cannot widen manifest
 access.
+
+For GitHub-backed runs, Donkeyspace publishes accepted aggregate changes to a
+single `donkeyspace/issue-<number>-<run>` checkpoint branch after each task
+wave. A non-successful task receives a separate immutable
+`donkeyspace/attempt-*` branch containing its declared write-root changes,
+structured result, bounded logs, and declared diagnostics. Publication errors
+are recorded independently of the agent outcome and retain the workspace for a
+dashboard-triggered retry.
 
 ## Run input and result
 

@@ -3,7 +3,12 @@ use crate::{
 };
 use donkeyspace_core::{PluginFlowSelection, PluginManifest, Policy, RepositoryEngagementPolicy};
 use serde::Serialize;
-use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 pub enum PluginEnvironmentInput {
     File(PathBuf),
@@ -257,10 +262,21 @@ impl Instance {
         // SELinux relabel option (`z`) rather than the private option (`Z`).
         let plugin_mount = format!("{}:/plugins/{mount_id}:ro,z", plugin.source_path.display());
         let policy_mount = format!("{}:/run/donkeyspace/policy.yml:ro,z", policy_path.display());
-        let worker_environment = BTreeMap::from([(
+        let mut worker_environment = BTreeMap::from([(
             "DONKEYSPACE_POLICY_PATH",
             "/run/donkeyspace/policy.yml".into(),
         )]);
+        let oss_tools_path = Path::new("/mnt/oss-tools");
+        if oss_tools_path.join("OpenROAD-flow-scripts").is_dir() {
+            worker_environment.insert(
+                "DONKEYSPACE_OSS_TOOLS_PATH",
+                oss_tools_path.display().to_string(),
+            );
+        }
+        let tech_path = Path::new("/mnt/tech");
+        if tech_path.join("tsmc7").is_dir() {
+            worker_environment.insert("DONKEYSPACE_TECH_PATH", tech_path.display().to_string());
+        }
         let mut secrets = BTreeMap::new();
         let mut mounts = Vec::new();
         for (index, path) in plugin.environment_files.values().enumerate() {

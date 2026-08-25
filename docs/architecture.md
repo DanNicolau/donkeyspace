@@ -70,6 +70,8 @@ PostgreSQL stores:
 - managed pull request metadata;
 - command results; and
 - pending, completed, or failed outbound GitHub actions.
+- accepted-checkpoint and forensic-attempt branch publications, including
+  retry state and commit links.
 
 The action outbox records label and comment writes before the worker sends them
 to GitHub. Policy snapshot tables exist, but policy snapshots and decisions are
