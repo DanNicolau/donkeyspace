@@ -27,9 +27,6 @@ impl TaskGraph {
         let mut dependencies = BTreeMap::new();
 
         for (task_name, task) in &flow.tasks {
-            if task_name == &flow.start {
-                continue;
-            }
             let item_ids = match task.scope {
                 PluginTaskScope::Workflow => vec![None],
                 PluginTaskScope::WorkItem => work_items
@@ -42,11 +39,17 @@ impl TaskGraph {
                     work_item: work_item.clone(),
                     task: task_name.clone(),
                 };
-                states.insert(key.clone(), TaskState::Waiting);
+                states.insert(
+                    key.clone(),
+                    if task_name == &flow.start {
+                        TaskState::Completed
+                    } else {
+                        TaskState::Waiting
+                    },
+                );
                 let mut required = task
                     .dependencies
                     .iter()
-                    .filter(|dependency| *dependency != &flow.start)
                     .map(|dependency| TaskKey {
                         work_item: match flow.tasks[dependency].scope {
                             PluginTaskScope::Workflow => None,
@@ -59,9 +62,15 @@ impl TaskGraph {
                     && let Some(item_id) = &work_item
                     && let Some(item) = work_items.iter().find(|item| &item.id == item_id)
                 {
-                    required.extend(item.depends_on.iter().map(|dependency| TaskKey {
-                        work_item: Some(dependency.clone()),
-                        task: task_name.clone(),
+                    let active_items = work_items
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<BTreeSet<_>>();
+                    required.extend(item.depends_on.iter().filter_map(|dependency| {
+                        active_items.contains(dependency.as_str()).then(|| TaskKey {
+                            work_item: Some(dependency.clone()),
+                            task: task_name.clone(),
+                        })
                     }));
                 }
                 dependencies.insert(key, required);
@@ -74,16 +83,24 @@ impl TaskGraph {
         }
     }
 
-    pub fn ready(&self) -> Vec<TaskKey> {
+    pub fn ready(&self) -> Result<Vec<TaskKey>, String> {
         self.states
             .iter()
-            .filter(|(key, state)| {
-                **state == TaskState::Waiting
-                    && self.dependencies[*key].iter().all(|dependency| {
+            .filter_map(|(key, state)| {
+                let dependencies = match self.dependencies.get(key) {
+                    Some(dependencies) => dependencies,
+                    None => {
+                        return Some(Err(format!(
+                            "task graph is missing dependencies for `{key:?}`"
+                        )));
+                    }
+                };
+                (*state == TaskState::Waiting
+                    && dependencies.iter().all(|dependency| {
                         self.states.get(dependency) == Some(&TaskState::Completed)
-                    })
+                    }))
+                .then(|| Ok(key.clone()))
             })
-            .map(|(key, _)| key.clone())
             .collect()
     }
 
@@ -91,20 +108,22 @@ impl TaskGraph {
         self.states.keys()
     }
 
-    pub fn mark_running(&mut self, key: &TaskKey) {
-        self.states.insert(key.clone(), TaskState::Running);
+    pub fn mark_running(&mut self, key: &TaskKey) -> Result<(), String> {
+        self.set_state(key, TaskState::Running)
     }
 
-    pub fn mark_completed(&mut self, key: &TaskKey) {
-        self.states.insert(key.clone(), TaskState::Completed);
+    pub fn mark_completed(&mut self, key: &TaskKey) -> Result<(), String> {
+        self.set_state(key, TaskState::Completed)
     }
 
-    pub fn restore_completed<'a>(&mut self, keys: impl IntoIterator<Item = &'a TaskKey>) {
+    pub fn restore_completed<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'a TaskKey>,
+    ) -> Result<(), String> {
         for key in keys {
-            if self.states.contains_key(key) {
-                self.states.insert(key.clone(), TaskState::Completed);
-            }
+            self.set_state(key, TaskState::Completed)?;
         }
+        Ok(())
     }
 
     pub fn completed_keys(&self) -> impl Iterator<Item = &TaskKey> {
@@ -117,7 +136,10 @@ impl TaskGraph {
         self.states.get(key) == Some(&TaskState::Completed)
     }
 
-    pub fn restart_from(&mut self, key: &TaskKey) -> Vec<TaskKey> {
+    pub fn restart_from(&mut self, key: &TaskKey) -> Result<Vec<TaskKey>, String> {
+        if !self.states.contains_key(key) {
+            return Err(format!("task graph has no task `{key:?}`"));
+        }
         let mut invalidated = BTreeSet::from([key.clone()]);
         loop {
             let before = invalidated.len();
@@ -134,10 +156,9 @@ impl TaskGraph {
             }
         }
         for invalidated_key in &invalidated {
-            self.states
-                .insert(invalidated_key.clone(), TaskState::Waiting);
+            self.set_state(invalidated_key, TaskState::Waiting)?;
         }
-        invalidated.into_iter().collect()
+        Ok(invalidated.into_iter().collect())
     }
 
     pub fn is_complete(&self) -> bool {
@@ -150,6 +171,15 @@ impl TaskGraph {
         self.states.iter().all(|(key, state)| {
             key.work_item.as_deref() != Some(work_item) || *state == TaskState::Completed
         })
+    }
+
+    fn set_state(&mut self, key: &TaskKey, state: TaskState) -> Result<(), String> {
+        let existing = self
+            .states
+            .get_mut(key)
+            .ok_or_else(|| format!("task graph has no task `{key:?}`"))?;
+        *existing = state;
+        Ok(())
     }
 }
 
@@ -210,7 +240,7 @@ flows:
             },
         ];
         let mut graph = TaskGraph::for_work_items(&flow, &items);
-        let ready = graph.ready();
+        let ready = graph.ready().unwrap();
         assert!(ready.contains(&TaskKey {
             work_item: Some("leaf".into()),
             task: "rtl".into()
@@ -225,8 +255,8 @@ flows:
             work_item: Some("leaf".into()),
             task: "rtl".into(),
         };
-        graph.mark_completed(&leaf_rtl);
-        assert!(graph.ready().contains(&TaskKey {
+        graph.mark_completed(&leaf_rtl).unwrap();
+        assert!(graph.ready().unwrap().contains(&TaskKey {
             work_item: Some("top".into()),
             task: "rtl".into()
         }));
@@ -243,14 +273,16 @@ flows:
         }];
         let mut graph = TaskGraph::for_work_items(&flow, &items);
         for key in graph.states.keys().cloned().collect::<Vec<_>>() {
-            graph.mark_completed(&key);
+            graph.mark_completed(&key).unwrap();
         }
-        graph.restart_from(&TaskKey {
-            work_item: Some("block".into()),
-            task: "rtl".into(),
-        });
+        graph
+            .restart_from(&TaskKey {
+                work_item: Some("block".into()),
+                task: "rtl".into(),
+            })
+            .unwrap();
         assert_eq!(
-            graph.ready(),
+            graph.ready().unwrap(),
             vec![TaskKey {
                 work_item: Some("block".into()),
                 task: "rtl".into()
@@ -278,13 +310,15 @@ flows:
         ];
         let mut graph = TaskGraph::for_work_items(&flow, &items);
         for key in graph.keys().cloned().collect::<Vec<_>>() {
-            graph.mark_completed(&key);
+            graph.mark_completed(&key).unwrap();
         }
 
-        graph.restart_from(&TaskKey {
-            work_item: Some("left".into()),
-            task: "rtl".into(),
-        });
+        graph
+            .restart_from(&TaskKey {
+                work_item: Some("left".into()),
+                task: "rtl".into(),
+            })
+            .unwrap();
 
         assert!(graph.is_completed(&TaskKey {
             work_item: Some("right".into()),
@@ -301,6 +335,36 @@ flows:
         assert!(!graph.is_completed(&TaskKey {
             work_item: Some("left".into()),
             task: "synthesis".into(),
+        }));
+    }
+
+    #[test]
+    fn rejects_unknown_checkpoint_and_restart_keys() {
+        let flow = flow();
+        let mut graph = TaskGraph::for_work_items(&flow, &[]);
+        let unknown = TaskKey {
+            work_item: Some("missing".into()),
+            task: "rtl".into(),
+        };
+
+        assert!(graph.restore_completed([&unknown]).is_err());
+        assert!(graph.restart_from(&unknown).is_err());
+    }
+
+    #[test]
+    fn catalog_dependencies_outside_the_lifecycle_are_already_satisfied() {
+        let flow = flow();
+        let items = vec![PluginWorkItem {
+            id: "top".into(),
+            spec: "top.md".into(),
+            depends_on: vec!["existing_leaf".into()],
+            metadata: BTreeMap::new(),
+        }];
+        let graph = TaskGraph::for_work_items(&flow, &items);
+
+        assert!(graph.ready().unwrap().contains(&TaskKey {
+            work_item: Some("top".into()),
+            task: "rtl".into(),
         }));
     }
 }

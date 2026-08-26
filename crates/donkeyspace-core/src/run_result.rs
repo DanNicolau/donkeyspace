@@ -45,6 +45,11 @@ pub struct PluginTaskResult {
     pub handoff: Option<AgentHandoff>,
     #[serde(default)]
     pub resources_used: Vec<String>,
+    /// Repository work-item ids selected for this lifecycle. Planner tasks use
+    /// this to distinguish the current issue's work from the persistent block
+    /// catalog; non-planner tasks leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_items: Option<Vec<String>>,
 }
 
 pub type PluginStageResult = PluginTaskResult;

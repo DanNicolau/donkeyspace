@@ -206,6 +206,7 @@ pub async fn publish_attempt(
     redact_diagnostic_tree(&diagnostic_root, context.token, attempt.redactions)?;
     git(&local_repo, &["add", "-A"], None, None).await?;
     let diagnostic_relative = diagnostic_root.strip_prefix(&local_repo)?.to_string_lossy();
+    let kind = publication_kind(attempt.outcome);
     git(
         &local_repo,
         &["add", "-f", "--", diagnostic_relative.as_ref()],
@@ -219,9 +220,10 @@ pub async fn publish_attempt(
             "commit",
             "-m",
             &format!(
-                "chore({}): preserve {} attempt for issue #{}",
+                "chore({}): preserve {} {} for issue #{}",
                 active_facade().command,
                 attempt.task,
+                kind,
                 context.issue_number
             ),
         ],
@@ -239,7 +241,7 @@ pub async fn publish_attempt(
             coordinator_job_id: context.coordinator_job_id,
             job_id: attempt.job_id,
             workflow_item_id: context.workflow_item_id,
-            kind: "attempt".into(),
+            kind: kind.into(),
             branch_name: branch.clone(),
             commit_sha: sha,
             html_url: branch_url(context.owner, context.repo, &branch),
@@ -358,7 +360,7 @@ async fn queue_status_comment(
     }
     lines.extend([
         String::new(),
-        "Attempt branches are forensic snapshots and are not merged automatically.".into(),
+        "Attempt and diagnostic branches are snapshots and are not merged automatically.".into(),
         String::new(),
         marker.clone(),
         "<!-- donkeyspace-generated -->".into(),
@@ -442,8 +444,9 @@ pub async fn push_existing_publication(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let askpass = workspace_path.join("git-askpass-publication.sh");
     let result = async {
-        let token =
-            token.ok_or("configured GitHub authentication is required to publish branches")?;
+        let token = crate::current_github_token(token)
+            .await?
+            .ok_or("configured GitHub authentication is required to publish branches")?;
         let remote = github_remote(&publication.metadata)?;
         write_askpass_script(&askpass)?;
         let refspec = format!(
@@ -453,7 +456,7 @@ pub async fn push_existing_publication(
         git(
             Path::new(&publication.local_repo_path),
             &["push", &remote, &refspec],
-            Some(token),
+            Some(&token),
             Some(&askpass),
         )
         .await
@@ -510,6 +513,14 @@ fn attempt_branch_name(
         safe_segment(attempt.work_item.unwrap_or("workflow")),
         attempt.attempt
     )
+}
+
+fn publication_kind(outcome: Option<Outcome>) -> &'static str {
+    if outcome == Some(Outcome::Implemented) {
+        "diagnostic"
+    } else {
+        "attempt"
+    }
 }
 
 fn branch_url(owner: &str, repo: &str, branch: &str) -> String {
@@ -862,6 +873,8 @@ mod tests {
             attempt_branch_name("example-agent", 29, id, &attempt),
             "example-agent/attempt-29-01a03537-synthesis-task-counter-detect-a301"
         );
+        assert_eq!(publication_kind(Some(Outcome::Implemented)), "diagnostic");
+        assert_eq!(publication_kind(Some(Outcome::Failed)), "attempt");
     }
 
     #[test]

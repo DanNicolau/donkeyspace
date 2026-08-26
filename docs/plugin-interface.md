@@ -278,9 +278,9 @@ for non-publishable outcomes such as `needs_changes`.
 
 Tasks may also declare optional forensic `diagnostics` using the same exact
 file-or-directory shape. Diagnostic paths must be inside a declared read or
-write root. They are collected only into a bounded, text-only attempt branch
-when the task does not complete successfully; they never enter the aggregate
-checkout or final pull request branch.
+write root. Non-empty diagnostics from successful tasks are published as a
+bounded, text-only `diagnostic` snapshot; unsuccessful tasks use an `attempt`
+snapshot. Neither enters the aggregate checkout or final pull request branch.
 
 ## Work-item registry
 
@@ -302,6 +302,13 @@ The planner writes the JSON file configured by `work_items_path`:
 IDs must be unique, filesystem-safe, and acyclic. Every dependency must name
 another work item. `depends_on_work_items: true` makes a task wait for the same
 task on each listed dependency.
+
+The registry is the persistent repository catalog, not the current execution
+set. A lifecycle-replacing planner must also return `work_items` in its task
+result with only the catalog IDs selected for the current parent issue.
+Unselected catalog dependencies are treated as already available; they are not
+scheduled or projected again. Planner revisions reuse projected issues for IDs
+that remain selected.
 
 Donkeyspace creates a persisted child job for every expanded task. Jobs remain
 `waiting` until their dependencies complete. All ready jobs in a task wave run
@@ -337,7 +344,10 @@ An `implemented` result completes a task. DV or synthesis can return
 }
 ```
 
-The target task and every downstream dependent are invalidated and rerun.
+The target task's scope determines the restart key: workflow tasks discard the
+source work-item ID, while work-item tasks retain it. The normalized target and
+every downstream dependent are invalidated and rerun. Unknown targets or
+checkpoint keys fail the lifecycle without mutating the graph.
 Handoffs are bounded per work item/source/target edge. Exceeding the limit
 produces `needs_human`. A role may return `needs_human` directly for ambiguous,
 high-risk, or tool-limited decisions. Repository risk policy is applied again
@@ -369,11 +379,13 @@ access.
 
 For GitHub-backed runs, Donkeyspace publishes accepted aggregate changes to a
 single `donkeyspace/issue-<number>-<run>` checkpoint branch after each task
-wave. A non-successful task receives a separate immutable
-`donkeyspace/attempt-*` branch containing its declared write-root changes,
-structured result, bounded logs, and declared diagnostics. Publication errors
+wave. A non-successful task receives a separate immutable attempt branch
+containing its declared write-root changes, structured result, bounded logs,
+and declared diagnostics. Successful tasks with non-empty diagnostics receive
+the same isolated snapshot recorded as kind `diagnostic`. Publication errors
 are recorded independently of the agent outcome and retain the workspace for a
-dashboard-triggered retry.
+dashboard-triggered retry. GitHub credentials are resolved immediately before
+every push so long-running jobs do not reuse expired App installation tokens.
 
 ## Run input and result
 

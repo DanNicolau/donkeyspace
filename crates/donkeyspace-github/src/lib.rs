@@ -759,7 +759,12 @@ impl GitHubClient {
         for item in work_items {
             let (_, issue_number) = projected[&item.id];
             for dependency in &item.depends_on {
-                let (blocking_issue_id, _) = projected[dependency];
+                let Some((blocking_issue_id, _)) = projected.get(dependency) else {
+                    // The dependency may be an existing repository block that
+                    // is intentionally outside this lifecycle. It is already
+                    // satisfied and must not be projected again.
+                    continue;
+                };
                 self.client
                     .post::<_, Value>(
                         format!(

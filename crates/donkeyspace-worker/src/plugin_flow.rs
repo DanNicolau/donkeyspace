@@ -1,8 +1,8 @@
 use donkeyspace_core::{
     Confidence, Outcome, PluginApprovalMode, PluginArtifact, PluginArtifactType, PluginFlow,
     PluginFlowSelection, PluginManifest, PluginParameter, PluginResourceAssignment,
-    PluginResourceSource, PluginTask, PluginTaskResult, PluginValidator, PluginWorkItem,
-    PluginWorkItemRegistry, Risk, RunResult, TestResult, TestStatus,
+    PluginResourceSource, PluginTask, PluginTaskResult, PluginTaskScope, PluginValidator,
+    PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult, TestResult, TestStatus,
 };
 use donkeyspace_db::{
     JobRecord, PgPool, complete_job, create_waiting_job, fail_job,
@@ -35,7 +35,7 @@ pub struct LifecycleTracking<'a> {
     pub publication: Option<PublicationContext<'a>>,
 }
 
-const CHECKPOINT_VERSION: u32 = 2;
+const CHECKPOINT_VERSION: u32 = 3;
 const MAX_RESOURCE_FILES: usize = 1_024;
 const MAX_RESOURCE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -110,6 +110,8 @@ struct LifecycleCheckpoint {
     start_approved: bool,
     #[serde(default)]
     revision_targets: Vec<TaskKey>,
+    #[serde(default)]
+    active_work_items: Vec<String>,
 }
 
 pub async fn run(
@@ -334,6 +336,21 @@ pub async fn run(
             {
                 tracing::warn!(%error, stage = stage_name, "plugin stage checkpoint failed");
             }
+            if diagnostics_present_at(&stage_repo, &diagnostics) {
+                publish_serial_stage_attempt(
+                    tracking.as_ref(),
+                    selection,
+                    &stage_name,
+                    attempt,
+                    &stage_root,
+                    repo_path,
+                    &write_roots,
+                    &diagnostics,
+                    Some(stage_result.result.outcome),
+                    &stage_result.result.summary,
+                )
+                .await;
+            }
         } else {
             publish_serial_stage_attempt(
                 tracking.as_ref(),
@@ -430,7 +447,7 @@ async fn run_work_item_lifecycle(
         if checkpoint_path.is_file() {
             let checkpoint: LifecycleCheckpoint =
                 serde_json::from_str(&fs::read_to_string(&checkpoint_path)?)?;
-            if !matches!(checkpoint.version, 1 | CHECKPOINT_VERSION) {
+            if !matches!(checkpoint.version, 1 | 2 | CHECKPOINT_VERSION) {
                 return Err(format!(
                     "unsupported lifecycle checkpoint version {}",
                     checkpoint.version
@@ -545,6 +562,7 @@ async fn run_work_item_lifecycle(
         mut aggregate_risk,
         mut aggregate_confidence,
         mut last_result,
+        requested_work_items,
     ) = if let Some(checkpoint) = &checkpoint
         && !rerun_start
     {
@@ -563,6 +581,8 @@ async fn run_work_item_lifecycle(
             checkpoint.aggregate_risk,
             checkpoint.aggregate_confidence,
             checkpoint.last_result.clone(),
+            (!checkpoint.active_work_items.is_empty())
+                .then(|| checkpoint.active_work_items.clone()),
         )
     } else {
         let mut previous = checkpoint
@@ -618,6 +638,7 @@ async fn run_work_item_lifecycle(
             }
         };
         accumulated_tests.extend(planner.result.tests.clone());
+        let requested_work_items = planner.work_items.clone();
         let aggregate_risk = planner.result.risk;
         let aggregate_confidence = planner.result.confidence;
         previous.push(task_summary(&flow.start, None, attempt, &planner.result));
@@ -666,6 +687,7 @@ async fn run_work_item_lifecycle(
             aggregate_risk,
             aggregate_confidence,
             planner.result,
+            requested_work_items,
         )
     };
 
@@ -677,8 +699,9 @@ async fn run_work_item_lifecycle(
     let registry: PluginWorkItemRegistry =
         serde_json::from_str(&fs::read_to_string(repo_path.join(&registry_path))?)?;
     validate_work_items(&registry.work_items)?;
-    if let Some(item) = registry
-        .work_items
+    let work_items =
+        select_lifecycle_work_items(&registry.work_items, requested_work_items.as_deref())?;
+    if let Some(item) = work_items
         .iter()
         .find(|item| !repo_path.join(&item.spec).is_file())
     {
@@ -697,7 +720,7 @@ async fn run_work_item_lifecycle(
             .and_then(Value::as_str),
         issue_input.pointer("/issue/number").and_then(Value::as_i64),
     );
-    let mut graph = TaskGraph::for_work_items(flow, &registry.work_items);
+    let mut graph = TaskGraph::for_work_items(flow, &work_items);
     let mut projected_issues = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.projected_issues.clone())
@@ -717,31 +740,40 @@ async fn run_work_item_lifecycle(
         .map(|checkpoint| checkpoint.completed_keys.iter().cloned().collect())
         .unwrap_or_default();
     if let Some(checkpoint) = &checkpoint {
-        graph.restore_completed(&checkpoint.completed_keys);
+        graph.restore_completed(&checkpoint.completed_keys)?;
     }
-    let revision_keys = revision_targets
-        .iter()
-        .flat_map(|target| graph.restart_from(target))
-        .collect::<BTreeSet<_>>();
+    let mut revision_keys = BTreeSet::new();
+    for target in &revision_targets {
+        revision_keys.extend(graph.restart_from(target)?);
+    }
     if checkpoint.is_none() || rerun_start {
         if rerun_start
             && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), _) = github_coordinates
         {
-            for issue_number in projected_issues.values() {
-                if let Err(error) = github.close_issue(owner, repo, *issue_number).await {
-                    tracing::warn!(%error, issue_number, "failed to close superseded projected issue");
+            let active_ids = work_items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let removed = projected_issues
+                .iter()
+                .filter(|(id, _)| !active_ids.contains(id.as_str()))
+                .map(|(id, issue)| (id.clone(), *issue))
+                .collect::<Vec<_>>();
+            for (id, issue_number) in removed {
+                if let Err(error) = github.close_issue(owner, repo, issue_number).await {
+                    tracing::warn!(%error, issue_number, "failed to close removed projected issue");
                 }
+                projected_issues.remove(&id);
             }
-            projected_issues.clear();
         }
         if flow.project_github_issues
             && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
         {
-            let work_items = registry
-                .work_items
+            let github_work_items = work_items
                 .iter()
+                .filter(|item| !projected_issues.contains_key(&item.id))
                 .map(|item| GitHubWorkItem {
                     id: item.id.clone(),
                     spec: item.spec.clone(),
@@ -754,7 +786,7 @@ async fn run_work_item_lifecycle(
                 })
                 .collect::<Vec<_>>();
             match github
-                .project_work_items(owner, repo, parent_issue_number, &work_items)
+                .project_work_items(owner, repo, parent_issue_number, &github_work_items)
                 .await
             {
                 Ok(issues) => {
@@ -772,10 +804,11 @@ async fn run_work_item_lifecycle(
                             .await?;
                         }
                     }
-                    projected_issues = issues
-                        .into_iter()
-                        .map(|(work_item, issue)| (work_item, issue.number))
-                        .collect();
+                    projected_issues.extend(
+                        issues
+                            .into_iter()
+                            .map(|(work_item, issue)| (work_item, issue.number)),
+                    );
                 }
                 Err(error) => tracing::warn!(%error, "github work-item projection failed"),
             }
@@ -818,6 +851,7 @@ async fn run_work_item_lifecycle(
                 pending_approvals: pending,
                 start_approved: false,
                 revision_targets: Vec::new(),
+                active_work_items: work_items.iter().map(|item| item.id.clone()).collect(),
             },
         )?;
         return Ok(finish_result(result, accumulated_tests, &previous));
@@ -825,14 +859,16 @@ async fn run_work_item_lifecycle(
 
     if let Some(tracking) = &tracking {
         for key in graph.keys() {
-            if !tracked_jobs.contains_key(key) || revision_keys.contains(key) {
+            if !graph.is_completed(key)
+                && (!tracked_jobs.contains_key(key) || revision_keys.contains(key))
+            {
                 let job = create_tracked_job(
                     tracking,
                     manifest,
                     &selection.flow,
                     flow,
                     key,
-                    &registry.work_items,
+                    &work_items,
                     issue_input,
                 )
                 .await?;
@@ -869,7 +905,7 @@ async fn run_work_item_lifecycle(
 
     while !graph.is_complete() {
         let ready = graph
-            .ready()
+            .ready()?
             .into_iter()
             .take(flow.max_parallel_tasks)
             .collect::<Vec<_>>();
@@ -886,7 +922,7 @@ async fn run_work_item_lifecycle(
             return Err("plugin task graph has no runnable tasks".into());
         }
         for key in &ready {
-            graph.mark_running(key);
+            graph.mark_running(key)?;
             if let Some(tracking) = &tracking {
                 start_waiting_job(tracking.pool, tracked_jobs[key])
                     .await?
@@ -915,7 +951,7 @@ async fn run_work_item_lifecycle(
             let work_item = key
                 .work_item
                 .as_deref()
-                .and_then(|id| registry.work_items.iter().find(|item| item.id == id));
+                .and_then(|id| work_items.iter().find(|item| item.id == id));
             execute_task(
                 selection,
                 manifest,
@@ -980,13 +1016,22 @@ async fn run_work_item_lifecycle(
             tracing::warn!(%error, "plugin task-wave checkpoint publication failed");
         }
         for (key, execution) in &successful_executions {
-            if execution.result.outcome == Outcome::Implemented {
-                continue;
-            }
             let work_item = key
                 .work_item
                 .as_deref()
-                .and_then(|id| registry.work_items.iter().find(|item| item.id == id));
+                .and_then(|id| work_items.iter().find(|item| item.id == id));
+            if execution.result.outcome == Outcome::Implemented
+                && !declared_diagnostics_present(
+                    &flow.tasks[&key.task],
+                    workspace_path,
+                    &key.task,
+                    work_item,
+                    task_attempts[key],
+                    parameters,
+                )
+            {
+                continue;
+            }
             publish_task_attempt(
                 tracking.as_ref(),
                 selection,
@@ -1011,7 +1056,7 @@ async fn run_work_item_lifecycle(
             let work_item = key
                 .work_item
                 .as_deref()
-                .and_then(|id| registry.work_items.iter().find(|item| item.id == id));
+                .and_then(|id| work_items.iter().find(|item| item.id == id));
             publish_task_attempt(
                 tracking.as_ref(),
                 selection,
@@ -1077,7 +1122,7 @@ async fn run_work_item_lifecycle(
             if execution.result.outcome == Outcome::Implemented
                 && flow.tasks[&key.task].approval != PluginApprovalMode::Required
             {
-                graph.mark_completed(key);
+                graph.mark_completed(key)?;
             }
         }
         for (key, execution) in successful_executions {
@@ -1125,11 +1170,8 @@ async fn run_work_item_lifecycle(
                     let count = handoffs.entry(edge.clone()).or_default();
                     *count += 1;
                     if *count > max_handoffs {
-                        let resume_target = TaskKey {
-                            work_item: key.work_item.clone(),
-                            task: handoff.target.clone(),
-                        };
-                        graph.restart_from(&resume_target);
+                        let resume_target = normalize_handoff_target(flow, &key, &handoff.target)?;
+                        graph.restart_from(&resume_target)?;
                         if let Some(tracking) = &tracking {
                             let pending_keys = graph
                                 .keys()
@@ -1140,7 +1182,8 @@ async fn run_work_item_lifecycle(
                                 if !required_approvals
                                     .iter()
                                     .any(|approval| approval.key == pending_key)
-                                    && finished_jobs.remove(&pending_key)
+                                    && (finished_jobs.remove(&pending_key)
+                                        || !tracked_jobs.contains_key(&pending_key))
                                 {
                                     let job = create_tracked_job(
                                         tracking,
@@ -1148,7 +1191,7 @@ async fn run_work_item_lifecycle(
                                         &selection.flow,
                                         flow,
                                         &pending_key,
-                                        &registry.work_items,
+                                        &work_items,
                                         issue_input,
                                     )
                                     .await?;
@@ -1205,15 +1248,19 @@ async fn run_work_item_lifecycle(
                                 pending_approvals: required_approvals,
                                 start_approved: true,
                                 revision_targets: Vec::new(),
+                                active_work_items: work_items
+                                    .iter()
+                                    .map(|item| item.id.clone())
+                                    .collect(),
                             },
                         )?;
                         return Ok(finish_result(result, accumulated_tests, &previous));
                     }
-                    feedback.push((key.work_item.clone(), handoff.target));
+                    feedback.push(normalize_handoff_target(flow, &key, &handoff.target)?);
                 }
                 Outcome::NeedsHuman => {
                     let resume_target = key.clone();
-                    graph.restart_from(&resume_target);
+                    graph.restart_from(&resume_target)?;
                     if let Some(tracking) = &tracking {
                         let pending_keys = graph
                             .keys()
@@ -1224,7 +1271,8 @@ async fn run_work_item_lifecycle(
                             if !required_approvals
                                 .iter()
                                 .any(|approval| approval.key == pending_key)
-                                && finished_jobs.remove(&pending_key)
+                                && (finished_jobs.remove(&pending_key)
+                                    || !tracked_jobs.contains_key(&pending_key))
                             {
                                 let job = create_tracked_job(
                                     tracking,
@@ -1232,7 +1280,7 @@ async fn run_work_item_lifecycle(
                                     &selection.flow,
                                     flow,
                                     &pending_key,
-                                    &registry.work_items,
+                                    &work_items,
                                     issue_input,
                                 )
                                 .await?;
@@ -1288,6 +1336,10 @@ async fn run_work_item_lifecycle(
                             pending_approvals: required_approvals,
                             start_approved: true,
                             revision_targets: Vec::new(),
+                            active_work_items: work_items
+                                .iter()
+                                .map(|item| item.id.clone())
+                                .collect(),
                         },
                     )?;
                     return Ok(finish_result(result, accumulated_tests, &previous));
@@ -1313,22 +1365,21 @@ async fn run_work_item_lifecycle(
                 }
             }
         }
-        for (work_item, target) in feedback {
-            let invalidated = graph.restart_from(&TaskKey {
-                work_item,
-                task: target,
-            });
+        for target in feedback {
+            let invalidated = graph.restart_from(&target)?;
             required_approvals.retain(|approval| !invalidated.contains(&approval.key));
             if let Some(tracking) = &tracking {
                 for invalidated_key in invalidated {
-                    if finished_jobs.remove(&invalidated_key) {
+                    if finished_jobs.remove(&invalidated_key)
+                        || !tracked_jobs.contains_key(&invalidated_key)
+                    {
                         let job = create_tracked_job(
                             tracking,
                             manifest,
                             &selection.flow,
                             flow,
                             &invalidated_key,
-                            &registry.work_items,
+                            &work_items,
                             issue_input,
                         )
                         .await?;
@@ -1376,6 +1427,7 @@ async fn run_work_item_lifecycle(
                     pending_approvals: required_approvals,
                     start_approved: true,
                     revision_targets: Vec::new(),
+                    active_work_items: work_items.iter().map(|item| item.id.clone()).collect(),
                 },
             )?;
             return Ok(finish_result(result, accumulated_tests, &previous));
@@ -1383,7 +1435,7 @@ async fn run_work_item_lifecycle(
         if let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), _) = github_coordinates
         {
-            for item in &registry.work_items {
+            for item in &work_items {
                 if graph.work_item_is_complete(&item.id)
                     && closed_projected_issues.insert(item.id.clone())
                     && let Some(issue_number) = projected_issues.get(&item.id)
@@ -1404,13 +1456,46 @@ async fn run_work_item_lifecycle(
     last_result.confidence = aggregate_confidence;
     last_result.summary = format!(
         "Completed {} block work item(s) across {} task execution(s).",
-        registry.work_items.len(),
+        work_items.len(),
         previous.len()
     );
     if checkpoint_path.exists() {
         fs::remove_file(&checkpoint_path)?;
     }
     Ok(finish_result(last_result, accumulated_tests, &previous))
+}
+
+fn declared_diagnostics_present(
+    task: &PluginTask,
+    workspace_path: &Path,
+    task_name: &str,
+    work_item: Option<&PluginWorkItem>,
+    attempt: u32,
+    parameters: &BTreeMap<String, Value>,
+) -> bool {
+    let Ok(diagnostics) = expand_artifacts(&task.diagnostics, parameters, work_item) else {
+        return false;
+    };
+    let repo = task_attempt_root(
+        workspace_path,
+        task_name,
+        work_item.map(|item| item.id.as_str()),
+        attempt,
+    )
+    .join("repo");
+    diagnostics_present_at(&repo, &diagnostics)
+}
+
+fn diagnostics_present_at(repo: &Path, diagnostics: &[PluginArtifact]) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        let path = repo.join(&diagnostic.path);
+        match diagnostic.kind {
+            PluginArtifactType::File => path.metadata().is_ok_and(|metadata| metadata.len() > 0),
+            PluginArtifactType::Directory => path
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_some()),
+        }
+    })
 }
 
 fn write_lifecycle_checkpoint(
@@ -1429,6 +1514,30 @@ fn approval_target(key: &TaskKey) -> String {
         .as_ref()
         .map(|work_item| format!("{}/{work_item}", key.task))
         .unwrap_or_else(|| key.task.clone())
+}
+
+fn normalize_handoff_target(
+    flow: &PluginFlow,
+    source: &TaskKey,
+    target: &str,
+) -> Result<TaskKey, Box<dyn std::error::Error>> {
+    let task = flow
+        .tasks
+        .get(target)
+        .ok_or_else(|| format!("handoff targets unknown task `{target}`"))?;
+    let work_item = match task.scope {
+        PluginTaskScope::Workflow => None,
+        PluginTaskScope::WorkItem => Some(
+            source
+                .work_item
+                .clone()
+                .ok_or_else(|| format!("workflow task `{}` cannot hand off to work-item task `{target}` without a work item", source.task))?,
+        ),
+    };
+    Ok(TaskKey {
+        work_item,
+        task: target.to_string(),
+    })
 }
 
 fn select_pending_approvals(
@@ -1986,6 +2095,35 @@ fn validate_work_items(items: &[PluginWorkItem]) -> Result<(), Box<dyn std::erro
         visit(&item.id, items, &mut visiting, &mut visited)?;
     }
     Ok(())
+}
+
+fn select_lifecycle_work_items(
+    catalog: &[PluginWorkItem],
+    requested: Option<&[String]>,
+) -> Result<Vec<PluginWorkItem>, Box<dyn std::error::Error>> {
+    let requested = requested.ok_or(
+        "architect result is missing `work_items`; list only the repository block ids participating in this lifecycle",
+    )?;
+    if requested.is_empty() {
+        return Err("architect selected no work items for this lifecycle".into());
+    }
+    let ids = requested
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if ids.len() != requested.len() {
+        return Err("architect selected duplicate lifecycle work item ids".into());
+    }
+    if let Some(id) = requested
+        .iter()
+        .find(|id| !catalog.iter().any(|item| &item.id == *id))
+    {
+        return Err(format!("architect selected unknown lifecycle work item `{id}`").into());
+    }
+    Ok(requested
+        .iter()
+        .filter_map(|id| catalog.iter().find(|item| &item.id == id).cloned())
+        .collect())
 }
 
 fn task_summary(task: &str, work_item: Option<&str>, attempt: u32, result: &RunResult) -> Value {
@@ -2687,6 +2825,83 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_selection_excludes_unrelated_catalog_items() {
+        let catalog = vec![
+            PluginWorkItem {
+                id: "existing".into(),
+                spec: "docs/existing/spec.md".into(),
+                depends_on: Vec::new(),
+                metadata: BTreeMap::new(),
+            },
+            PluginWorkItem {
+                id: "requested".into(),
+                spec: "docs/requested/spec.md".into(),
+                depends_on: vec!["existing".into()],
+                metadata: BTreeMap::new(),
+            },
+        ];
+
+        let selected = select_lifecycle_work_items(&catalog, Some(&["requested".into()])).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "requested");
+        assert_eq!(selected[0].depends_on, ["existing"]);
+        assert!(select_lifecycle_work_items(&catalog, None).is_err());
+        assert!(select_lifecycle_work_items(&catalog, Some(&["missing".into()])).is_err());
+    }
+
+    #[test]
+    fn handoff_target_uses_the_target_tasks_scope() {
+        let manifest = test_manifest(
+            r#"
+api_version: 1
+id: example
+runtime: { default_image: image }
+roles:
+  architect: { command: [run] }
+  dv: { command: [run] }
+flows:
+  blocks:
+    start: architect
+    replaces_default_lifecycle: true
+    work_items_path: docs/index.json
+    tasks:
+      architect: { role: architect }
+      dv: { role: dv, scope: work_item, dependencies: [architect] }
+"#,
+        );
+        let flow = &manifest.flows["blocks"];
+        let source = TaskKey {
+            work_item: Some("fifo".into()),
+            task: "dv".into(),
+        };
+
+        assert_eq!(
+            normalize_handoff_target(flow, &source, "architect").unwrap(),
+            TaskKey {
+                work_item: None,
+                task: "architect".into(),
+            }
+        );
+        assert!(normalize_handoff_target(flow, &source, "unknown").is_err());
+    }
+
+    #[test]
+    fn successful_diagnostics_require_nonempty_declared_output() {
+        let root = temporary_root();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        let diagnostics = vec![PluginArtifact {
+            path: "logs".into(),
+            kind: PluginArtifactType::Directory,
+            required: false,
+        }];
+
+        assert!(!diagnostics_present_at(&root, &diagnostics));
+        fs::write(root.join("logs/synthesis.log"), "success").unwrap();
+        assert!(diagnostics_present_at(&root, &diagnostics));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unfinished_tracked_keys_excludes_every_terminal_sibling() {
         let first = TaskKey {
             work_item: Some("first".into()),
@@ -3079,6 +3294,7 @@ flows:
             result,
             handoff: None,
             resources_used: Vec::new(),
+            work_items: None,
         })
         .unwrap();
         assert_eq!(
