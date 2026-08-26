@@ -1,3 +1,4 @@
+use crate::FacadeConfig;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 use thiserror::Error;
@@ -16,6 +17,8 @@ pub enum PluginError {
 pub struct PluginManifest {
     pub api_version: u32,
     pub id: String,
+    #[serde(default)]
+    pub facade: FacadeConfig,
     pub runtime: PluginRuntime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation: Option<PluginInstallation>,
@@ -298,6 +301,7 @@ impl PluginManifest {
                 "id and runtime.default_image are required".into(),
             ));
         }
+        self.facade.validate().map_err(PluginError::Invalid)?;
         if let Some(installation) = &self.installation {
             validate_relative_path(&installation.build.context)?;
             validate_relative_path(&installation.build.dockerfile)?;
@@ -628,6 +632,7 @@ mod tests {
             r#"
 api_version: 1
 id: example.rtl
+facade: { display_name: Example Platform, tagline: Hardware agents, command: example-agent }
 runtime: { default_image: example:dev }
 agents:
   rtl: { command: [run-rtl] }
@@ -644,6 +649,7 @@ flows:
         )
         .unwrap();
         manifest.validate().unwrap();
+        assert_eq!(manifest.facade.command.as_deref(), Some("example-agent"));
     }
 
     #[test]

@@ -55,6 +55,13 @@ struct HealthResponse {
     service: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct FacadeResponse {
+    display_name: String,
+    tagline: String,
+    issue_command: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PolledRepository {
     owner: String,
@@ -131,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/facade", get(api_facade))
         .route("/api/runs", get(api_runs))
         .route("/api/outbound-actions", get(api_outbound_actions))
         .route("/api/engagement-decisions", get(api_engagement_decisions))
@@ -447,6 +455,16 @@ async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "donkeyspace-api",
+    })
+}
+
+async fn api_facade(State(state): State<Arc<AppState>>) -> Json<FacadeResponse> {
+    let facade = state.policy.facade.resolve();
+    let issue_command = facade.issue_command();
+    Json(FacadeResponse {
+        display_name: facade.display_name,
+        tagline: facade.tagline,
+        issue_command,
     })
 }
 
@@ -886,7 +904,17 @@ fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
     let path =
         env::var("DONKEYSPACE_POLICY_PATH").unwrap_or_else(|_| ".donkeyspace/policy.yml".into());
     let raw = fs::read_to_string(&path)?;
-    Ok(Policy::from_yaml(&raw)?)
+    let mut policy = Policy::from_yaml(&raw)?;
+    if let Some(selection) = policy.lifecycle.plugin.as_ref().or(policy
+        .agents
+        .developer
+        .plugin
+        .as_ref())
+    {
+        let manifest = PluginManifest::from_path(&selection.manifest_path)?;
+        policy.facade = manifest.facade.overlay(&policy.facade);
+    }
+    Ok(policy)
 }
 
 fn lifecycle_start_role(policy: &Policy) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -1022,6 +1050,7 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
+    let facade_command = policy.facade.resolve().command;
     if !should_queue_triage(
         event,
         &payload.action,
@@ -1029,7 +1058,7 @@ async fn persist_issue_webhook(
         current_state.as_deref(),
         payload.comment.as_ref(),
         payload.label.as_ref().map(|label| label.name.as_str()),
-        &policy.workflow.allow_labels,
+        (&policy.workflow.allow_labels, &facade_command),
     ) {
         tracing::info!(
             event,
@@ -1042,10 +1071,9 @@ async fn persist_issue_webhook(
     }
 
     let human_approval = if current_state.as_deref() == Some("needs_human") {
-        payload
-            .comment
-            .as_ref()
-            .and_then(|comment| parse_human_approval_command(&comment.body))
+        payload.comment.as_ref().and_then(|comment| {
+            parse_human_approval_command(&comment.body, &policy.facade.resolve().command)
+        })
     } else {
         None
     };
@@ -1102,7 +1130,7 @@ async fn persist_issue_webhook(
                     .as_ref()
                     .and_then(|actor| serde_json::to_value(actor).ok()),
                 matched_selector: None,
-                reason: "donkeyspace-managed github resource cannot trigger agent work".into(),
+                reason: "platform-managed GitHub resource cannot trigger agent work".into(),
             },
         )
         .await?;
@@ -1492,8 +1520,9 @@ fn should_queue_triage(
     current_state: Option<&str>,
     comment: Option<&GitHubComment>,
     changed_label: Option<&str>,
-    allow_labels: &[String],
+    workflow: (&[String], &str),
 ) -> bool {
+    let (allow_labels, facade_command) = workflow;
     if issue_state == "closed" {
         return false;
     }
@@ -1501,8 +1530,9 @@ fn should_queue_triage(
     if current_state == Some("needs_human") {
         return event == "issue_comment"
             && action == "created"
-            && comment
-                .is_some_and(|comment| parse_human_approval_command(&comment.body).is_some());
+            && comment.is_some_and(|comment| {
+                parse_human_approval_command(&comment.body, facade_command).is_some()
+            });
     }
 
     match (event, action) {
@@ -1523,11 +1553,11 @@ fn should_queue_triage(
     }
 }
 
-fn parse_human_approval_command(body: &str) -> Option<HumanApprovalAction> {
+fn parse_human_approval_command(body: &str, facade_command: &str) -> Option<HumanApprovalAction> {
     let mut lines = body.lines();
     let first = lines.find(|line| !line.trim().is_empty())?.trim();
     let mut parts = first.split_whitespace();
-    if parts.next()? != "/donkeyspace" {
+    if parts.next()? != format!("/{facade_command}") {
         return None;
     }
     let action = parts.next()?;
@@ -1874,7 +1904,10 @@ fn pull_request_is_managed(pull_request: &GitHubPullRequest) -> bool {
         || pull_request
             .body
             .as_deref()
-            .map(|body| body.contains("Generated by donkeyspace developer job"))
+            .map(|body| {
+                body.contains("<!-- donkeyspace-generated -->")
+                    || body.contains("Generated by donkeyspace developer job")
+            })
             .unwrap_or(false)
 }
 
@@ -2504,7 +2537,7 @@ mod tests {
             current_state,
             comment,
             None,
-            &[],
+            (&[], "donkeyspace"),
         )
     }
 
@@ -2533,7 +2566,7 @@ mod tests {
             Some("needs_info"),
             None,
             Some("bug"),
-            &["ai".to_string()],
+            (&["ai".to_string()], "donkeyspace"),
         ));
     }
 
@@ -2546,7 +2579,7 @@ mod tests {
             None,
             None,
             Some("ai"),
-            &["ai".to_string()],
+            (&["ai".to_string()], "donkeyspace"),
         ));
     }
 
@@ -2559,7 +2592,7 @@ mod tests {
             Some("pr_open"),
             None,
             Some("ai"),
-            &["ai".to_string()],
+            (&["ai".to_string()], "donkeyspace"),
         ));
     }
 
@@ -2621,23 +2654,32 @@ mod tests {
     #[test]
     fn parses_explicit_approval_commands() {
         assert_eq!(
-            parse_human_approval_command(" /donkeyspace approve rtl/storage "),
+            parse_human_approval_command(" /donkeyspace approve rtl/storage ", "donkeyspace"),
             Some(HumanApprovalAction::Approve {
                 target: Some("rtl/storage".into())
             })
         );
         assert_eq!(
             parse_human_approval_command(
-                "/donkeyspace revise architect\nSplit the register file from decode."
+                "/donkeyspace revise architect\nSplit the register file from decode.",
+                "donkeyspace",
             ),
             Some(HumanApprovalAction::Revise {
                 target: Some("architect".into()),
                 feedback: "Split the register file from decode.".into()
             })
         );
-        assert!(parse_human_approval_command("/donkeyspace revise architect").is_none());
-        assert!(parse_human_approval_command("please /donkeyspace approve").is_none());
-        assert!(parse_human_approval_command("/donkeyspace approve too many").is_none());
+        assert!(
+            parse_human_approval_command("/donkeyspace revise architect", "donkeyspace").is_none()
+        );
+        assert!(
+            parse_human_approval_command("please /donkeyspace approve", "donkeyspace").is_none()
+        );
+        assert!(
+            parse_human_approval_command("/donkeyspace approve too many", "donkeyspace").is_none()
+        );
+        assert!(parse_human_approval_command("/epic-agent approve", "epic-agent").is_some());
+        assert!(parse_human_approval_command("/donkeyspace approve", "epic-agent").is_none());
     }
 
     #[test]

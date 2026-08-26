@@ -1,3 +1,4 @@
+pub mod facade;
 pub mod fake_agent;
 pub mod github_workflow;
 pub mod plugin;
@@ -5,6 +6,7 @@ pub mod policy;
 pub mod run_result;
 pub mod state;
 
+pub use facade::{Facade, FacadeConfig};
 pub use fake_agent::{fake_triage_issue, workflow_state_for_outcome};
 pub use github_workflow::{GitHubIssueAction, triage_comment_body, triage_github_issue_actions};
 pub use plugin::{

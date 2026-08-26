@@ -1,4 +1,4 @@
-use crate::{Outcome, Risk, RunResult};
+use crate::{FacadeConfig, Outcome, Risk, RunResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -14,6 +14,8 @@ pub enum PolicyError {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Policy {
     pub version: u32,
+    #[serde(default)]
+    pub facade: FacadeConfig,
     pub workflow: WorkflowPolicy,
     #[serde(default)]
     pub lifecycle: LifecyclePolicy,
@@ -58,6 +60,7 @@ impl Policy {
                 "lifecycle plugin flow cannot be empty".to_string(),
             ));
         }
+        policy.facade.validate().map_err(PolicyError::Invalid)?;
         policy.workflow.engagement.validate()?;
         Ok(policy)
     }

@@ -220,6 +220,7 @@ impl Instance {
             rules.needs_human_resume.get_or_insert_default().allow =
                 subjects.iter().map(|subject| subject.selector()).collect();
         }
+        policy.facade = policy.facade.overlay(&config.facade);
         let policy_path = self.directory.join("effective-policy.yml");
         let Some(active) = &config.active_plugin else {
             write_secret(&policy_path, serde_yaml::to_string(&policy)?.as_bytes())?;
@@ -429,6 +430,11 @@ mod tests {
                     flow: "replacement".into(),
                     class: PluginFlowClass::LifecycleReplacement,
                 }),
+                facade: donkeyspace_core::FacadeConfig {
+                    display_name: Some("Deployment Platform".into()),
+                    tagline: None,
+                    command: Some("deployment-agent".into()),
+                },
             }),
         };
         instance.write_plugin_runtime_files().unwrap();
@@ -445,6 +451,8 @@ mod tests {
         assert!(policy.contains("alice"));
         assert!(policy.contains("reviewer"));
         assert!(policy.contains("needs_human_resume"));
+        assert!(policy.contains("Deployment Platform"));
+        assert!(policy.contains("deployment-agent"));
         assert!(!policy.contains("do-not-serialize"));
         fs::remove_dir_all(directory).unwrap();
     }

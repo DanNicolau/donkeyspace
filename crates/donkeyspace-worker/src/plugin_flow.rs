@@ -22,6 +22,7 @@ use std::{
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::active_facade;
 use crate::plugin_task_graph::{TaskGraph, TaskKey};
 use crate::publication::{
     AttemptPublication, PublicationContext, publish_attempt, publish_checkpoint,
@@ -323,8 +324,10 @@ pub async fn run(
                     publication,
                     repo_path,
                     &format!(
-                        "chore(donkeyspace): checkpoint {} for issue #{}",
-                        stage_name, publication.issue_number
+                        "chore({}): checkpoint {} for issue #{}",
+                        active_facade().command,
+                        stage_name,
+                        publication.issue_number
                     ),
                 )
                 .await
@@ -626,8 +629,10 @@ async fn run_work_item_lifecycle(
                 publication,
                 repo_path,
                 &format!(
-                    "chore(donkeyspace): checkpoint {} for issue #{}",
-                    flow.start, publication.issue_number
+                    "chore({}): checkpoint {} for issue #{}",
+                    active_facade().command,
+                    flow.start,
+                    publication.issue_number
                 ),
             )
             .await
@@ -965,7 +970,8 @@ async fn run_work_item_lifecycle(
                 publication,
                 repo_path,
                 &format!(
-                    "chore(donkeyspace): checkpoint task wave for issue #{}",
+                    "chore({}): checkpoint task wave for issue #{}",
+                    active_facade().command,
                     publication.issue_number
                 ),
             )
@@ -1479,9 +1485,13 @@ fn pending_approval_result(
     let single = (pending.len() == 1).then(|| approval_target(&pending[0].key));
     let commands = match single {
         Some(target) => format!(
-            "`/donkeyspace approve {target}`\n\nOr request changes with `/donkeyspace revise {target}` followed by feedback on subsequent lines."
+            "`{0} approve {target}`\n\nOr request changes with `{0} revise {target}` followed by feedback on subsequent lines.",
+            active_facade().issue_command()
         ),
-        None => "Approve everything with `/donkeyspace approve all`, approve one target with `/donkeyspace approve <task>`, or revise one target with `/donkeyspace revise <task>` followed by feedback on subsequent lines.".to_string(),
+        None => format!(
+            "Approve everything with `{0} approve all`, approve one target with `{0} approve <task>`, or revise one target with `{0} revise <task>` followed by feedback on subsequent lines.",
+            active_facade().issue_command()
+        ),
     };
     RunResult {
         outcome: Outcome::NeedsHuman,

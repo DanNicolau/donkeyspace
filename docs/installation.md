@@ -235,3 +235,16 @@ execution with `donkeyspace plugin disable`; this restores the default policy
 without deleting checkouts, images, configuration, or secret files. The TUI's
 “Manage plugins” action provides connect, activate, rebuild, and disable
 operations and clearly marks lifecycle-replacement flows as exclusive.
+
+An active plugin may provide facade defaults for the dashboard and GitHub
+workflow. Override any field for one installation with:
+
+```sh
+donkeyspace configure facade \
+  --display-name "ePIC Agent Platform" \
+  --tagline "Agentic hardware design workflow" \
+  --command epic-agent
+```
+
+Restart a running stack after changing the facade. Use
+`donkeyspace configure facade --reset` to return to plugin and policy defaults.

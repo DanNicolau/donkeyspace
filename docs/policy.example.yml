@@ -2,6 +2,12 @@
 
 version: 1
 
+# Optional user-facing product facade. Plugins may supply their own defaults.
+# facade:
+#   display_name: "Example Agent Platform"
+#   tagline: "Agentic repository workflow"
+#   command: "example-agent"
+
 workflow:
   state_labels:
     needs_info: "ai:needs-info"

@@ -1,4 +1,4 @@
-use donkeyspace_core::EngagementSelector;
+use donkeyspace_core::{EngagementSelector, Facade, FacadeConfig, PluginManifest, Policy};
 use donkeyspace_github::{
     GitHubAuthConfig, GitHubCredentialProvider, GitHubRepository, discover_installation_id,
 };
@@ -18,7 +18,7 @@ mod plugins;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
 const PORT_SUGGESTION_ATTEMPTS: u16 = 100;
@@ -77,6 +77,8 @@ pub struct InstanceConfig {
     pub plugins: BTreeMap<String, InstalledPlugin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_plugin: Option<ActivePlugin>,
+    #[serde(default)]
+    pub facade: FacadeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,6 +299,10 @@ impl Instance {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
+                5 => {
+                    config.schema_version = SCHEMA_VERSION;
+                    true
+                }
                 SCHEMA_VERSION => false,
                 version => {
                     return Err(SetupError::Config(format!(
@@ -304,6 +310,7 @@ impl Instance {
                     )));
                 }
             };
+            config.facade.validate().map_err(SetupError::Config)?;
             (Some(config), migrated)
         } else {
             (None, false)
@@ -374,6 +381,7 @@ impl Instance {
                 github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
                 active_plugin: None,
+                facade: FacadeConfig::default(),
             },
         };
         validate_ports(config.api_port, config.web_port)?;
@@ -387,6 +395,57 @@ impl Instance {
         web_port: Option<u16>,
     ) -> Result<(), SetupError> {
         self.configure_ports_with_availability(api_port, web_port, port_is_available)
+    }
+
+    pub fn configure_facade(
+        &mut self,
+        display_name: Option<String>,
+        tagline: Option<String>,
+        command: Option<String>,
+        reset: bool,
+    ) -> Result<(), SetupError> {
+        if reset && (display_name.is_some() || tagline.is_some() || command.is_some()) {
+            return Err(SetupError::Config(
+                "--reset cannot be combined with facade value flags".into(),
+            ));
+        }
+        if !reset && display_name.is_none() && tagline.is_none() && command.is_none() {
+            return Err(SetupError::Config(
+                "provide --display-name, --tagline, --command, or --reset".into(),
+            ));
+        }
+        let current = &self.require_config()?.facade;
+        let override_config = if reset {
+            FacadeConfig::default()
+        } else {
+            current.overlay(&FacadeConfig {
+                display_name,
+                tagline,
+                command,
+            })
+        };
+        override_config.validate().map_err(SetupError::Config)?;
+        self.config.as_mut().unwrap().facade = override_config;
+        self.save()?;
+        self.write_plugin_runtime_files()
+    }
+
+    pub fn resolved_facade(&self) -> Result<Facade, SetupError> {
+        let config = self.require_config()?;
+        let raw = fs::read_to_string(config.source_tree.join(".donkeyspace/policy.yml"))?;
+        let policy =
+            Policy::from_yaml(&raw).map_err(|error| SetupError::Config(error.to_string()))?;
+        let mut facade = FacadeConfig::default();
+        if let Some(active) = &config.active_plugin
+            && let Some(plugin) = config.plugins.get(&active.id)
+        {
+            let manifest = PluginManifest::from_path(&plugin.manifest_path)
+                .map_err(|error| SetupError::Config(error.to_string()))?;
+            facade = facade.overlay(&manifest.facade);
+        }
+        facade = facade.overlay(&policy.facade).overlay(&config.facade);
+        facade.validate().map_err(SetupError::Config)?;
+        Ok(facade.resolve())
     }
 
     fn configure_ports_with_availability<F>(
@@ -586,8 +645,13 @@ impl Instance {
         validate_owner(&owner)?;
         validate_organization(organization.as_deref())?;
         validate_ingress(&ingress)?;
-        let conversion =
-            run_manifest_registration(callback_port, organization.as_deref(), &ingress)?;
+        let display_name = self.resolved_facade()?.display_name;
+        let conversion = run_manifest_registration(
+            callback_port,
+            organization.as_deref(),
+            &ingress,
+            &display_name,
+        )?;
         let private_key_file = self.secret_path("pending-github-app.pem");
         let webhook_secret_file = self.secret_path("pending-github-webhook-secret");
         write_secret(&private_key_file, &conversion.private_key)?;
@@ -813,6 +877,7 @@ impl Instance {
                             options.callback_port,
                             options.organization.as_deref(),
                             &ingress,
+                            &self.resolved_facade()?.display_name,
                         )?;
                         (app_id, None, private_key, webhook_secret)
                     }
@@ -1216,7 +1281,7 @@ impl Instance {
         }
         let mut command = self.compose_command(arguments)?;
         if destructive {
-            eprintln!("deleting Donkeyspace Compose volumes");
+            eprintln!("deleting agent-platform Compose volumes");
         }
         run_status(&mut command)
     }
@@ -1534,7 +1599,7 @@ fn validate_repositories(repositories: &[String]) -> Result<(), SetupError> {
             .eq_ignore_ascii_case(owner)
     }) {
         return Err(SetupError::Config(
-            "all repositories must belong to one owner per Donkeyspace instance".into(),
+            "all repositories must belong to one owner per agent-platform instance".into(),
         ));
     }
     Ok(())
@@ -1640,8 +1705,9 @@ fn run_manifest_flow(
     port: u16,
     organization: Option<&str>,
     ingress: &IngressMode,
+    display_name: &str,
 ) -> Result<(u64, Vec<u8>, Vec<u8>), SetupError> {
-    let conversion = run_manifest_registration(port, organization, ingress)?;
+    let conversion = run_manifest_registration(port, organization, ingress, display_name)?;
     read_line("Press Enter after the App installation is complete: ")?;
     Ok((
         conversion.app_id,
@@ -1654,10 +1720,11 @@ fn run_manifest_registration(
     port: u16,
     organization: Option<&str>,
     ingress: &IngressMode,
+    display_name: &str,
 ) -> Result<ManifestConversion, SetupError> {
     let state = random_hex(32)?;
     let callback_url = format!("http://127.0.0.1:{port}/callback");
-    let manifest = github_app_manifest(&state, &callback_url, ingress);
+    let manifest = github_app_manifest(&state, &callback_url, ingress, display_name);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let local_url = format!("http://127.0.0.1:{port}/");
     println!("GitHub App registration URL: {local_url}");
@@ -1725,7 +1792,12 @@ fn run_manifest_registration(
     Ok(conversion)
 }
 
-fn github_app_manifest(state: &str, callback_url: &str, ingress: &IngressMode) -> Value {
+fn github_app_manifest(
+    state: &str,
+    callback_url: &str,
+    ingress: &IngressMode,
+    display_name: &str,
+) -> Value {
     let hook_attributes = match ingress {
         IngressMode::Webhook { public_url } => json!({
             "url": format!("{}/webhooks/github", public_url.trim_end_matches('/')),
@@ -1740,7 +1812,7 @@ fn github_app_manifest(state: &str, callback_url: &str, ingress: &IngressMode) -
         }),
     };
     json!({
-        "name": format!("Donkeyspace {}", &state[..8]),
+        "name": format!("{} {}", display_name, &state[..8]),
         "url": "https://github.com/DanNicolau/donkeyspace",
         "hook_attributes": hook_attributes,
         "redirect_url": callback_url,
@@ -2105,6 +2177,7 @@ mod tests {
             "0123456789abcdef",
             "http://127.0.0.1:8787/callback",
             &IngressMode::Polling,
+            "Donkeyspace",
         );
         assert_eq!(manifest["hook_attributes"]["active"], false);
         assert_eq!(
@@ -2123,6 +2196,7 @@ mod tests {
             &IngressMode::Webhook {
                 public_url: "https://donkeyspace.example/".into(),
             },
+            "Donkeyspace",
         );
         assert_eq!(manifest["hook_attributes"]["active"], true);
         assert_eq!(
@@ -2181,6 +2255,7 @@ mod tests {
             github_approvers: BTreeMap::from([("owner/repo".into(), Vec::new())]),
             plugins: BTreeMap::new(),
             active_plugin: None,
+            facade: FacadeConfig::default(),
         };
         let serialized = serde_json::to_string(&config).unwrap();
         assert!(!serialized.contains("ghp_"));
@@ -2193,7 +2268,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for schema_version in [1, 2, 3, 4] {
+        for schema_version in [1, 2, 3, 4, 5] {
             let directory =
                 env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
             fs::create_dir_all(&directory).unwrap();
@@ -2217,6 +2292,7 @@ mod tests {
             assert!(config.active_plugin.is_none());
             assert!(config.github_access.is_empty());
             assert!(config.github_approvers.is_empty());
+            assert_eq!(config.facade, FacadeConfig::default());
             let saved: Value =
                 serde_json::from_slice(&fs::read(directory.join(CONFIG_FILE)).unwrap()).unwrap();
             assert_eq!(saved["schema_version"], SCHEMA_VERSION);
@@ -2289,6 +2365,7 @@ mod tests {
             github_approvers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             active_plugin: None,
+            facade: FacadeConfig::default(),
         };
         reconcile_github_access(&mut config);
         assert_eq!(config.github_access.len(), 2);
@@ -2321,6 +2398,7 @@ mod tests {
             github_approvers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             active_plugin: None,
+            facade: FacadeConfig::default(),
         };
         let stopped = DeploymentStatus { services: vec![] };
         let error = validate_start_ports(&config, &stopped, |port| port == 8081).unwrap_err();
@@ -2361,6 +2439,7 @@ mod tests {
                 github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
                 active_plugin: None,
+                facade: FacadeConfig::default(),
             }),
         };
         fs::create_dir_all(&directory).unwrap();

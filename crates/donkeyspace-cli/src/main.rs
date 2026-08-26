@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "donkeyspace",
-    about = "Install and operate a local Donkeyspace deployment"
+    about = "Install and operate a local agent-platform deployment"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -71,7 +71,20 @@ struct ConfigureArgs {
 #[derive(Debug, Subcommand)]
 enum ConfigureTarget {
     Ports(PortArgs),
+    Facade(FacadeArgs),
     GithubAccess(GitHubAccessArgs),
+}
+
+#[derive(Debug, Args)]
+struct FacadeArgs {
+    #[arg(long)]
+    display_name: Option<String>,
+    #[arg(long)]
+    tagline: Option<String>,
+    #[arg(long)]
+    command: Option<String>,
+    #[arg(long)]
+    reset: bool,
 }
 
 #[derive(Debug, Args)]
@@ -313,6 +326,34 @@ async fn run() -> Result<(), SetupError> {
                     );
                 }
             }
+            ConfigureTarget::Facade(args) => {
+                let stack_running = instance
+                    .deployment_status()
+                    .map(|status| {
+                        status
+                            .services
+                            .iter()
+                            .any(|service| service.state.eq_ignore_ascii_case("running"))
+                    })
+                    .unwrap_or(false);
+                instance.configure_facade(
+                    args.display_name,
+                    args.tagline,
+                    args.command,
+                    args.reset,
+                )?;
+                let facade = instance.resolved_facade()?;
+                println!(
+                    "facade saved: {} ({})",
+                    facade.display_name,
+                    facade.issue_command()
+                );
+                if stack_running {
+                    println!(
+                        "restart required: run `donkeyspace down` followed by `donkeyspace up`"
+                    );
+                }
+            }
             ConfigureTarget::GithubAccess(args) => match args.command {
                 GitHubAccessCommand::List => {
                     let subjects =
@@ -430,6 +471,29 @@ mod tests {
         };
         assert_eq!(args.api_port, None);
         assert_eq!(args.web_port, Some(5175));
+    }
+
+    #[test]
+    fn parses_facade_configuration() {
+        let cli = Cli::try_parse_from([
+            "donkeyspace",
+            "configure",
+            "facade",
+            "--display-name",
+            "ePIC Agent Platform",
+            "--command",
+            "epic-agent",
+        ])
+        .unwrap();
+        let Some(Command::Configure(ConfigureArgs {
+            target: ConfigureTarget::Facade(args),
+        })) = cli.command
+        else {
+            panic!("expected facade configuration");
+        };
+        assert_eq!(args.display_name.as_deref(), Some("ePIC Agent Platform"));
+        assert_eq!(args.command.as_deref(), Some("epic-agent"));
+        assert!(!args.reset);
     }
 
     #[test]

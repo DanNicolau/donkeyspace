@@ -57,6 +57,10 @@ misrepresenting those phases as new roles.
 ```yaml
 api_version: 1
 id: example.rtl
+facade:
+  display_name: Example Agent Platform
+  tagline: Agentic hardware design workflow
+  command: example-agent
 runtime:
   default_image: example-rtl:dev
 
@@ -122,6 +126,11 @@ flows:
         write: ["synth/{work_item}"]
         allowed_handoffs: [rtl]
 ```
+
+The optional `facade` supplies user-facing defaults. Core validates and applies
+these values across the dashboard, GitHub prose and commands, and generated Git
+identity. Policy and private instance configuration may override individual
+fields without changing the plugin.
 
 `max_parallel_tasks` bounds the number of simultaneously running ready tasks;
 it defaults to four. `scope: workflow` is the default. A lifecycle start task must have workflow

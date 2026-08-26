@@ -10,7 +10,7 @@ use std::{env, fs, io::Read, path::Path, process::Stdio};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::repo_context::write_askpass_script;
+use crate::{active_facade, repo_context::write_askpass_script};
 
 const MAX_DIAGNOSTIC_FILES: usize = 256;
 const MAX_DIAGNOSTIC_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -206,8 +206,10 @@ pub async fn publish_attempt(
             "commit",
             "-m",
             &format!(
-                "chore(donkeyspace): preserve {} attempt for issue #{}",
-                attempt.task, context.issue_number
+                "chore({}): preserve {} attempt for issue #{}",
+                active_facade().command,
+                attempt.task,
+                context.issue_number
             ),
         ],
         None,
@@ -280,7 +282,10 @@ async fn queue_status_comment(
                     "<!-- donkeyspace-publication-status:{}:{} -->",
                     context.coordinator_job_id, work_item
                 ),
-                format!("Donkeyspace agent artifacts for `{work_item}`"),
+                format!(
+                    "{} agent artifacts for `{work_item}`",
+                    active_facade().display_name
+                ),
                 visible,
             )
         }
@@ -290,7 +295,7 @@ async fn queue_status_comment(
                 "<!-- donkeyspace-publication-status:{} -->",
                 context.coordinator_job_id
             ),
-            "Donkeyspace agent workspace status".to_string(),
+            format!("{} agent workspace status", active_facade().display_name),
             publications.iter().collect::<Vec<_>>(),
         ),
     };
@@ -514,24 +519,11 @@ fn safe_segment(value: &str) -> String {
 }
 
 async fn configure_git_author(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    git(
-        repo,
-        &["config", "user.name", "donkeyspace[bot]"],
-        None,
-        None,
-    )
-    .await?;
-    git(
-        repo,
-        &[
-            "config",
-            "user.email",
-            "donkeyspace[bot]@users.noreply.github.com",
-        ],
-        None,
-        None,
-    )
-    .await?;
+    let facade = active_facade();
+    let name = facade.git_author_name();
+    let email = facade.git_author_email();
+    git(repo, &["config", "user.name", &name], None, None).await?;
+    git(repo, &["config", "user.email", &email], None, None).await?;
     Ok(())
 }
 

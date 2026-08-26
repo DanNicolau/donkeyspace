@@ -1,4 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
+
+type Facade = {
+  display_name: string;
+  tagline: string;
+  issue_command: string;
+};
 
 type Run = {
   id: string;
@@ -109,6 +116,14 @@ async function fetchRuns(): Promise<Run[]> {
   return response.json();
 }
 
+async function fetchFacade(): Promise<Facade> {
+  const response = await fetch("/api/facade");
+  if (!response.ok) {
+    throw new Error(`Failed to load facade: ${response.status}`);
+  }
+  return response.json();
+}
+
 async function fetchOutboundActions(): Promise<OutboundAction[]> {
   const response = await fetch("/api/outbound-actions");
 
@@ -152,6 +167,20 @@ async function retryPublication(id: number): Promise<void> {
 }
 
 export function App() {
+  const facadeQuery = useQuery({
+    queryKey: ["facade"],
+    queryFn: fetchFacade,
+    staleTime: Infinity,
+    retry: 1
+  });
+  const facade = facadeQuery.data ?? {
+    display_name: "Agent Platform",
+    tagline: "Agentic repository workflow",
+    issue_command: ""
+  };
+  useEffect(() => {
+    document.title = facade.display_name;
+  }, [facade.display_name]);
   const runsQuery = useQuery({
     queryKey: ["runs"],
     queryFn: fetchRuns,
@@ -178,8 +207,8 @@ export function App() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>donkeyspace</h1>
-          <p>Agentic repository workflow harness</p>
+          <h1>{facade.display_name}</h1>
+          <p>{facade.tagline}</p>
         </div>
         <a href="/healthz">API health</a>
       </header>

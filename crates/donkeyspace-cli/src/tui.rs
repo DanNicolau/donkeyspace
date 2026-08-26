@@ -28,8 +28,8 @@ use tokio::sync::mpsc;
 
 const HOME_ACTIONS: &[&str] = &[
     "Run doctor",
-    "Start Donkeyspace",
-    "Stop Donkeyspace",
+    "Start platform",
+    "Stop platform",
     "Configure ports",
     "Configure GitHub",
     "Manage GitHub access",
@@ -98,6 +98,7 @@ enum TaskResult {
 }
 
 struct App {
+    display_name: String,
     config_dir: Option<PathBuf>,
     screen: Screen,
     selected: usize,
@@ -129,6 +130,11 @@ impl App {
     fn new(instance: &Instance, config_dir: Option<PathBuf>) -> Result<Self, SetupError> {
         let pending = instance.pending_github_app()?;
         let initialized = instance.is_initialized();
+        let display_name = if initialized {
+            instance.resolved_facade()?.display_name
+        } else {
+            "Agent Platform".into()
+        };
         let screen = if !instance.is_initialized() {
             Screen::Init
         } else if pending.is_some() {
@@ -154,6 +160,7 @@ impl App {
             )
         };
         Ok(Self {
+            display_name,
             config_dir,
             screen,
             selected: 0,
@@ -398,10 +405,15 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
         | TaskResult::Access(Err(error))
         | TaskResult::Codex(Err(error))
         | TaskResult::Plugin(Err(error)) => app.error = Some(error.to_string()),
-        TaskResult::Start(Ok(())) => app.notice = Some("Donkeyspace started.".into()),
+        TaskResult::Start(Ok(())) => {
+            app.notice = Some(format!("{} started.", app.display_name));
+        }
         TaskResult::Stop(Ok(())) => {
             app.status.services.clear();
-            app.notice = Some("Donkeyspace stopped; volumes were preserved.".into());
+            app.notice = Some(format!(
+                "{} stopped; volumes were preserved.",
+                app.display_name
+            ));
         }
         TaskResult::Manifest(Ok(pending)) => {
             app.pending = Some(pending);
@@ -456,6 +468,11 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
             app.doctor = None;
         }
         TaskResult::Plugin(Ok(message)) => {
+            if let Ok(instance) = Instance::open(app.config_dir.clone())
+                && let Ok(facade) = instance.resolved_facade()
+            {
+                app.display_name = facade.display_name;
+            }
             app.notice = Some(message);
             app.screen = Screen::Plugins;
             app.selected = 0;
@@ -575,7 +592,10 @@ fn handle_ports(app: &mut App, key: KeyEvent) -> Result<(), SetupError> {
             }
             app.show_home();
             app.notice = Some(if stack_running {
-                "Ports saved. Stop and start Donkeyspace to apply them.".into()
+                format!(
+                    "Ports saved. Stop and start {} to apply them.",
+                    app.display_name
+                )
             } else {
                 "Ports saved.".into()
             });
@@ -1695,14 +1715,23 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
     let mut state = ListState::default();
     state.select(Some(app.selected));
     frame.render_stateful_widget(
-        List::new(HOME_ACTIONS.iter().map(|action| ListItem::new(*action)))
-            .block(Block::default().title(" Actions ").borders(Borders::ALL))
-            .highlight_symbol("› ")
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+        List::new(
+            HOME_ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(index, action)| match index {
+                    1 => ListItem::new(format!("Start {}", app.display_name)),
+                    2 => ListItem::new(format!("Stop {}", app.display_name)),
+                    _ => ListItem::new(*action),
+                }),
+        )
+        .block(Block::default().title(" Actions ").borders(Borders::ALL))
+        .highlight_symbol("› ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         right[0],
         &mut state,
     );
@@ -2041,7 +2070,7 @@ fn render_doctor(frame: &mut Frame, area: Rect, app: &App) {
             .chain(std::iter::once(Line::from("")))
             .chain(std::iter::once(Line::styled(
                 if report.passed() {
-                    "Enter  Start Donkeyspace    r  rerun    b  back"
+                    "Enter  Start platform    r  rerun    b  back"
                 } else {
                     "r  rerun diagnostics    b  back"
                 },
@@ -2106,6 +2135,7 @@ mod tests {
 
     fn app(screen: Screen) -> App {
         App {
+            display_name: "Donkeyspace".into(),
             config_dir: None,
             screen,
             selected: 0,

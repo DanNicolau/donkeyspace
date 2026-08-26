@@ -7,6 +7,28 @@ local GitHub access, and active plugin selection.
 Missing or invalid policy makes the API or worker fail at startup. The dashboard
 does not currently display or edit the active policy.
 
+## Product Facade
+
+`facade` controls the product name, dashboard tagline, and GitHub issue command
+shown to users. Values are optional and resolve field-by-field from built-in
+defaults, the active plugin, policy, and private instance overrides.
+
+```yaml
+facade:
+  display_name: "ePIC Agent Platform"
+  tagline: "Agentic hardware design workflow"
+  command: "epic-agent"
+```
+
+The command omits its leading slash. Configure private deployment overrides
+with `donkeyspace configure facade`; use `--reset` to return to plugin and
+policy defaults. Facades do not rename stable runtime identifiers such as
+`.donkeyspace`, environment variables, hidden GitHub markers, or branch
+prefixes.
+
+Only the resolved issue command is accepted. Changing it intentionally makes
+comments using the previous command token ineligible to resume paused jobs.
+
 ## Workflow Labels
 
 `workflow.state_labels` maps Donkeyspace workflow states to GitHub labels. Donkeyspace keeps one active workflow label on an issue when it applies state changes.
@@ -149,8 +171,8 @@ Supported path patterns are exact paths, prefix globs ending in `/**`, and neste
 Failed jobs can be retried manually through `POST /api/runs/{id}/retry` or the
 dashboard when `dashboard.allow_retry` is true. Only failed jobs are eligible;
 results with `blocked` or `needs_human` outcomes must be resolved by a person
-instead. For a paused lifecycle plugin, a newly created `/donkeyspace approve`
-or `/donkeyspace revise` comment on the parent issue resumes the checkpoint only
+instead. For a paused lifecycle plugin, a newly created
+`/<facade-command> approve` or `/<facade-command> revise` comment on the parent issue resumes the checkpoint only
 after `needs_human_resume` authorizes the actor. A
 retry creates a new job linked through `retry_of_job_id`.
 

@@ -65,7 +65,7 @@ pub fn triage_github_issue_actions(
         }
     }
 
-    if let Some(body) = triage_comment_body(result, target_state) {
+    if let Some(body) = triage_comment_body(policy, result, target_state) {
         actions.push(GitHubIssueAction {
             action_type: "issue.create_comment".to_string(),
             payload: serde_json::json!({
@@ -80,7 +80,14 @@ pub fn triage_github_issue_actions(
     actions
 }
 
-pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> Option<String> {
+pub fn triage_comment_body(
+    policy: &Policy,
+    result: &RunResult,
+    target_state: WorkflowState,
+) -> Option<String> {
+    let facade = policy.facade.resolve();
+    let name = &facade.display_name;
+    let command = facade.issue_command();
     let body = match result.outcome {
         Outcome::NeedsInfo => {
             let questions = result
@@ -91,12 +98,12 @@ pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> O
                 .join("\n");
 
             Some(format!(
-                "donkeyspace triage needs clarification before this issue can move to implementation.\n\nQuestions:\n{questions}\n\nCurrent state: `{}`",
+                "{name} triage needs clarification before this issue can move to implementation.\n\nQuestions:\n{questions}\n\nCurrent state: `{}`",
                 workflow_label_text(target_state)
             ))
         }
         Outcome::Ready => Some(format!(
-            "donkeyspace marked this issue ready for agent implementation.\n\nReason:\n{}\n\nCurrent state: `{}`",
+            "{name} marked this issue ready for agent implementation.\n\nReason:\n{}\n\nCurrent state: `{}`",
             result.summary,
             workflow_label_text(target_state)
         )),
@@ -124,7 +131,7 @@ pub fn triage_comment_body(result: &RunResult, target_state: WorkflowState) -> O
             };
 
             Some(format!(
-                "donkeyspace needs human input before this workflow can continue.\n\nWhat needs attention:\n{reason}\n\nLatest result:\n{}{evidence}\n\nWhat to do:\nUse the exact approval or revision command shown above. If no target-specific command is shown, use `/donkeyspace approve` to authorize continuation or `/donkeyspace revise` followed by feedback on subsequent lines. Only a newly created command comment from an authorized approver can requeue the workflow.\n\nCurrent state: `{}`",
+                "{name} needs human input before this workflow can continue.\n\nWhat needs attention:\n{reason}\n\nLatest result:\n{}{evidence}\n\nWhat to do:\nUse the exact approval or revision command shown above. If no target-specific command is shown, use `{command} approve` to authorize continuation or `{command} revise` followed by feedback on subsequent lines. Only a newly created command comment from an authorized approver can requeue the workflow.\n\nCurrent state: `{}`",
                 result.summary,
                 workflow_label_text(target_state)
             ))
@@ -253,6 +260,7 @@ mod tests {
     #[test]
     fn needs_info_comment_includes_questions() {
         let body = triage_comment_body(
+            &policy(),
             &RunResult {
                 outcome: Outcome::NeedsInfo,
                 summary: "Missing context.".to_string(),
@@ -275,7 +283,11 @@ mod tests {
 
     #[test]
     fn needs_human_comment_explains_required_action_and_failed_checks() {
+        let mut policy = policy();
+        policy.facade.display_name = Some("ePIC Agent Platform".into());
+        policy.facade.command = Some("epic-agent".into());
         let body = triage_comment_body(
+            &policy,
             &RunResult {
                 outcome: Outcome::NeedsHuman,
                 summary: "DV and RTL disagree about output latency.".to_string(),
@@ -303,7 +315,9 @@ mod tests {
         assert!(body.contains("handoff exceeded the policy limit"));
         assert!(body.contains("Failed verification:"));
         assert!(body.contains("`top-level simulation`: 31 cycle-alignment mismatches."));
-        assert!(body.contains("/donkeyspace approve"));
+        assert!(body.contains("ePIC Agent Platform needs human input"));
+        assert!(body.contains("/epic-agent approve"));
+        assert!(!body.contains("/donkeyspace approve"));
         assert!(body.contains("Current state: `ai:needs-human`"));
     }
 }
