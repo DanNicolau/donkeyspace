@@ -402,16 +402,27 @@ impl Instance {
         display_name: Option<String>,
         tagline: Option<String>,
         command: Option<String>,
+        branch_prefix: Option<String>,
         reset: bool,
     ) -> Result<(), SetupError> {
-        if reset && (display_name.is_some() || tagline.is_some() || command.is_some()) {
+        if reset
+            && (display_name.is_some()
+                || tagline.is_some()
+                || command.is_some()
+                || branch_prefix.is_some())
+        {
             return Err(SetupError::Config(
                 "--reset cannot be combined with facade value flags".into(),
             ));
         }
-        if !reset && display_name.is_none() && tagline.is_none() && command.is_none() {
+        if !reset
+            && display_name.is_none()
+            && tagline.is_none()
+            && command.is_none()
+            && branch_prefix.is_none()
+        {
             return Err(SetupError::Config(
-                "provide --display-name, --tagline, --command, or --reset".into(),
+                "provide --display-name, --tagline, --command, --branch-prefix, or --reset".into(),
             ));
         }
         let current = &self.require_config()?.facade;
@@ -422,6 +433,7 @@ impl Instance {
                 display_name,
                 tagline,
                 command,
+                branch_prefix,
             })
         };
         override_config.validate().map_err(SetupError::Config)?;

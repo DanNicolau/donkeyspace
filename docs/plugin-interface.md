@@ -61,6 +61,7 @@ facade:
   display_name: Example Agent Platform
   tagline: Agentic hardware design workflow
   command: example-agent
+  branch_prefix: example-agent
 runtime:
   default_image: example-rtl:dev
 

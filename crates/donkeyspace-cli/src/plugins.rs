@@ -434,6 +434,7 @@ mod tests {
                     display_name: Some("Deployment Platform".into()),
                     tagline: None,
                     command: Some("deployment-agent".into()),
+                    branch_prefix: Some("deployment-agent".into()),
                 },
             }),
         };
@@ -459,6 +460,6 @@ mod tests {
 
     #[test]
     fn mount_ids_are_stable_and_compose_safe() {
-        assert_eq!(safe_id("donkeyspace.epic-rtl"), "donkeyspace-epic-rtl");
+        assert_eq!(safe_id("example.hardware"), "example-hardware");
     }
 }

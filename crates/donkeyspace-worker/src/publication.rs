@@ -42,9 +42,13 @@ pub struct AttemptPublication<'a> {
     pub redactions: &'a [String],
 }
 
-pub fn issue_branch_name(issue_number: i64, coordinator_job_id: Uuid) -> String {
+pub fn issue_branch_name(
+    branch_prefix: &str,
+    issue_number: i64,
+    coordinator_job_id: Uuid,
+) -> String {
     format!(
-        "donkeyspace/issue-{issue_number}-{}",
+        "{branch_prefix}/issue-{issue_number}-{}",
         short_uuid(coordinator_job_id)
     )
 }
@@ -54,7 +58,11 @@ pub async fn publish_checkpoint(
     repo_path: &Path,
     commit_title: &str,
 ) -> Result<AgentPublicationRecord, Box<dyn std::error::Error>> {
-    let branch = issue_branch_name(context.issue_number, context.coordinator_job_id);
+    let branch = issue_branch_name(
+        &active_facade().branch_prefix,
+        context.issue_number,
+        context.coordinator_job_id,
+    );
     configure_git_author(repo_path).await?;
     let current = git(repo_path, &["branch", "--show-current"], None, None).await?;
     if current.trim() != branch {
@@ -103,7 +111,12 @@ pub async fn publish_attempt(
     aggregate_repo: &Path,
     attempt: &AttemptPublication<'_>,
 ) -> Result<AgentPublicationRecord, Box<dyn std::error::Error>> {
-    let branch = attempt_branch_name(context.issue_number, context.coordinator_job_id, attempt);
+    let branch = attempt_branch_name(
+        &active_facade().branch_prefix,
+        context.issue_number,
+        context.coordinator_job_id,
+        attempt,
+    );
     let local_repo = context
         .workspace_path
         .join("publication-attempts")
@@ -484,12 +497,14 @@ async fn push_publication(
 }
 
 fn attempt_branch_name(
+    branch_prefix: &str,
     issue_number: i64,
     coordinator_job_id: Uuid,
     attempt: &AttemptPublication<'_>,
 ) -> String {
     format!(
-        "donkeyspace/attempt-{issue_number}-{}-{}-{}-a{}",
+        "{}/attempt-{issue_number}-{}-{}-{}-a{}",
+        branch_prefix,
         short_uuid(attempt.job_id.unwrap_or(coordinator_job_id)),
         safe_segment(attempt.task),
         safe_segment(attempt.work_item.unwrap_or("workflow")),
@@ -826,7 +841,10 @@ mod tests {
     #[test]
     fn branch_names_are_safe_and_stable() {
         let id = Uuid::parse_str("01a03537-b408-7213-bdc7-ead9a6f1a48a").unwrap();
-        assert_eq!(issue_branch_name(29, id), "donkeyspace/issue-29-01a03537");
+        assert_eq!(
+            issue_branch_name("example-agent", 29, id),
+            "example-agent/issue-29-01a03537"
+        );
         let attempt = AttemptPublication {
             job_id: Some(id),
             task: "synthesis/task",
@@ -841,16 +859,16 @@ mod tests {
             redactions: &[],
         };
         assert_eq!(
-            attempt_branch_name(29, id, &attempt),
-            "donkeyspace/attempt-29-01a03537-synthesis-task-counter-detect-a301"
+            attempt_branch_name("example-agent", 29, id, &attempt),
+            "example-agent/attempt-29-01a03537-synthesis-task-counter-detect-a301"
         );
     }
 
     #[test]
     fn publication_pushes_target_the_github_repository_not_the_clone_origin() {
         assert_eq!(
-            github_remote(&json!({"owner": "EPIC-BLOCKCHAIN", "repo": "hw-ai-flow-test"})).unwrap(),
-            "https://github.com/EPIC-BLOCKCHAIN/hw-ai-flow-test.git"
+            github_remote(&json!({"owner": "example-org", "repo": "hardware-project"})).unwrap(),
+            "https://github.com/example-org/hardware-project.git"
         );
     }
 

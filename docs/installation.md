@@ -241,9 +241,10 @@ workflow. Override any field for one installation with:
 
 ```sh
 donkeyspace configure facade \
-  --display-name "ePIC Agent Platform" \
-  --tagline "Agentic hardware design workflow" \
-  --command epic-agent
+  --display-name "Example Agent Platform" \
+  --tagline "Agentic repository workflow" \
+  --command example-agent \
+  --branch-prefix example-agent
 ```
 
 Restart a running stack after changing the facade. Use

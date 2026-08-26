@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_DISPLAY_NAME: &str = "Donkeyspace";
 pub const DEFAULT_TAGLINE: &str = "Agentic repository workflow harness";
 pub const DEFAULT_COMMAND: &str = "donkeyspace";
+pub const DEFAULT_BRANCH_PREFIX: &str = "donkeyspace";
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +14,8 @@ pub struct FacadeConfig {
     pub tagline: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_prefix: Option<String>,
 }
 
 impl FacadeConfig {
@@ -30,6 +33,10 @@ impl FacadeConfig {
                 .command
                 .clone()
                 .or_else(|| self.command.clone()),
+            branch_prefix: higher_priority
+                .branch_prefix
+                .clone()
+                .or_else(|| self.branch_prefix.clone()),
         }
     }
 
@@ -45,6 +52,14 @@ impl FacadeConfig {
         {
             return Err(
                 "facade command must contain 1-32 lowercase ASCII letters, digits, or hyphens; it must start and end with a letter or digit"
+                    .into(),
+            );
+        }
+        if let Some(value) = &self.branch_prefix
+            && !valid_branch_prefix(value)
+        {
+            return Err(
+                "facade branch_prefix must contain 1-64 lowercase ASCII letters, digits, or hyphens; it must start and end with a letter or digit"
                     .into(),
             );
         }
@@ -65,6 +80,10 @@ impl FacadeConfig {
                 .command
                 .clone()
                 .unwrap_or_else(|| DEFAULT_COMMAND.into()),
+            branch_prefix: self
+                .branch_prefix
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BRANCH_PREFIX.into()),
         }
     }
 }
@@ -74,6 +93,7 @@ pub struct Facade {
     pub display_name: String,
     pub tagline: String,
     pub command: String,
+    pub branch_prefix: String,
 }
 
 impl Default for Facade {
@@ -104,8 +124,16 @@ fn validate_text(field: &str, value: &str) -> Result<(), String> {
 }
 
 fn valid_command(value: &str) -> bool {
+    valid_slug(value, 32)
+}
+
+fn valid_branch_prefix(value: &str) -> bool {
+    valid_slug(value, 64)
+}
+
+fn valid_slug(value: &str, max_len: usize) -> bool {
     let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len() > 32 {
+    if bytes.is_empty() || bytes.len() > max_len {
         return false;
     }
     let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
@@ -126,6 +154,7 @@ mod tests {
             display_name: Some("Plugin Name".into()),
             tagline: Some("Plugin tagline".into()),
             command: Some("plugin-agent".into()),
+            branch_prefix: Some("plugin-work".into()),
         };
         let deployment = FacadeConfig {
             display_name: Some("Deployment Name".into()),
@@ -135,6 +164,7 @@ mod tests {
         assert_eq!(resolved.display_name, "Deployment Name");
         assert_eq!(resolved.tagline, "Plugin tagline");
         assert_eq!(resolved.issue_command(), "/plugin-agent");
+        assert_eq!(resolved.branch_prefix, "plugin-work");
     }
 
     #[test]
@@ -145,6 +175,22 @@ mod tests {
             assert!(
                 FacadeConfig {
                     command: Some(invalid.into()),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for invalid in [
+            "example/agent",
+            "Example-agent",
+            "agent_1",
+            "-agent",
+            "agent-",
+        ] {
+            assert!(
+                FacadeConfig {
+                    branch_prefix: Some(invalid.into()),
                     ..Default::default()
                 }
                 .validate()

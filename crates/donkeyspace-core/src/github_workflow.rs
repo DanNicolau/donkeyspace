@@ -284,8 +284,8 @@ mod tests {
     #[test]
     fn needs_human_comment_explains_required_action_and_failed_checks() {
         let mut policy = policy();
-        policy.facade.display_name = Some("ePIC Agent Platform".into());
-        policy.facade.command = Some("epic-agent".into());
+        policy.facade.display_name = Some("Example Agent Platform".into());
+        policy.facade.command = Some("example-agent".into());
         let body = triage_comment_body(
             &policy,
             &RunResult {
@@ -315,8 +315,8 @@ mod tests {
         assert!(body.contains("handoff exceeded the policy limit"));
         assert!(body.contains("Failed verification:"));
         assert!(body.contains("`top-level simulation`: 31 cycle-alignment mismatches."));
-        assert!(body.contains("ePIC Agent Platform needs human input"));
-        assert!(body.contains("/epic-agent approve"));
+        assert!(body.contains("Example Agent Platform needs human input"));
+        assert!(body.contains("/example-agent approve"));
         assert!(!body.contains("/donkeyspace approve"));
         assert!(body.contains("Current state: `ai:needs-human`"));
     }

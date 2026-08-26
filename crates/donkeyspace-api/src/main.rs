@@ -60,6 +60,7 @@ struct FacadeResponse {
     display_name: String,
     tagline: String,
     issue_command: String,
+    branch_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +466,7 @@ async fn api_facade(State(state): State<Arc<AppState>>) -> Json<FacadeResponse> 
         display_name: facade.display_name,
         tagline: facade.tagline,
         issue_command,
+        branch_prefix: facade.branch_prefix,
     })
 }
 
@@ -1294,13 +1296,16 @@ async fn persist_pull_request_webhook(
         return Ok(WebhookPersistOutcome::Duplicate);
     }
 
-    let managed = pull_request_is_managed(&payload.pull_request);
+    let branch_prefix = &policy.facade.resolve().branch_prefix;
+    let managed = pull_request_is_managed(&payload.pull_request, branch_prefix);
     let linked_issue_number = payload
         .pull_request
         .body
         .as_deref()
         .and_then(extract_linked_issue_number)
-        .or_else(|| issue_number_from_donkeyspace_branch(&payload.pull_request.head.ref_name));
+        .or_else(|| {
+            issue_number_from_managed_branch(&payload.pull_request.head.ref_name, branch_prefix)
+        });
     let workflow_item = match linked_issue_number {
         Some(issue_number) => {
             get_workflow_item_by_issue_number(pool, repository_id, issue_number).await?
@@ -1899,8 +1904,11 @@ fn can_retry_job(job: &JobRecord) -> bool {
     )
 }
 
-fn pull_request_is_managed(pull_request: &GitHubPullRequest) -> bool {
-    pull_request.head.ref_name.starts_with("donkeyspace/issue-")
+fn pull_request_is_managed(pull_request: &GitHubPullRequest, branch_prefix: &str) -> bool {
+    pull_request
+        .head
+        .ref_name
+        .starts_with(&format!("{branch_prefix}/issue-"))
         || pull_request
             .body
             .as_deref()
@@ -1923,8 +1931,9 @@ fn extract_linked_issue_number(value: &str) -> Option<i64> {
     None
 }
 
-fn issue_number_from_donkeyspace_branch(branch: &str) -> Option<i64> {
-    let suffix = branch.strip_prefix("donkeyspace/issue-")?;
+fn issue_number_from_managed_branch(branch: &str, branch_prefix: &str) -> Option<i64> {
+    let prefix = format!("{branch_prefix}/issue-");
+    let suffix = branch.strip_prefix(&prefix)?;
     let number = suffix.split('-').next()?;
     parse_positive_i64(number)
 }
@@ -2114,10 +2123,9 @@ mod tests {
         GitHubLabel, GitHubOwner, GitHubRepository, HumanApprovalAction, JobRecord,
         PolledRepository, authorize_engagement, can_retry_job, engagement_gate,
         extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
-        issue_number_from_donkeyspace_branch, parse_human_approval_command,
-        parse_polled_repositories, permission_rank, polled_event_sender, polled_repository_input,
-        should_queue_reviewer, should_queue_triage, webhook_installation_matches,
-        webhook_repository_allowed,
+        issue_number_from_managed_branch, parse_human_approval_command, parse_polled_repositories,
+        permission_rank, polled_event_sender, polled_repository_input, should_queue_reviewer,
+        should_queue_triage, webhook_installation_matches, webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
     use donkeyspace_core::{EngagementGate, EngagementSelector, Policy};
@@ -2678,8 +2686,8 @@ mod tests {
         assert!(
             parse_human_approval_command("/donkeyspace approve too many", "donkeyspace").is_none()
         );
-        assert!(parse_human_approval_command("/epic-agent approve", "epic-agent").is_some());
-        assert!(parse_human_approval_command("/donkeyspace approve", "epic-agent").is_none());
+        assert!(parse_human_approval_command("/example-agent approve", "example-agent").is_some());
+        assert!(parse_human_approval_command("/donkeyspace approve", "example-agent").is_none());
     }
 
     #[test]
@@ -2761,7 +2769,7 @@ mod tests {
     fn extracts_linked_issue_from_pr_text_and_branch() {
         assert_eq!(extract_linked_issue_number("Closes #12"), Some(12));
         assert_eq!(
-            issue_number_from_donkeyspace_branch("donkeyspace/issue-12-019e399e"),
+            issue_number_from_managed_branch("example-agent/issue-12-019e399e", "example-agent"),
             Some(12)
         );
     }

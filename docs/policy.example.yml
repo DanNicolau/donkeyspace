@@ -7,6 +7,7 @@ version: 1
 #   display_name: "Example Agent Platform"
 #   tagline: "Agentic repository workflow"
 #   command: "example-agent"
+#   branch_prefix: "example-agent"
 
 workflow:
   state_labels:

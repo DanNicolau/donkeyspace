@@ -84,6 +84,8 @@ struct FacadeArgs {
     #[arg(long)]
     command: Option<String>,
     #[arg(long)]
+    branch_prefix: Option<String>,
+    #[arg(long)]
     reset: bool,
 }
 
@@ -340,6 +342,7 @@ async fn run() -> Result<(), SetupError> {
                     args.display_name,
                     args.tagline,
                     args.command,
+                    args.branch_prefix,
                     args.reset,
                 )?;
                 let facade = instance.resolved_facade()?;
@@ -480,9 +483,11 @@ mod tests {
             "configure",
             "facade",
             "--display-name",
-            "ePIC Agent Platform",
+            "Example Agent Platform",
             "--command",
-            "epic-agent",
+            "example-agent",
+            "--branch-prefix",
+            "example-agent",
         ])
         .unwrap();
         let Some(Command::Configure(ConfigureArgs {
@@ -491,8 +496,9 @@ mod tests {
         else {
             panic!("expected facade configuration");
         };
-        assert_eq!(args.display_name.as_deref(), Some("ePIC Agent Platform"));
-        assert_eq!(args.command.as_deref(), Some("epic-agent"));
+        assert_eq!(args.display_name.as_deref(), Some("Example Agent Platform"));
+        assert_eq!(args.command.as_deref(), Some("example-agent"));
+        assert_eq!(args.branch_prefix.as_deref(), Some("example-agent"));
         assert!(!args.reset);
     }
 

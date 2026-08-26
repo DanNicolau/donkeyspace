@@ -9,22 +9,23 @@ does not currently display or edit the active policy.
 
 ## Product Facade
 
-`facade` controls the product name, dashboard tagline, and GitHub issue command
+`facade` controls the product name, dashboard tagline, GitHub issue command, and
+branch namespace
 shown to users. Values are optional and resolve field-by-field from built-in
 defaults, the active plugin, policy, and private instance overrides.
 
 ```yaml
 facade:
-  display_name: "ePIC Agent Platform"
-  tagline: "Agentic hardware design workflow"
-  command: "epic-agent"
+  display_name: "Example Agent Platform"
+  tagline: "Agentic repository workflow"
+  command: "example-agent"
+  branch_prefix: "example-agent"
 ```
 
 The command omits its leading slash. Configure private deployment overrides
 with `donkeyspace configure facade`; use `--reset` to return to plugin and
 policy defaults. Facades do not rename stable runtime identifiers such as
-`.donkeyspace`, environment variables, hidden GitHub markers, or branch
-prefixes.
+`.donkeyspace`, environment variables, or hidden GitHub markers.
 
 Only the resolved issue command is accepted. Changing it intentionally makes
 comments using the previous command token ineligible to resume paused jobs.

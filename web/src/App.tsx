@@ -5,6 +5,7 @@ type Facade = {
   display_name: string;
   tagline: string;
   issue_command: string;
+  branch_prefix: string;
 };
 
 type Run = {
@@ -176,7 +177,8 @@ export function App() {
   const facade = facadeQuery.data ?? {
     display_name: "Agent Platform",
     tagline: "Agentic repository workflow",
-    issue_command: ""
+    issue_command: "",
+    branch_prefix: "agent"
   };
   useEffect(() => {
     document.title = facade.display_name;
