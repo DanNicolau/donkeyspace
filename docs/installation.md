@@ -127,7 +127,7 @@ still requires a public webhook URL, so polling registrations use the official
 documentation's `https://example.com/github/events` example with delivery
 explicitly disabled; Donkeyspace does not send repository events there.
 
-Polling uses a configurable 8-second local interval, conditional requests, and
+Polling uses a configurable 60-second local interval, conditional requests, and
 GitHub's `X-Poll-Interval` as the effective minimum for each repository. Change
 the local interval with `donkeyspace configure polling --interval-seconds N`,
 then restart the stack. The dashboard reports polling health and can coalesce a

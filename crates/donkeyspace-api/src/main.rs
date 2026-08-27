@@ -283,7 +283,7 @@ impl GitHubPollConfig {
             &env::var("DONKEYSPACE_GITHUB_POLL_REPOSITORIES").unwrap_or_default(),
         )?;
         let interval_seconds = env::var("DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS")
-            .unwrap_or_else(|_| "8".to_string())
+            .unwrap_or_else(|_| "60".to_string())
             .parse::<u64>()?;
         if !(5..=3600).contains(&interval_seconds) {
             return Err(

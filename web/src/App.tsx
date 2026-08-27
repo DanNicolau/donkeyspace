@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 type Facade = {
   display_name: string;
@@ -356,6 +356,11 @@ function GitHubPollingPanel({
   unavailable: boolean;
 }) {
   const queryClient = useQueryClient();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const triggerMutation = useMutation({
     mutationFn: triggerGitHubPoll,
     onSuccess: async () => {
@@ -396,12 +401,12 @@ function GitHubPollingPanel({
               <dd>{status.configured_interval_seconds}s</dd>
             </div>
             <div>
-              <dt>Last success</dt>
-              <dd>{formatTimestamp(status.last_success_at)}</dd>
+              <dt>Since last poll</dt>
+              <dd>{formatElapsed(status.last_completed_at, now)}</dd>
             </div>
             <div>
-              <dt>Next eligible</dt>
-              <dd>{formatTimestamp(status.next_poll_at)}</dd>
+              <dt>Until next poll</dt>
+              <dd>{formatCountdown(status.next_poll_at, now)}</dd>
             </div>
             <div>
               <dt>Failures</dt>
@@ -412,8 +417,8 @@ function GitHubPollingPanel({
             <div className="polling-repository" key={repository.full_name}>
               <strong>{repository.full_name}</strong>
               <span>
-                GitHub minimum: {repository.server_interval_seconds ?? "unknown"}s · next:{" "}
-                {formatTimestamp(repository.next_eligible_at)}
+                GitHub minimum: {repository.server_interval_seconds ?? "unknown"}s · next in{" "}
+                {formatCountdown(repository.next_eligible_at, now)}
               </span>
               {repository.last_error ? <p>{repository.last_error}</p> : null}
             </div>
@@ -669,13 +674,47 @@ function shortJobId(id: string): string {
   return id.length > 8 ? `${id.slice(0, 8)}…` : id;
 }
 
-function formatTimestamp(value: string | null): string {
+function formatElapsed(value: string | null, now: number): string {
   if (!value) {
     return "not yet";
   }
-  return new Date(value).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit"
-  });
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? formatDuration(Math.max(0, now - timestamp))
+    : "unknown";
+}
+
+function formatCountdown(value: string | null, now: number): string {
+  if (!value) {
+    return "unknown";
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    return "unknown";
+  }
+  const remaining = timestamp - now;
+  return remaining <= 0 ? "due now" : formatDuration(remaining, true);
+}
+
+function formatDuration(milliseconds: number, roundUp = false): string {
+  const rawSeconds = milliseconds / 1_000;
+  const totalSeconds = Math.max(
+    0,
+    roundUp ? Math.ceil(rawSeconds) : Math.floor(rawSeconds)
+  );
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
 }

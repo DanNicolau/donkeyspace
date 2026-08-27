@@ -21,7 +21,7 @@ pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 const SCHEMA_VERSION: u32 = 7;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
-pub const DEFAULT_GITHUB_POLL_INTERVAL_SECONDS: u64 = 8;
+pub const DEFAULT_GITHUB_POLL_INTERVAL_SECONDS: u64 = 60;
 const PORT_SUGGESTION_ATTEMPTS: u16 = 100;
 const CONFIG_FILE: &str = "instance.json";
 const GENERATED_ENV: &str = "compose.env";
