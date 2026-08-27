@@ -71,8 +71,15 @@ struct ConfigureArgs {
 #[derive(Debug, Subcommand)]
 enum ConfigureTarget {
     Ports(PortArgs),
+    Polling(PollingArgs),
     Facade(FacadeArgs),
     GithubAccess(GitHubAccessArgs),
+}
+
+#[derive(Debug, Args)]
+struct PollingArgs {
+    #[arg(long)]
+    interval_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -328,6 +335,27 @@ async fn run() -> Result<(), SetupError> {
                     );
                 }
             }
+            ConfigureTarget::Polling(args) => {
+                let stack_running = instance
+                    .deployment_status()
+                    .map(|status| {
+                        status
+                            .services
+                            .iter()
+                            .any(|service| service.state.eq_ignore_ascii_case("running"))
+                    })
+                    .unwrap_or(false);
+                instance.configure_polling_interval(args.interval_seconds)?;
+                println!(
+                    "GitHub polling interval saved: {} seconds",
+                    args.interval_seconds
+                );
+                if stack_running {
+                    println!(
+                        "restart required: run `donkeyspace down` followed by `donkeyspace up`"
+                    );
+                }
+            }
             ConfigureTarget::Facade(args) => {
                 let stack_running = instance
                     .deployment_status()
@@ -474,6 +502,22 @@ mod tests {
         };
         assert_eq!(args.api_port, None);
         assert_eq!(args.web_port, Some(5175));
+
+        let configure = Cli::try_parse_from([
+            "donkeyspace",
+            "configure",
+            "polling",
+            "--interval-seconds",
+            "8",
+        ])
+        .unwrap();
+        let Some(Command::Configure(ConfigureArgs {
+            target: ConfigureTarget::Polling(args),
+        })) = configure.command
+        else {
+            panic!("expected configure polling command");
+        };
+        assert_eq!(args.interval_seconds, 8);
     }
 
     #[test]

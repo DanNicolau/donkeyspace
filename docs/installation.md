@@ -127,6 +127,12 @@ still requires a public webhook URL, so polling registrations use the official
 documentation's `https://example.com/github/events` example with delivery
 explicitly disabled; Donkeyspace does not send repository events there.
 
+Polling uses a configurable 8-second local interval, conditional requests, and
+GitHub's `X-Poll-Interval` as the effective minimum for each repository. Change
+the local interval with `donkeyspace configure polling --interval-seconds N`,
+then restart the stack. The dashboard reports polling health and can coalesce a
+manual poll request without overlapping an active cycle or bypassing cooldowns.
+
 An existing private App can be imported with `--app-id`, `--installation-id`,
 and `--private-key-file`. Add `--webhook-secret-file` when using `--public-url`.
 
@@ -139,6 +145,9 @@ DONKEYSPACE_GITHUB_INSTALLATION_ID
 DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE
 DONKEYSPACE_WEBHOOK_SECRET_FILE
 DONKEYSPACE_GITHUB_REPOSITORIES
+DONKEYSPACE_GITHUB_POLL_REPOSITORIES
+DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS
+DONKEYSPACE_GITHUB_POLL_MAX_PAGES
 DONKEYSPACE_GITHUB_TOKEN  # deprecated PAT mode only
 ```
 

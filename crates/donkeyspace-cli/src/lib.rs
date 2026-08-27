@@ -18,9 +18,10 @@ mod plugins;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
+pub const DEFAULT_GITHUB_POLL_INTERVAL_SECONDS: u64 = 8;
 const PORT_SUGGESTION_ATTEMPTS: u16 = 100;
 const CONFIG_FILE: &str = "instance.json";
 const GENERATED_ENV: &str = "compose.env";
@@ -182,8 +183,28 @@ pub enum GitHubInstanceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum IngressMode {
-    Polling,
-    Webhook { public_url: String },
+    Polling {
+        #[serde(default = "default_github_poll_interval_seconds")]
+        interval_seconds: u64,
+    },
+    Webhook {
+        public_url: String,
+    },
+}
+
+impl IngressMode {
+    pub fn polling() -> Self {
+        Self::Polling {
+            interval_seconds: DEFAULT_GITHUB_POLL_INTERVAL_SECONDS,
+        }
+    }
+
+    pub fn poll_interval_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Polling { interval_seconds } => Some(*interval_seconds),
+            Self::Webhook { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -287,7 +308,7 @@ impl Instance {
             let bytes = fs::read(&path)?;
             let mut config: InstanceConfig = serde_json::from_slice(&bytes)?;
             let migrated = match config.schema_version {
-                1 | 2 | 3 => {
+                1..=3 => {
                     reconcile_github_access(&mut config);
                     config.github_approvers = config.github_access.clone();
                     config.schema_version = SCHEMA_VERSION;
@@ -299,7 +320,7 @@ impl Instance {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
-                5 => {
+                5 | 6 => {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
@@ -395,6 +416,30 @@ impl Instance {
         web_port: Option<u16>,
     ) -> Result<(), SetupError> {
         self.configure_ports_with_availability(api_port, web_port, port_is_available)
+    }
+
+    pub fn configure_polling_interval(&mut self, interval_seconds: u64) -> Result<(), SetupError> {
+        validate_poll_interval(interval_seconds)?;
+        let github = self
+            .config
+            .as_mut()
+            .and_then(|config| config.github.as_mut())
+            .ok_or_else(|| SetupError::Config("GitHub is not connected".into()))?;
+        let ingress = match github {
+            GitHubInstanceConfig::App { ingress, .. }
+            | GitHubInstanceConfig::Pat { ingress, .. } => ingress,
+        };
+        match ingress {
+            IngressMode::Polling {
+                interval_seconds: configured,
+            } => *configured = interval_seconds,
+            IngressMode::Webhook { .. } => {
+                return Err(SetupError::Config(
+                    "polling interval is unavailable while webhook ingress is active".into(),
+                ));
+            }
+        }
+        self.save()
     }
 
     pub fn configure_facade(
@@ -841,7 +886,7 @@ impl Instance {
                 eprintln!(
                     "warning: no public HTTPS URL configured; repository polling is delayed and is not real-time"
                 );
-                IngressMode::Polling
+                IngressMode::polling()
             }
         };
 
@@ -872,7 +917,7 @@ impl Instance {
                     (Some(app_id), Some(installation_id), Some(private_key_file)) => {
                         let webhook_secret = match options.webhook_secret_file {
                             Some(path) => fs::read(path)?,
-                            None if matches!(ingress, IngressMode::Polling) => random_hex(32)?.into_bytes(),
+                            None if matches!(ingress, IngressMode::Polling { .. }) => random_hex(32)?.into_bytes(),
                             None => return Err(SetupError::Config(
                                 "webhook mode requires --webhook-secret-file".into(),
                             )),
@@ -1279,10 +1324,10 @@ impl Instance {
             matches!(
                 github,
                 GitHubInstanceConfig::App {
-                    ingress: IngressMode::Polling,
+                    ingress: IngressMode::Polling { .. },
                     ..
                 } | GitHubInstanceConfig::Pat {
-                    ingress: IngressMode::Polling,
+                    ingress: IngressMode::Polling { .. },
                     ..
                 }
             )
@@ -1423,11 +1468,17 @@ impl Instance {
                         format!("DONKEYSPACE_GITHUB_REPOSITORIES={}", repositories.join(",")),
                         format!(
                             "DONKEYSPACE_GITHUB_POLL_REPOSITORIES={}",
-                            if matches!(ingress, IngressMode::Polling) {
+                            if matches!(ingress, IngressMode::Polling { .. }) {
                                 repositories.join(",")
                             } else {
                                 String::new()
                             }
+                        ),
+                        format!(
+                            "DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS={}",
+                            ingress
+                                .poll_interval_seconds()
+                                .unwrap_or(DEFAULT_GITHUB_POLL_INTERVAL_SECONDS)
                         ),
                     ]);
                 }
@@ -1440,11 +1491,17 @@ impl Instance {
                     format!("DONKEYSPACE_GITHUB_REPOSITORIES={}", repositories.join(",")),
                     format!(
                         "DONKEYSPACE_GITHUB_POLL_REPOSITORIES={}",
-                        if matches!(ingress, IngressMode::Polling) {
+                        if matches!(ingress, IngressMode::Polling { .. }) {
                             repositories.join(",")
                         } else {
                             String::new()
                         }
+                    ),
+                    format!(
+                        "DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS={}",
+                        ingress
+                            .poll_interval_seconds()
+                            .unwrap_or(DEFAULT_GITHUB_POLL_INTERVAL_SECONDS)
                     ),
                 ]),
             }
@@ -1476,6 +1533,19 @@ impl Instance {
 
 fn default_web_port() -> u16 {
     DEFAULT_WEB_PORT
+}
+
+fn default_github_poll_interval_seconds() -> u64 {
+    DEFAULT_GITHUB_POLL_INTERVAL_SECONDS
+}
+
+fn validate_poll_interval(interval_seconds: u64) -> Result<(), SetupError> {
+    if !(5..=3600).contains(&interval_seconds) {
+        return Err(SetupError::Config(
+            "GitHub polling interval must be between 5 and 3600 seconds".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ports(api_port: u16, web_port: u16) -> Result<(), SetupError> {
@@ -1818,7 +1888,7 @@ fn github_app_manifest(
         // GitHub's manifest schema requires a public hook URL even when
         // delivery is disabled. This documented example endpoint is never
         // used because `active` is false; polling remains the only ingress.
-        IngressMode::Polling => json!({
+        IngressMode::Polling { .. } => json!({
             "url": "https://example.com/github/events",
             "active": false
         }),
@@ -1920,12 +1990,13 @@ fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                output.push(byte);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16)
+        {
+            output.push(byte);
+            index += 3;
+            continue;
         }
         output.push(if bytes[index] == b'+' {
             b' '
@@ -2188,7 +2259,7 @@ mod tests {
         let manifest = github_app_manifest(
             "0123456789abcdef",
             "http://127.0.0.1:8787/callback",
-            &IngressMode::Polling,
+            &IngressMode::polling(),
             "Donkeyspace",
         );
         assert_eq!(manifest["hook_attributes"]["active"], false);
@@ -2261,7 +2332,7 @@ mod tests {
             github: Some(GitHubInstanceConfig::Pat {
                 token_file: "/config/secrets/github-pat".into(),
                 repositories: vec!["owner/repo".into()],
-                ingress: IngressMode::Polling,
+                ingress: IngressMode::polling(),
             }),
             github_access: BTreeMap::from([("owner/repo".into(), Vec::new())]),
             github_approvers: BTreeMap::from([("owner/repo".into(), Vec::new())]),
@@ -2280,7 +2351,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for schema_version in [1, 2, 3, 4, 5] {
+        for schema_version in [1, 2, 3, 4, 5, 6] {
             let directory =
                 env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
             fs::create_dir_all(&directory).unwrap();
@@ -2312,6 +2383,39 @@ mod tests {
             assert!(!directory.join(".instance.json.tmp").exists());
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn schema_six_polling_ingress_defaults_to_eight_seconds() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("donkeyspace-schema-six-poll-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CONFIG_FILE),
+            r#"{
+              "schema_version": 6,
+              "source_tree": "/src",
+              "runtime_source": "local-build",
+              "api_port": 8080,
+              "web_port": 5173,
+              "github": {
+                "mode": "pat",
+                "token_file": "/tmp/token",
+                "repositories": ["owner/repo"],
+                "ingress": {"kind": "polling"}
+              }
+            }"#,
+        )
+        .unwrap();
+        let instance = Instance::open(Some(directory)).unwrap();
+        let interval = match instance.config().unwrap().github.as_ref().unwrap() {
+            GitHubInstanceConfig::Pat { ingress, .. } => ingress.poll_interval_seconds(),
+            GitHubInstanceConfig::App { .. } => None,
+        };
+        assert_eq!(interval, Some(DEFAULT_GITHUB_POLL_INTERVAL_SECONDS));
     }
 
     #[test]
@@ -2366,7 +2470,7 @@ mod tests {
             github: Some(GitHubInstanceConfig::Pat {
                 token_file: "/secret".into(),
                 repositories: vec!["acme/rtl".into(), "acme/dv".into()],
-                ingress: IngressMode::Polling,
+                ingress: IngressMode::polling(),
             }),
             github_access: BTreeMap::from([(
                 "old/repo".into(),
@@ -2471,6 +2575,44 @@ mod tests {
         let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
         assert!(environment.contains("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:Z\n"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn polling_interval_is_persisted_and_written_to_compose_environment() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("donkeyspace-poll-env-test-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let mut instance = Instance {
+            directory: directory.clone(),
+            config: Some(InstanceConfig {
+                schema_version: SCHEMA_VERSION,
+                source_tree: "/src".into(),
+                runtime_source: RuntimeSource::LocalBuild,
+                api_port: 8080,
+                web_port: 5173,
+                codex_home: None,
+                github: Some(GitHubInstanceConfig::Pat {
+                    token_file: "/tmp/token".into(),
+                    repositories: vec!["owner/repo".into()],
+                    ingress: IngressMode::polling(),
+                }),
+                github_access: BTreeMap::new(),
+                github_approvers: BTreeMap::new(),
+                plugins: BTreeMap::new(),
+                active_plugin: None,
+                facade: FacadeConfig::default(),
+            }),
+        };
+        instance.configure_polling_interval(12).unwrap();
+        instance
+            .write_compose_env(instance.config().unwrap())
+            .unwrap();
+        let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
+        assert!(environment.contains("DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS=12\n"));
+        assert!(instance.configure_polling_interval(4).is_err());
     }
 
     #[test]
@@ -2639,7 +2781,7 @@ mod tests {
             app_id: 42,
             slug: "donkeyspace-test".into(),
             owner: "example".into(),
-            ingress: IngressMode::Polling,
+            ingress: IngressMode::polling(),
             callback_port: 8787,
             organization: None,
             private_key_file: private_key_file.clone(),

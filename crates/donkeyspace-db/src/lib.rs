@@ -662,6 +662,15 @@ pub async fn record_webhook_delivery(
     Ok(inserted)
 }
 
+pub async fn webhook_delivery_exists(pool: &PgPool, delivery_id: &str) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = $1)",
+    )
+    .bind(delivery_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 pub async fn record_engagement_decision(
     pool: &PgPool,
     input: &EngagementDecisionInput,

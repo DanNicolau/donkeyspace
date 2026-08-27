@@ -1,11 +1,20 @@
 use hmac::{Hmac, Mac};
-use http::header::ACCEPT;
-use octocrab::{Octocrab, models::IssueState};
+use http::{
+    StatusCode,
+    header::{ACCEPT, ETAG, HeaderMap, HeaderValue, IF_NONE_MATCH},
+};
+use octocrab::{FromResponse, Octocrab, Page, models::IssueState};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use std::{collections::BTreeMap, env, fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -52,6 +61,8 @@ pub enum GitHubClientError {
     Octocrab(#[from] octocrab::Error),
     #[error("invalid github response: {0}")]
     InvalidResponse(String),
+    #[error("github rate limit requires waiting {retry_after_seconds} seconds")]
+    RateLimited { retry_after_seconds: u64 },
     #[error("github authentication configuration is invalid: {0}")]
     InvalidAuthConfig(String),
     #[error("failed to read github private key `{path}`: {source}")]
@@ -203,6 +214,20 @@ impl GitHubAuthConfig {
         match self {
             Self::App { app_id, .. } => Some(*app_id),
             Self::Pat { .. } => None,
+        }
+    }
+}
+
+impl GitHubClientError {
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            Self::RateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            Self::Octocrab(error) if matches!(github_error_status(error), Some(403 | 429)) => {
+                Some(60)
+            }
+            _ => None,
         }
     }
 }
@@ -531,6 +556,14 @@ pub struct GitHubProjectedIssue {
     pub number: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitHubEventPoll {
+    pub events: Vec<Value>,
+    pub etag: Option<String>,
+    pub poll_interval_seconds: Option<u64>,
+    pub not_modified: bool,
+}
+
 impl GitHubClient {
     pub fn new(token: impl Into<String>) -> Result<Self, GitHubClientError> {
         Ok(Self {
@@ -838,6 +871,105 @@ impl GitHubClient {
         Ok(events)
     }
 
+    pub async fn repository_events_conditional(
+        &self,
+        owner: &str,
+        repo: &str,
+        max_pages: usize,
+        etag: Option<&str>,
+    ) -> Result<GitHubEventPoll, GitHubClientError> {
+        let route = format!("/repos/{owner}/{repo}/events?per_page=100");
+        let mut headers = HeaderMap::new();
+        if let Some(etag) = etag {
+            headers.insert(
+                IF_NONE_MATCH,
+                HeaderValue::from_str(etag).map_err(|_| {
+                    GitHubClientError::InvalidResponse("invalid cached events ETag".into())
+                })?,
+            );
+        }
+        let response = self
+            .client
+            ._get_with_headers(route.as_str(), Some(headers))
+            .await?;
+        let status = response.status();
+        let response_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| etag.map(str::to_string));
+        let poll_interval_seconds = response
+            .headers()
+            .get("x-poll-interval")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(GitHubEventPoll {
+                events: Vec::new(),
+                etag: response_etag,
+                poll_interval_seconds,
+                not_modified: true,
+            });
+        }
+        if matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+        ) {
+            let retry_after_seconds = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| {
+                    let remaining = response
+                        .headers()
+                        .get("x-ratelimit-remaining")?
+                        .to_str()
+                        .ok()?
+                        .parse::<u64>()
+                        .ok()?;
+                    if remaining != 0 {
+                        return None;
+                    }
+                    let reset = response
+                        .headers()
+                        .get("x-ratelimit-reset")?
+                        .to_str()
+                        .ok()?
+                        .parse::<u64>()
+                        .ok()?;
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+                    Some(reset.saturating_sub(now).max(1))
+                })
+                .unwrap_or(60);
+            return Err(GitHubClientError::RateLimited {
+                retry_after_seconds,
+            });
+        }
+        if !status.is_success() {
+            return Err(GitHubClientError::InvalidResponse(format!(
+                "github repository events returned {status}"
+            )));
+        }
+
+        let mut page = Page::<Value>::from_response(response).await?;
+        let mut events = page.take_items();
+        for _ in 1..max_pages.max(1) {
+            let Some(mut next_page) = self.client.get_page(&page.next).await? else {
+                break;
+            };
+            events.append(&mut next_page.take_items());
+            page = next_page;
+        }
+        Ok(GitHubEventPoll {
+            events,
+            etag: response_etag,
+            poll_interval_seconds,
+            not_modified: false,
+        })
+    }
+
     pub async fn pull_request(
         &self,
         owner: &str,
@@ -922,8 +1054,9 @@ fn workflow_label_color(label: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubAuthConfig, GitHubAuthMode, SignatureError, parse_repository, select_installation_id,
-        validate_installation_response, validate_members_permission_response, verify_signature,
+        GitHubAuthConfig, GitHubAuthMode, GitHubClient, SignatureError, parse_repository,
+        select_installation_id, validate_installation_response,
+        validate_members_permission_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
     use http_body_util::Full;
@@ -1201,5 +1334,65 @@ mod tests {
         assert_eq!(provider.token().await.unwrap(), "installation-token-1");
         assert_eq!(provider.token().await.unwrap(), "installation-token-2");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn repository_events_reuse_etag_and_honor_poll_interval_header() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let service = service_fn(move |request: http::Request<octocrab::OctoBody>| {
+            let request_count = Arc::clone(&request_count);
+            async move {
+                let index = request_count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.uri().path(), "/repos/acme/rtl/events");
+                if index == 0 {
+                    assert!(request.headers().get(http::header::IF_NONE_MATCH).is_none());
+                    Ok::<_, Infallible>(
+                        http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .header(http::header::ETAG, "\"events-v1\"")
+                            .header("x-poll-interval", "60")
+                            .body(Full::new(bytes::Bytes::from_static(
+                                br#"[{"id":"1","type":"IssuesEvent","payload":{}}]"#,
+                            )))
+                            .unwrap(),
+                    )
+                } else {
+                    assert_eq!(
+                        request.headers()[http::header::IF_NONE_MATCH],
+                        "\"events-v1\""
+                    );
+                    Ok::<_, Infallible>(
+                        http::Response::builder()
+                            .status(http::StatusCode::NOT_MODIFIED)
+                            .header(http::header::ETAG, "\"events-v1\"")
+                            .header("x-poll-interval", "60")
+                            .body(Full::new(bytes::Bytes::new()))
+                            .unwrap(),
+                    )
+                }
+            }
+        });
+        let client = GitHubClient {
+            client: OctocrabBuilder::new_empty()
+                .with_service(service)
+                .with_auth(AuthState::None)
+                .build()
+                .unwrap(),
+        };
+
+        let first = client
+            .repository_events_conditional("acme", "rtl", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.poll_interval_seconds, Some(60));
+        let second = client
+            .repository_events_conditional("acme", "rtl", 1, first.etag.as_deref())
+            .await
+            .unwrap();
+        assert!(second.not_modified);
+        assert!(second.events.is_empty());
     }
 }

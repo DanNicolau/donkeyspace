@@ -31,6 +31,7 @@ const HOME_ACTIONS: &[&str] = &[
     "Start platform",
     "Stop platform",
     "Configure ports",
+    "Configure polling",
     "Configure GitHub",
     "Manage GitHub access",
     "Configure Codex",
@@ -42,6 +43,7 @@ enum Screen {
     Init,
     Home,
     Ports,
+    Polling,
     GitHubMethod,
     GitHubManifest,
     GitHubInstall,
@@ -248,6 +250,24 @@ impl App {
         self.reset_messages();
     }
 
+    fn begin_polling(&mut self, instance: &Instance) {
+        let interval = instance
+            .config()
+            .and_then(|config| config.github.as_ref())
+            .and_then(|github| match github {
+                GitHubInstanceConfig::App { ingress, .. }
+                | GitHubInstanceConfig::Pat { ingress, .. } => ingress.poll_interval_seconds(),
+            });
+        let Some(interval) = interval else {
+            self.error = Some("Polling ingress is not active for this instance.".into());
+            return;
+        };
+        self.screen = Screen::Polling;
+        self.fields = vec![interval.to_string()];
+        self.field = 0;
+        self.reset_messages();
+    }
+
     fn polling_warning(&self, instance: &Instance) -> bool {
         instance
             .config()
@@ -256,10 +276,10 @@ impl App {
                 matches!(
                     github,
                     GitHubInstanceConfig::App {
-                        ingress: IngressMode::Polling,
+                        ingress: IngressMode::Polling { .. },
                         ..
                     } | GitHubInstanceConfig::Pat {
-                        ingress: IngressMode::Polling,
+                        ingress: IngressMode::Polling { .. },
                         ..
                     }
                 )
@@ -498,6 +518,7 @@ async fn handle_key(
         Screen::Init => handle_init(app, key)?,
         Screen::Home => handle_home(app, key, sender),
         Screen::Ports => handle_ports(app, key)?,
+        Screen::Polling => handle_polling(app, key)?,
         Screen::GitHubMethod => handle_github_method(app, key),
         Screen::GitHubManifest => handle_manifest_form(app, key, sender),
         Screen::GitHubInstall => handle_install(app, key, sender),
@@ -605,6 +626,43 @@ fn handle_ports(app: &mut App, key: KeyEvent) -> Result<(), SetupError> {
     Ok(())
 }
 
+fn handle_polling(app: &mut App, key: KeyEvent) -> Result<(), SetupError> {
+    match key.code {
+        KeyCode::Esc => app.show_home(),
+        KeyCode::Enter => {
+            let interval = match app.fields[0].trim().parse::<u64>() {
+                Ok(value) if (5..=3600).contains(&value) => value,
+                _ => {
+                    app.error =
+                        Some("GitHub polling interval must be between 5 and 3600 seconds.".into());
+                    return Ok(());
+                }
+            };
+            let stack_running = app
+                .status
+                .services
+                .iter()
+                .any(|service| service.state.eq_ignore_ascii_case("running"));
+            let mut instance = Instance::open(app.config_dir.clone())?;
+            if let Err(error) = instance.configure_polling_interval(interval) {
+                app.error = Some(error.to_string());
+                return Ok(());
+            }
+            app.show_home();
+            app.notice = Some(if stack_running {
+                format!(
+                    "Polling interval saved. Stop and start {} to apply it.",
+                    app.display_name
+                )
+            } else {
+                "Polling interval saved.".into()
+            });
+        }
+        _ => edit_field(&mut app.fields[0], key, false),
+    }
+    Ok(())
+}
+
 fn parse_port(value: &str, label: &str) -> Result<u16, String> {
     value
         .trim()
@@ -643,13 +701,17 @@ fn handle_home(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskR
                 Ok(instance) => app.begin_ports(&instance),
                 Err(error) => app.error = Some(error.to_string()),
             },
-            4 => app.begin_github(),
-            5 => match Instance::open(app.config_dir.clone()) {
+            4 => match Instance::open(app.config_dir.clone()) {
+                Ok(instance) => app.begin_polling(&instance),
+                Err(error) => app.error = Some(error.to_string()),
+            },
+            5 => app.begin_github(),
+            6 => match Instance::open(app.config_dir.clone()) {
                 Ok(instance) => app.begin_github_access(&instance),
                 Err(error) => app.error = Some(error.to_string()),
             },
-            6 => app.begin_codex(),
-            7 => app.begin_plugins(),
+            7 => app.begin_codex(),
+            8 => app.begin_plugins(),
             _ => {}
         },
         _ => {}
@@ -1383,7 +1445,7 @@ fn ingress(webhook: bool, public_url: Option<&String>) -> IngressMode {
             public_url: public_url.cloned().unwrap_or_default(),
         }
     } else {
-        IngressMode::Polling
+        IngressMode::polling()
     }
 }
 
@@ -1441,6 +1503,16 @@ fn render(frame: &mut Frame, app: &App, instance: &Instance) {
             app.field,
             false,
             "Enter save  Tab next  Esc back\nChanging a running stack requires a stop and start.",
+        ),
+        Screen::Polling => render_form(
+            frame,
+            vertical[1],
+            "Configure GitHub polling",
+            &["Interval seconds"],
+            &app.fields,
+            app.field,
+            false,
+            "Enter save  Esc back\nGitHub's server-provided minimum interval is still honored.",
         ),
         Screen::GitHubMethod => render_menu(
             frame,
@@ -1909,6 +1981,8 @@ fn render_menu(frame: &mut Frame, area: Rect, title: &str, options: &[&str], sel
     );
 }
 
+// Form rendering is clearer at call sites with explicit layout arguments.
+#[allow(clippy::too_many_arguments)]
 fn render_form(
     frame: &mut Frame,
     area: Rect,

@@ -74,7 +74,7 @@ impl Policy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngagementPolicy {
     #[serde(default)]
     pub default: EngagementRule,
@@ -88,19 +88,6 @@ pub struct EngagementPolicy {
     pub needs_human_resume: Option<EngagementRule>,
     #[serde(default)]
     pub repositories: BTreeMap<String, RepositoryEngagementPolicy>,
-}
-
-impl Default for EngagementPolicy {
-    fn default() -> Self {
-        Self {
-            default: EngagementRule::default(),
-            initial: None,
-            needs_info_resume: None,
-            blocked_resume: None,
-            needs_human_resume: None,
-            repositories: BTreeMap::new(),
-        }
-    }
 }
 
 impl EngagementPolicy {

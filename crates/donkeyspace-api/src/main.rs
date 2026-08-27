@@ -6,6 +6,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use donkeyspace_core::{
     AgentRole, EngagementGate, EngagementSelector, LabelState, PluginManifest, Policy,
     WorkflowState, normalize_workflow_labels,
@@ -21,19 +22,19 @@ use donkeyspace_db::{
     pending_outbound_comment_exists, record_engagement_decision, record_state_transition,
     record_webhook_delivery, repair_job_exists_for_pr_base, resume_latest_paused_job,
     retry_agent_publication, reviewer_job_exists_for_pr_head, upsert_pull_request,
-    upsert_repository, upsert_workflow_item,
+    upsert_repository, upsert_workflow_item, webhook_delivery_exists,
 };
-use donkeyspace_github::{GitHubClient, GitHubCredentialProvider};
+use donkeyspace_github::{GitHubClient, GitHubClientError, GitHubCredentialProvider};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -47,6 +48,7 @@ struct AppState {
     github_token_owner: Option<String>,
     configured_repositories: Vec<PolledRepository>,
     verification_cache: Arc<Mutex<HashMap<String, (Instant, String)>>>,
+    github_poller: GitHubPollController,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +76,71 @@ struct GitHubPollConfig {
     repositories: Vec<PolledRepository>,
     interval: Duration,
     max_pages: usize,
+}
+
+const GITHUB_POLL_REPOSITORY_TIMEOUT: Duration = Duration::from_secs(60);
+const GITHUB_POLL_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone)]
+struct GitHubPollController {
+    config: GitHubPollConfig,
+    runtime: Arc<Mutex<GitHubPollRuntime>>,
+    notify: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct GitHubPollRuntime {
+    running: bool,
+    pending_manual: bool,
+    last_started_at: Option<DateTime<Utc>>,
+    last_completed_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    repositories: BTreeMap<String, GitHubRepositoryPollRuntime>,
+}
+
+#[derive(Debug)]
+struct GitHubRepositoryPollRuntime {
+    etag: Option<String>,
+    server_interval: Option<Duration>,
+    next_eligible: Instant,
+    next_eligible_at: DateTime<Utc>,
+    last_polled_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubPollStatusResponse {
+    enabled: bool,
+    running: bool,
+    pending_manual: bool,
+    configured_interval_seconds: u64,
+    last_started_at: Option<DateTime<Utc>>,
+    last_completed_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    consecutive_failures: u32,
+    next_poll_at: Option<DateTime<Utc>>,
+    repositories: Vec<GitHubRepositoryPollStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubRepositoryPollStatus {
+    full_name: String,
+    server_interval_seconds: Option<u64>,
+    next_eligible_at: DateTime<Utc>,
+    last_polled_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubPollTriggerResponse {
+    status: &'static str,
+    already_pending: bool,
 }
 
 #[derive(Debug)]
@@ -122,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let configured_repositories = parse_polled_repositories(
         &env::var("DONKEYSPACE_GITHUB_REPOSITORIES").unwrap_or_default(),
     )?;
+    let github_poller = GitHubPollController::new(GitHubPollConfig::from_env()?);
     let state = Arc::new(AppState {
         webhook_secret: load_optional_secret(
             "DONKEYSPACE_WEBHOOK_SECRET",
@@ -133,6 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         github_token_owner,
         configured_repositories,
         verification_cache: Arc::new(Mutex::new(HashMap::new())),
+        github_poller,
     });
 
     start_github_poller(state.clone())?;
@@ -143,6 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/runs", get(api_runs))
         .route("/api/outbound-actions", get(api_outbound_actions))
         .route("/api/engagement-decisions", get(api_engagement_decisions))
+        .route("/api/github-poll/status", get(api_github_poll_status))
+        .route("/api/github-poll/trigger", post(api_github_poll_trigger))
         .route("/api/runs/{id}", get(api_run))
         .route("/api/runs/{id}/transitions", get(api_run_transitions))
         .route("/api/runs/{id}/lease", post(api_lease_run))
@@ -163,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn start_github_poller(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = GitHubPollConfig::from_env()?;
+    let config = state.github_poller.config.clone();
     if config.repositories.is_empty() {
         return Ok(());
     }
@@ -182,10 +253,23 @@ fn start_github_poller(state: Arc<AppState>) -> Result<(), Box<dyn std::error::E
         max_pages = config.max_pages,
         "github event poller enabled"
     );
+    let controller = state.github_poller.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = poll_github_events(&state, &client, &config).await {
-                tracing::error!(%error, "github event poll failed");
+            let child_state = state.clone();
+            let child_client = client.clone();
+            let child_controller = controller.clone();
+            let task = tokio::spawn(async move {
+                run_github_poller(child_state, child_client, child_controller).await
+            });
+            match task.await {
+                Ok(()) => tracing::error!("github event poller exited unexpectedly"),
+                Err(error) => tracing::error!(%error, "github event poller crashed"),
+            }
+            {
+                let mut runtime = controller.runtime.lock().await;
+                runtime.running = false;
+                runtime.last_error = Some("polling task restarted after an unexpected exit".into());
             }
             tokio::time::sleep(config.interval).await;
         }
@@ -199,9 +283,13 @@ impl GitHubPollConfig {
             &env::var("DONKEYSPACE_GITHUB_POLL_REPOSITORIES").unwrap_or_default(),
         )?;
         let interval_seconds = env::var("DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS")
-            .unwrap_or_else(|_| "60".to_string())
-            .parse::<u64>()?
-            .max(5);
+            .unwrap_or_else(|_| "8".to_string())
+            .parse::<u64>()?;
+        if !(5..=3600).contains(&interval_seconds) {
+            return Err(
+                "DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS must be between 5 and 3600".into(),
+            );
+        }
         let max_pages = env::var("DONKEYSPACE_GITHUB_POLL_MAX_PAGES")
             .unwrap_or_else(|_| "2".to_string())
             .parse::<usize>()?
@@ -212,6 +300,282 @@ impl GitHubPollConfig {
             max_pages,
         })
     }
+}
+
+impl GitHubPollController {
+    fn new(config: GitHubPollConfig) -> Self {
+        let now = Utc::now();
+        let repositories = config
+            .repositories
+            .iter()
+            .map(|repository| {
+                (
+                    repository.full_name(),
+                    GitHubRepositoryPollRuntime {
+                        etag: None,
+                        server_interval: None,
+                        next_eligible: Instant::now(),
+                        next_eligible_at: now,
+                        last_polled_at: None,
+                        last_success_at: None,
+                        last_error: None,
+                        consecutive_failures: 0,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            config,
+            runtime: Arc::new(Mutex::new(GitHubPollRuntime {
+                running: false,
+                pending_manual: false,
+                last_started_at: None,
+                last_completed_at: None,
+                last_success_at: None,
+                last_error: None,
+                repositories,
+            })),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn status(&self) -> GitHubPollStatusResponse {
+        let runtime = self.runtime.lock().await;
+        let repositories = runtime
+            .repositories
+            .iter()
+            .map(|(full_name, repository)| GitHubRepositoryPollStatus {
+                full_name: full_name.clone(),
+                server_interval_seconds: repository.server_interval.map(|value| value.as_secs()),
+                next_eligible_at: repository.next_eligible_at,
+                last_polled_at: repository.last_polled_at,
+                last_success_at: repository.last_success_at,
+                last_error: repository.last_error.clone(),
+                consecutive_failures: repository.consecutive_failures,
+            })
+            .collect::<Vec<_>>();
+        GitHubPollStatusResponse {
+            enabled: !self.config.repositories.is_empty(),
+            running: runtime.running,
+            pending_manual: runtime.pending_manual,
+            configured_interval_seconds: self.config.interval.as_secs(),
+            last_started_at: runtime.last_started_at,
+            last_completed_at: runtime.last_completed_at,
+            last_success_at: runtime.last_success_at,
+            last_error: runtime.last_error.clone(),
+            consecutive_failures: runtime
+                .repositories
+                .values()
+                .map(|repository| repository.consecutive_failures)
+                .max()
+                .unwrap_or(0),
+            next_poll_at: repositories
+                .iter()
+                .map(|repository| repository.next_eligible_at)
+                .min(),
+            repositories,
+        }
+    }
+
+    async fn trigger(&self) -> bool {
+        let already_pending = {
+            let mut runtime = self.runtime.lock().await;
+            let already_pending = runtime.pending_manual;
+            runtime.pending_manual = true;
+            already_pending
+        };
+        self.notify.notify_one();
+        already_pending
+    }
+}
+
+impl PolledRepository {
+    fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
+async fn api_github_poll_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.github_poller.status().await)
+}
+
+async fn api_github_poll_trigger(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.github_poller.config.repositories.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!(ApiError::new("github polling is disabled"))),
+        );
+    }
+    let already_pending = state.github_poller.trigger().await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!(GitHubPollTriggerResponse {
+            status: "requested",
+            already_pending,
+        })),
+    )
+}
+
+async fn run_github_poller(
+    state: Arc<AppState>,
+    client: GitHubClient,
+    controller: GitHubPollController,
+) {
+    loop {
+        let wait = {
+            let runtime = controller.runtime.lock().await;
+            runtime
+                .repositories
+                .values()
+                .map(|repository| {
+                    repository
+                        .next_eligible
+                        .saturating_duration_since(Instant::now())
+                })
+                .min()
+                .unwrap_or(controller.config.interval)
+        };
+        if !wait.is_zero() {
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = controller.notify.notified() => {}
+            }
+        }
+
+        let eligible = {
+            let mut runtime = controller.runtime.lock().await;
+            let now = Instant::now();
+            let eligible = controller
+                .config
+                .repositories
+                .iter()
+                .filter(|repository| {
+                    runtime.repositories[&repository.full_name()].next_eligible <= now
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !eligible.is_empty() {
+                runtime.running = true;
+                runtime.pending_manual = false;
+                runtime.last_started_at = Some(Utc::now());
+            }
+            eligible
+        };
+        if eligible.is_empty() {
+            continue;
+        }
+
+        let mut cycle_errors = Vec::new();
+        for repository in eligible {
+            let full_name = repository.full_name();
+            let etag = {
+                controller.runtime.lock().await.repositories[&full_name]
+                    .etag
+                    .clone()
+            };
+            let result = tokio::time::timeout(
+                GITHUB_POLL_REPOSITORY_TIMEOUT,
+                poll_github_repository(
+                    &state,
+                    &client,
+                    &controller.config,
+                    &repository,
+                    etag.as_deref(),
+                ),
+            )
+            .await;
+            let completed_at = Utc::now();
+            let mut runtime = controller.runtime.lock().await;
+            let repository_runtime = runtime
+                .repositories
+                .get_mut(&full_name)
+                .expect("configured polling repository has runtime state");
+            repository_runtime.last_polled_at = Some(completed_at);
+            match result {
+                Ok(Ok(outcome)) => {
+                    repository_runtime.etag = outcome.etag;
+                    repository_runtime.server_interval = outcome
+                        .server_interval
+                        .or(repository_runtime.server_interval);
+                    repository_runtime.last_success_at = Some(completed_at);
+                    repository_runtime.last_error = None;
+                    repository_runtime.consecutive_failures = 0;
+                    let delay = repository_runtime
+                        .server_interval
+                        .unwrap_or_default()
+                        .max(controller.config.interval);
+                    schedule_repository(repository_runtime, delay, completed_at);
+                }
+                Ok(Err(error)) => {
+                    let error_text = error.to_string();
+                    repository_runtime.consecutive_failures =
+                        repository_runtime.consecutive_failures.saturating_add(1);
+                    repository_runtime.last_error = Some(error_text.clone());
+                    let delay = error
+                        .downcast_ref::<GitHubClientError>()
+                        .and_then(GitHubClientError::retry_after_seconds)
+                        .map(Duration::from_secs)
+                        .unwrap_or_else(|| {
+                            poll_backoff(
+                                controller.config.interval,
+                                repository_runtime.consecutive_failures,
+                            )
+                        })
+                        .max(repository_runtime.server_interval.unwrap_or_default());
+                    schedule_repository(repository_runtime, delay, completed_at);
+                    cycle_errors.push(format!("{full_name}: {error_text}"));
+                }
+                Err(_) => {
+                    repository_runtime.consecutive_failures =
+                        repository_runtime.consecutive_failures.saturating_add(1);
+                    let error_text = format!(
+                        "repository poll exceeded {} seconds",
+                        GITHUB_POLL_REPOSITORY_TIMEOUT.as_secs()
+                    );
+                    repository_runtime.last_error = Some(error_text.clone());
+                    let delay = poll_backoff(
+                        controller.config.interval,
+                        repository_runtime.consecutive_failures,
+                    )
+                    .max(repository_runtime.server_interval.unwrap_or_default());
+                    schedule_repository(repository_runtime, delay, completed_at);
+                    cycle_errors.push(format!("{full_name}: {error_text}"));
+                }
+            }
+        }
+        let mut runtime = controller.runtime.lock().await;
+        runtime.running = false;
+        runtime.last_completed_at = Some(Utc::now());
+        if cycle_errors.is_empty() {
+            runtime.last_success_at = Some(Utc::now());
+        }
+        runtime.last_error = (!cycle_errors.is_empty()).then(|| cycle_errors.join("; "));
+        if let Some(error) = &runtime.last_error {
+            tracing::error!(%error, "github event poll cycle failed");
+        }
+    }
+}
+
+fn schedule_repository(
+    repository: &mut GitHubRepositoryPollRuntime,
+    delay: Duration,
+    completed_at: DateTime<Utc>,
+) {
+    repository.next_eligible = Instant::now() + delay;
+    repository.next_eligible_at = completed_at
+        + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
+}
+
+fn poll_backoff(interval: Duration, consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(10);
+    interval
+        .saturating_mul(2_u32.saturating_pow(exponent))
+        .min(GITHUB_POLL_MAX_BACKOFF)
+}
+
+struct GitHubRepositoryPollOutcome {
+    etag: Option<String>,
+    server_interval: Option<Duration>,
 }
 
 fn parse_polled_repositories(value: &str) -> Result<Vec<PolledRepository>, String> {
@@ -236,82 +600,93 @@ fn parse_polled_repositories(value: &str) -> Result<Vec<PolledRepository>, Strin
         .collect()
 }
 
-async fn poll_github_events(
+async fn poll_github_repository(
     state: &AppState,
     client: &GitHubClient,
     config: &GitHubPollConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+    repository: &PolledRepository,
+    etag: Option<&str>,
+) -> Result<GitHubRepositoryPollOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let pool = state.pool.as_ref().ok_or("database is not configured")?;
-    for repository in &config.repositories {
-        let repository_payload = client
-            .repository(&repository.owner, &repository.name)
-            .await?;
-        let repository_input = polled_repository_input(
-            &repository_payload,
-            state
-                .github_auth
-                .as_ref()
-                .and_then(GitHubCredentialProvider::installation_id),
-        )?;
-        let repository_id = upsert_repository(pool, &repository_input).await?;
-        tracing::debug!(
-            repository_id,
-            repository = format_args!("{}/{}", repository_input.owner, repository_input.name),
-            "registered polled github repository"
-        );
-        let mut events = client
-            .repository_events(&repository.owner, &repository.name, config.max_pages)
-            .await?;
-        events.reverse();
+    let repository_payload = client
+        .repository(&repository.owner, &repository.name)
+        .await?;
+    let repository_input = polled_repository_input(
+        &repository_payload,
+        state
+            .github_auth
+            .as_ref()
+            .and_then(GitHubCredentialProvider::installation_id),
+    )?;
+    let repository_id = upsert_repository(pool, &repository_input).await?;
+    tracing::debug!(
+        repository_id,
+        repository = format_args!("{}/{}", repository_input.owner, repository_input.name),
+        "registered polled github repository"
+    );
+    let poll = client
+        .repository_events_conditional(&repository.owner, &repository.name, config.max_pages, etag)
+        .await?;
+    let outcome = GitHubRepositoryPollOutcome {
+        etag: poll.etag,
+        server_interval: poll.poll_interval_seconds.map(Duration::from_secs),
+    };
+    let mut events = poll.events;
+    events.reverse();
 
-        for mut event in events {
-            if event.get("type").and_then(Value::as_str) == Some("PullRequestEvent") {
-                let pull_request_number = event
-                    .pointer("/payload/number")
-                    .and_then(Value::as_u64)
-                    .ok_or("github pull request event is missing its number")?;
-                let pull_request = client
-                    .pull_request(&repository.owner, &repository.name, pull_request_number)
-                    .await?;
-                event["payload"]["pull_request"] = pull_request;
-            }
-            let Some(mut ingress) = github_poll_event_to_ingress(
-                &repository.owner,
-                &repository.name,
-                &repository_payload,
-                &event,
-            ) else {
-                continue;
-            };
-            if let Some(installation_id) = state
-                .github_auth
-                .as_ref()
-                .and_then(GitHubCredentialProvider::installation_id)
-                && let Value::Object(payload) = &mut ingress.payload
-            {
-                payload.insert("installation".into(), json!({"id": installation_id}));
-            }
-            let body = serde_json::to_vec(&ingress.payload)?;
-            match persist_github_webhook(
-                pool,
-                state,
-                ingress.event_name,
-                &ingress.delivery_id,
-                &body,
-            )
-            .await?
-            {
-                WebhookPersistOutcome::Queued(job) => tracing::info!(
-                    job_id = %job.id,
-                    event = ingress.event_name,
-                    delivery = ingress.delivery_id,
-                    "queued github polling job"
-                ),
-                WebhookPersistOutcome::Ignored | WebhookPersistOutcome::Duplicate => {}
-            }
+    for mut event in events {
+        let event_id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("github polling event is missing its id")?;
+        let delivery_id = format!(
+            "github-poll:{}/{}:{event_id}",
+            repository.owner, repository.name
+        );
+        if webhook_delivery_exists(pool, &delivery_id).await? {
+            continue;
+        }
+        if event.get("type").and_then(Value::as_str) == Some("PullRequestEvent") {
+            let pull_request_number = event
+                .pointer("/payload/number")
+                .and_then(Value::as_u64)
+                .ok_or("github pull request event is missing its number")?;
+            let pull_request = client
+                .pull_request(&repository.owner, &repository.name, pull_request_number)
+                .await?;
+            event["payload"]["pull_request"] = pull_request;
+        }
+        let Some(mut ingress) = github_poll_event_to_ingress(
+            &repository.owner,
+            &repository.name,
+            &repository_payload,
+            &event,
+        ) else {
+            continue;
+        };
+        if let Some(installation_id) = state
+            .github_auth
+            .as_ref()
+            .and_then(GitHubCredentialProvider::installation_id)
+            && let Value::Object(payload) = &mut ingress.payload
+        {
+            payload.insert("installation".into(), json!({"id": installation_id}));
+        }
+        let body = serde_json::to_vec(&ingress.payload)?;
+        match persist_github_webhook(pool, state, ingress.event_name, &ingress.delivery_id, &body)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+        {
+            WebhookPersistOutcome::Queued(job) => tracing::info!(
+                job_id = %job.id,
+                event = ingress.event_name,
+                delivery = ingress.delivery_id,
+                "queued github polling job"
+            ),
+            WebhookPersistOutcome::Ignored | WebhookPersistOutcome::Duplicate => {}
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn polled_repository_input(
@@ -809,14 +1184,13 @@ async fn github_webhook(
         .github_auth
         .as_ref()
         .and_then(GitHubCredentialProvider::installation_id)
+        && !webhook_installation_matches(expected, &body)
     {
-        if !webhook_installation_matches(expected, &body) {
-            let actual = serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|payload| payload.pointer("/installation/id").and_then(Value::as_u64));
-            tracing::warn!(expected, ?actual, "github webhook installation rejected");
-            return StatusCode::FORBIDDEN;
-        }
+        let actual = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|payload| payload.pointer("/installation/id").and_then(Value::as_u64));
+        tracing::warn!(expected, ?actual, "github webhook installation rejected");
+        return StatusCode::FORBIDDEN;
     }
 
     if !webhook_repository_allowed(&state.configured_repositories, &body) {
@@ -1236,7 +1610,7 @@ async fn persist_issue_webhook(
             ),
         )
         .await?;
-        return Ok(WebhookPersistOutcome::Queued(job));
+        return Ok(WebhookPersistOutcome::Queued(Box::new(job)));
     }
 
     let initial_role =
@@ -1255,7 +1629,7 @@ async fn persist_issue_webhook(
     )
     .await?;
 
-    Ok(WebhookPersistOutcome::Queued(job))
+    Ok(WebhookPersistOutcome::Queued(Box::new(job)))
 }
 
 fn is_projected_work_item(body: &str) -> bool {
@@ -1401,7 +1775,7 @@ async fn persist_pull_request_webhook(
     )
     .await?;
 
-    Ok(WebhookPersistOutcome::Queued(job))
+    Ok(WebhookPersistOutcome::Queued(Box::new(job)))
 }
 
 async fn persist_push_webhook(
@@ -1514,7 +1888,7 @@ async fn persist_push_webhook(
     }
 
     Ok(queued
-        .map(WebhookPersistOutcome::Queued)
+        .map(|job| WebhookPersistOutcome::Queued(Box::new(job)))
         .unwrap_or(WebhookPersistOutcome::Ignored))
 }
 
@@ -1952,7 +2326,7 @@ fn attach_pull_request_input(input: &mut Value, pull_request: Value) {
 enum WebhookPersistOutcome {
     Ignored,
     Duplicate,
-    Queued(JobRecord),
+    Queued(Box<JobRecord>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -2120,12 +2494,13 @@ impl ApiError {
 mod tests {
     use super::{
         AppState, GitHubActor, GitHubAppIdentity, GitHubComment, GitHubIssue, GitHubIssueWebhook,
-        GitHubLabel, GitHubOwner, GitHubRepository, HumanApprovalAction, JobRecord,
-        PolledRepository, authorize_engagement, can_retry_job, engagement_gate,
-        extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
-        issue_number_from_managed_branch, parse_human_approval_command, parse_polled_repositories,
-        permission_rank, polled_event_sender, polled_repository_input, should_queue_reviewer,
-        should_queue_triage, webhook_installation_matches, webhook_repository_allowed,
+        GitHubLabel, GitHubOwner, GitHubPollConfig, GitHubPollController, GitHubRepository,
+        HumanApprovalAction, JobRecord, PolledRepository, authorize_engagement, can_retry_job,
+        engagement_gate, extract_linked_issue_number, github_poll_event_to_ingress,
+        is_projected_work_item, issue_number_from_managed_branch, parse_human_approval_command,
+        parse_polled_repositories, permission_rank, poll_backoff, polled_event_sender,
+        polled_repository_input, should_queue_reviewer, should_queue_triage,
+        webhook_installation_matches, webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
     use donkeyspace_core::{EngagementGate, EngagementSelector, Policy};
@@ -2161,6 +2536,11 @@ mod tests {
             github_token_owner: Some("maintainer".into()),
             configured_repositories: Vec::new(),
             verification_cache: Arc::new(Mutex::new(HashMap::new())),
+            github_poller: GitHubPollController::new(GitHubPollConfig {
+                repositories: Vec::new(),
+                interval: std::time::Duration::from_secs(8),
+                max_pages: 2,
+            }),
         }
     }
 
@@ -2333,6 +2713,31 @@ mod tests {
         assert_eq!(repositories[0].name, "rtl");
         assert!(parse_polled_repositories("missing-owner-separator").is_err());
         assert!(parse_polled_repositories("acme/too/many").is_err());
+    }
+
+    #[test]
+    fn polling_backoff_is_exponential_and_bounded() {
+        let interval = std::time::Duration::from_secs(8);
+        assert_eq!(poll_backoff(interval, 1).as_secs(), 8);
+        assert_eq!(poll_backoff(interval, 2).as_secs(), 16);
+        assert_eq!(poll_backoff(interval, 10).as_secs(), 300);
+    }
+
+    #[tokio::test]
+    async fn manual_poll_requests_are_coalesced() {
+        let controller = GitHubPollController::new(GitHubPollConfig {
+            repositories: vec![PolledRepository {
+                owner: "acme".into(),
+                name: "rtl".into(),
+            }],
+            interval: std::time::Duration::from_secs(8),
+            max_pages: 2,
+        });
+        assert!(!controller.trigger().await);
+        assert!(controller.trigger().await);
+        let status = controller.status().await;
+        assert!(status.pending_manual);
+        assert_eq!(status.repositories.len(), 1);
     }
 
     #[test]

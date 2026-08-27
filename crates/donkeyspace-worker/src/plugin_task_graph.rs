@@ -66,12 +66,15 @@ impl TaskGraph {
                         .iter()
                         .map(|item| item.id.as_str())
                         .collect::<BTreeSet<_>>();
-                    required.extend(item.depends_on.iter().filter_map(|dependency| {
-                        active_items.contains(dependency.as_str()).then(|| TaskKey {
-                            work_item: Some(dependency.clone()),
-                            task: task_name.clone(),
-                        })
-                    }));
+                    required.extend(
+                        item.depends_on
+                            .iter()
+                            .filter(|dependency| active_items.contains(dependency.as_str()))
+                            .map(|dependency| TaskKey {
+                                work_item: Some(dependency.clone()),
+                                task: task_name.clone(),
+                            }),
+                    );
                 }
                 dependencies.insert(key, required);
             }

@@ -93,6 +93,30 @@ type AgentPublication = {
   last_error: string | null;
 };
 
+type GitHubPollRepositoryStatus = {
+  full_name: string;
+  server_interval_seconds: number | null;
+  next_eligible_at: string;
+  last_polled_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  consecutive_failures: number;
+};
+
+type GitHubPollStatus = {
+  enabled: boolean;
+  running: boolean;
+  pending_manual: boolean;
+  configured_interval_seconds: number;
+  last_started_at: string | null;
+  last_completed_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  consecutive_failures: number;
+  next_poll_at: string | null;
+  repositories: GitHubPollRepositoryStatus[];
+};
+
 const placeholderRuns: Run[] = [
   {
     id: "run_queued",
@@ -167,6 +191,22 @@ async function retryPublication(id: number): Promise<void> {
   }
 }
 
+async function fetchGitHubPollStatus(): Promise<GitHubPollStatus> {
+  const response = await fetch("/api/github-poll/status");
+  if (!response.ok) {
+    throw new Error(`Failed to load GitHub polling status: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function triggerGitHubPoll(): Promise<void> {
+  const response = await fetch("/api/github-poll/trigger", { method: "POST" });
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    throw new Error(error?.error ?? `Failed to request GitHub poll: ${response.status}`);
+  }
+}
+
 export function App() {
   const facadeQuery = useQuery({
     queryKey: ["facade"],
@@ -193,6 +233,12 @@ export function App() {
     queryKey: ["outbound-actions"],
     queryFn: fetchOutboundActions,
     refetchInterval: 10_000,
+    retry: 1
+  });
+  const pollQuery = useQuery({
+    queryKey: ["github-poll-status"],
+    queryFn: fetchGitHubPollStatus,
+    refetchInterval: 5_000,
     retry: 1
   });
   const runs = runsQuery.data ?? placeholderRuns;
@@ -233,6 +279,8 @@ export function App() {
           <strong>{pendingActions}</strong>
         </div>
       </section>
+
+      <GitHubPollingPanel status={pollQuery.data} unavailable={pollQuery.isError} />
 
       <section className="run-panel">
         <div className="panel-header">
@@ -281,6 +329,92 @@ export function App() {
         </div>
       </section>
     </main>
+  );
+}
+
+function GitHubPollingPanel({
+  status,
+  unavailable
+}: {
+  status: GitHubPollStatus | undefined;
+  unavailable: boolean;
+}) {
+  const queryClient = useQueryClient();
+  const triggerMutation = useMutation({
+    mutationFn: triggerGitHubPoll,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["github-poll-status"] });
+    }
+  });
+  const state = unavailable
+    ? "Status unavailable"
+    : status?.running
+      ? "Polling GitHub"
+      : status?.pending_manual
+        ? "Poll requested"
+        : status?.enabled
+          ? "Polling enabled"
+          : "Polling disabled";
+
+  return (
+    <section className="run-panel polling-panel">
+      <div className="panel-header">
+        <div>
+          <h2>GitHub polling</h2>
+          <span>{state}</span>
+        </div>
+        <button
+          className="retry-button"
+          disabled={!status?.enabled || triggerMutation.isPending}
+          onClick={() => triggerMutation.mutate()}
+          type="button"
+        >
+          {triggerMutation.isPending ? "Requesting…" : "Poll now"}
+        </button>
+      </div>
+      {status ? (
+        <div className="polling-status">
+          <dl>
+            <div>
+              <dt>Configured</dt>
+              <dd>{status.configured_interval_seconds}s</dd>
+            </div>
+            <div>
+              <dt>Last success</dt>
+              <dd>{formatTimestamp(status.last_success_at)}</dd>
+            </div>
+            <div>
+              <dt>Next eligible</dt>
+              <dd>{formatTimestamp(status.next_poll_at)}</dd>
+            </div>
+            <div>
+              <dt>Failures</dt>
+              <dd>{status.consecutive_failures}</dd>
+            </div>
+          </dl>
+          {status.repositories.map((repository) => (
+            <div className="polling-repository" key={repository.full_name}>
+              <strong>{repository.full_name}</strong>
+              <span>
+                GitHub minimum: {repository.server_interval_seconds ?? "unknown"}s · next:{" "}
+                {formatTimestamp(repository.next_eligible_at)}
+              </span>
+              {repository.last_error ? <p>{repository.last_error}</p> : null}
+            </div>
+          ))}
+          {status.last_error ? <p className="polling-error">{status.last_error}</p> : null}
+        </div>
+      ) : (
+        <div className="empty-state">Polling status is unavailable.</div>
+      )}
+      {triggerMutation.isError ? (
+        <p className="retry-status" role="status">
+          {triggerMutation.error instanceof Error
+            ? triggerMutation.error.message
+            : "Failed to request GitHub poll"}
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -488,4 +622,15 @@ function formatCommand(command: string[]): string {
 
 function shortJobId(id: string): string {
   return id.length > 8 ? `${id.slice(0, 8)}…` : id;
+}
+
+function formatTimestamp(value: string | null): string {
+  if (!value) {
+    return "not yet";
+  }
+  return new Date(value).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
 }

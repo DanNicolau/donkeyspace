@@ -224,6 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+// The worker loop passes one cohesive runtime context assembled at startup.
+#[allow(clippy::too_many_arguments)]
 async fn poll_once(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
@@ -485,6 +487,8 @@ async fn reconcile_pr_repair_jobs(
     Ok(())
 }
 
+// Keep the GitHub pull-request fields explicit at this serialization boundary.
+#[allow(clippy::too_many_arguments)]
 fn attach_repair_pull_request_input(
     input: &mut Value,
     pr_number: i64,
@@ -2826,7 +2830,7 @@ fn conventional_commit_title(input: &Value, changed_files: &[String]) -> String 
     )
     .to_ascii_lowercase();
 
-    if changed_files.iter().all(is_documentation_path) {
+    if changed_files.iter().all(|path| is_documentation_path(path)) {
         if changed_files.iter().any(|path| {
             path.eq_ignore_ascii_case("README.md") || path.eq_ignore_ascii_case("README")
         }) {
@@ -2852,7 +2856,7 @@ fn conventional_commit_title(input: &Value, changed_files: &[String]) -> String 
     format!("chore: implement issue #{issue_number}")
 }
 
-fn is_documentation_path(path: &String) -> bool {
+fn is_documentation_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower == "readme"
         || lower.starts_with("readme.")
@@ -3496,6 +3500,8 @@ struct UpsertCommentPayload {
     body: String,
 }
 
+// Runtime entrypoint helpers remain below the large colocated test module.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::{
