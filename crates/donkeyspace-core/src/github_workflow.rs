@@ -27,7 +27,6 @@ pub fn triage_github_issue_actions(
         return Vec::new();
     };
 
-    let current_labels = issue_labels(input);
     let mut actions = Vec::new();
 
     if let Some(target_label) = policy.workflow.state_labels.get(target_state.as_str()) {
@@ -51,18 +50,20 @@ pub fn triage_github_issue_actions(
             });
         }
 
-        if !current_labels.iter().any(|label| label == target_label) {
-            actions.push(GitHubIssueAction {
-                action_type: "issue.add_label".to_string(),
-                payload: serde_json::json!({
-                    "owner": owner,
-                    "repo": repo,
-                    "issue_number": issue_number,
-                    "label": target_label,
-                    "state": target_state.as_str(),
-                }),
-            });
-        }
+        // GitHub events are snapshots and can be stale by the time an async
+        // workflow transition is published. Adding an existing label is
+        // idempotent, so always re-apply the desired label after removing all
+        // stale state labels to make the issue converge on the target state.
+        actions.push(GitHubIssueAction {
+            action_type: "issue.add_label".to_string(),
+            payload: serde_json::json!({
+                "owner": owner,
+                "repo": repo,
+                "issue_number": issue_number,
+                "label": target_label,
+                "state": target_state.as_str(),
+            }),
+        });
     }
 
     if let Some(body) = triage_comment_body(policy, result, target_state) {
@@ -151,17 +152,6 @@ fn workflow_label_text(state: WorkflowState) -> &'static str {
         WorkflowState::NeedsHuman => "ai:needs-human",
         WorkflowState::Blocked => "ai:blocked",
     }
-}
-
-fn issue_labels(input: &Value) -> Vec<String> {
-    input
-        .pointer("/issue/labels")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|label| label.pointer("/name").and_then(Value::as_str))
-        .map(ToString::to_string)
-        .collect()
 }
 
 #[cfg(test)]
@@ -255,6 +245,40 @@ mod tests {
         );
         assert_eq!(actions[1].action_type, "issue.add_label");
         assert_eq!(actions[1].payload["label"], "ai:needs-info");
+    }
+
+    #[test]
+    fn target_label_is_reapplied_when_event_snapshot_already_contains_it() {
+        let result = RunResult {
+            outcome: Outcome::NeedsHuman,
+            summary: "Approval required.".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: Some("Approve the checkpoint.".to_string()),
+            blocked_reason: None,
+        };
+        let actions = triage_github_issue_actions(
+            &policy(),
+            &json!({
+                "repository": {
+                    "name": "repo",
+                    "owner": {"login": "owner"}
+                },
+                "issue": {
+                    "number": 42,
+                    "labels": [{"name": "ai:needs-human"}]
+                }
+            }),
+            &result,
+            WorkflowState::NeedsHuman,
+        );
+
+        assert_eq!(actions[0].action_type, "issue.remove_labels");
+        assert_eq!(actions[1].action_type, "issue.add_label");
+        assert_eq!(actions[1].payload["label"], "ai:needs-human");
     }
 
     #[test]

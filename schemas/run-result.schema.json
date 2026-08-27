@@ -127,8 +127,7 @@
       "items": {
         "type": "string",
         "minLength": 1
-      },
-      "uniqueItems": true
+      }
     },
     "work_items": {
       "type": [
@@ -139,8 +138,7 @@
         "type": "string",
         "minLength": 1
       },
-      "minItems": 1,
-      "uniqueItems": true
+      "minItems": 1
     },
     "handoff": {
       "type": [

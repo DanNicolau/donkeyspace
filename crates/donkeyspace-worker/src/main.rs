@@ -836,30 +836,6 @@ async fn execute_developer_job(
         }
     }
 
-    let repository_context = match build_repository_context(
-        &running_job.input,
-        running_job.id,
-        github_token,
-        repo_context_config,
-    )
-    .await
-    {
-        Ok(context) => context,
-        Err(error) => {
-            fail_role_job(
-                pool,
-                &running_job,
-                "Repository checkout context failed.",
-                &error.to_string(),
-                "implementation execution failed",
-            )
-            .await?;
-            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
-            tracing::warn!(job_id = %running_job.id, "implementation repository context failed");
-            return Ok(());
-        }
-    };
-
     if let Some(workflow_item_id) = running_job.workflow_item_id {
         update_workflow_item_state(pool, workflow_item_id, WorkflowState::InProgress.as_str())
             .await?;
@@ -888,13 +864,17 @@ async fn execute_developer_job(
             human_review_reason: None,
             blocked_reason: None,
         };
+        let github_client = github_token
+            .filter(|token| !token.trim().is_empty())
+            .map(configured_github_client)
+            .transpose()?;
         for action in triage_github_issue_actions(
             policy,
             &running_job.input,
             &state_result,
             WorkflowState::InProgress,
         ) {
-            create_outbound_action(
+            let outbound_action = create_outbound_action(
                 pool,
                 &OutboundActionInput {
                     workflow_item_id,
@@ -905,8 +885,36 @@ async fn execute_developer_job(
                 },
             )
             .await?;
+
+            if let Some(client) = &github_client {
+                process_outbound_action(pool, client, &outbound_action).await?;
+            }
         }
     }
+
+    let repository_context = match build_repository_context(
+        &running_job.input,
+        running_job.id,
+        github_token,
+        repo_context_config,
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            fail_role_job(
+                pool,
+                &running_job,
+                "Repository checkout context failed.",
+                &error.to_string(),
+                "implementation execution failed",
+            )
+            .await?;
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
+            tracing::warn!(job_id = %running_job.id, "implementation repository context failed");
+            return Ok(());
+        }
+    };
 
     let enriched_input =
         enrich_input_with_repository_context(&running_job.input, repository_context.clone());
@@ -3382,26 +3390,36 @@ async fn process_outbound_actions(
     client: &GitHubClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for action in list_pending_outbound_actions(pool, 20).await? {
-        match execute_outbound_action(client, &action).await {
-            Ok(provider_resource_id) => {
-                mark_outbound_action_completed(pool, action.id, provider_resource_id.as_deref())
-                    .await?;
-                tracing::info!(
-                    action_id = action.id,
-                    action_type = action.action_type,
-                    "outbound github action completed"
-                );
-            }
-            Err(error) => {
-                let error = error.to_string();
-                mark_outbound_action_failed(pool, action.id, &error).await?;
-                tracing::warn!(
-                    action_id = action.id,
-                    action_type = action.action_type,
-                    %error,
-                    "outbound github action failed"
-                );
-            }
+        process_outbound_action(pool, client, &action).await?;
+    }
+
+    Ok(())
+}
+
+async fn process_outbound_action(
+    pool: &donkeyspace_db::PgPool,
+    client: &GitHubClient,
+    action: &OutboundActionRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match execute_outbound_action(client, action).await {
+        Ok(provider_resource_id) => {
+            mark_outbound_action_completed(pool, action.id, provider_resource_id.as_deref())
+                .await?;
+            tracing::info!(
+                action_id = action.id,
+                action_type = action.action_type,
+                "outbound github action completed"
+            );
+        }
+        Err(error) => {
+            let error = error.to_string();
+            mark_outbound_action_failed(pool, action.id, &error).await?;
+            tracing::warn!(
+                action_id = action.id,
+                action_type = action.action_type,
+                %error,
+                "outbound github action failed"
+            );
         }
     }
 
