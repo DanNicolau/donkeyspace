@@ -767,10 +767,7 @@ impl GitHubClient {
                     format!("/repos/{owner}/{repo}/issues"),
                     Some(&serde_json::json!({
                         "title": format!("[block] {}", item.id),
-                        "body": format!(
-                            "<!-- donkeyspace-work-item -->\n\nParent lifecycle issue: #{parent_issue_number}\n\nSpecification path: `{}`\n\n{}",
-                            item.spec, item.body
-                        ),
+                        "body": projected_work_item_body(parent_issue_number, item),
                     })),
                 )
                 .await?;
@@ -812,6 +809,26 @@ impl GitHubClient {
             .into_iter()
             .map(|(key, (id, number))| (key, GitHubProjectedIssue { id, number }))
             .collect())
+    }
+
+    pub async fn update_projected_work_item(
+        &self,
+        owner: &str,
+        repo: &str,
+        parent_issue_number: i64,
+        issue_number: i64,
+        item: &GitHubWorkItem,
+    ) -> Result<(), GitHubClientError> {
+        let title = format!("[block] {}", item.id);
+        let body = projected_work_item_body(parent_issue_number, item);
+        self.client
+            .issues(owner, repo)
+            .update(issue_number as u64)
+            .title(&title)
+            .body(&body)
+            .send()
+            .await?;
+        Ok(())
     }
 
     pub async fn close_issue(
@@ -1039,6 +1056,13 @@ fn github_error_status(error: &octocrab::Error) -> Option<u16> {
     }
 }
 
+fn projected_work_item_body(parent_issue_number: i64, item: &GitHubWorkItem) -> String {
+    format!(
+        "<!-- donkeyspace-work-item -->\n\nParent lifecycle issue: #{parent_issue_number}\n\nSpecification path: `{}`\n\n{}",
+        item.spec, item.body
+    )
+}
+
 fn workflow_label_color(label: &str) -> &'static str {
     match label {
         "ai:needs-info" => "d4a72c",
@@ -1054,9 +1078,9 @@ fn workflow_label_color(label: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubAuthConfig, GitHubAuthMode, GitHubClient, SignatureError, parse_repository,
-        select_installation_id, validate_installation_response,
-        validate_members_permission_response, verify_signature,
+        GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubWorkItem, SignatureError,
+        parse_repository, projected_work_item_body, select_installation_id,
+        validate_installation_response, validate_members_permission_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
     use http_body_util::Full;
@@ -1077,6 +1101,24 @@ mod tests {
     #[test]
     fn rejects_missing_signature() {
         assert!(verify_signature("secret", b"{}", None).is_err());
+    }
+
+    #[test]
+    fn projected_work_item_body_contains_current_specification() {
+        let body = projected_work_item_body(
+            58,
+            &GitHubWorkItem {
+                id: "divider".into(),
+                spec: "docs/divider/spec.md".into(),
+                body: "Specification version: 1.1.0\nSigned division.".into(),
+                depends_on: Vec::new(),
+            },
+        );
+
+        assert!(body.contains("Parent lifecycle issue: #58"));
+        assert!(body.contains("Specification path: `docs/divider/spec.md`"));
+        assert!(body.contains("Specification version: 1.1.0"));
+        assert!(body.contains("Signed division."));
     }
 
     #[test]

@@ -27,6 +27,13 @@ type Run = {
         login?: string;
       };
     };
+    plugin_execution?: {
+      coordinator_run_id?: string;
+      task?: string;
+      work_item?: {
+        id?: string;
+      };
+    };
   };
   result: RunResult | null;
   created_at: string;
@@ -250,6 +257,11 @@ export function App() {
   const pendingActions = outboundActions.filter(
     (action) => action.status === "pending"
   ).length;
+  const coordinatorRunIds = new Set(
+    runs
+      .map((run) => run.input?.plugin_execution?.coordinator_run_id)
+      .filter((id): id is string => Boolean(id))
+  );
 
   return (
     <main className="app-shell">
@@ -289,7 +301,11 @@ export function App() {
         </div>
         <div className="run-list">
           {runs.map((run) => (
-            <RunRow key={run.id} run={run} />
+            <RunRow
+              isCoordinator={coordinatorRunIds.has(run.id)}
+              key={run.id}
+              run={run}
+            />
           ))}
         </div>
       </section>
@@ -507,7 +523,7 @@ function RunPublication({
   );
 }
 
-function RunRow({ run }: { run: Run }) {
+function RunRow({ run, isCoordinator }: { run: Run; isCoordinator: boolean }) {
   const queryClient = useQueryClient();
   const retryMutation = useMutation({
     mutationFn: retryRun,
@@ -522,6 +538,12 @@ function RunRow({ run }: { run: Run }) {
     run.status === "failed" &&
     run.result?.outcome !== "blocked" &&
     run.result?.outcome !== "needs_human";
+  const pluginExecution = run.input?.plugin_execution;
+  const runType = isCoordinator
+    ? "Lifecycle coordinator"
+    : pluginExecution
+      ? "Agent task"
+      : "Standalone job";
 
   return (
     <article className="run-row">
@@ -529,6 +551,7 @@ function RunRow({ run }: { run: Run }) {
         <h3>{runIssueTitle(run)}</h3>
         <div className="run-meta">
           <span>{run.id}</span>
+          <span>{runType}</span>
           {run.retry_of_job_id ? (
             <span>Retry of {shortJobId(run.retry_of_job_id)}</span>
           ) : null}
@@ -540,6 +563,12 @@ function RunRow({ run }: { run: Run }) {
               ? `Workflow item ${run.workflow_item_id}`
               : "No workflow item linked yet")}
         </p>
+        {isCoordinator ? (
+          <p>
+            This outcome is aggregate lifecycle state. Individual agent outcomes are shown on
+            their task rows.
+          </p>
+        ) : null}
         {run.result?.questions.length ? (
           <ul className="question-list">
             {run.result.questions.map((question) => (
@@ -552,9 +581,25 @@ function RunRow({ run }: { run: Run }) {
       <div className="run-sidecar">
         <dl>
           <div>
-            <dt>Role</dt>
+            <dt>Run type</dt>
+            <dd>{runType}</dd>
+          </div>
+          <div>
+            <dt>{isCoordinator ? "Initial role" : "Agent role"}</dt>
             <dd>{run.role}</dd>
           </div>
+          {pluginExecution?.task ? (
+            <div>
+              <dt>Task</dt>
+              <dd>{pluginExecution.task}</dd>
+            </div>
+          ) : null}
+          {pluginExecution?.work_item?.id ? (
+            <div>
+              <dt>Work item</dt>
+              <dd>{pluginExecution.work_item.id}</dd>
+            </div>
+          ) : null}
           <div>
             <dt>Status</dt>
             <dd>{run.status}</dd>
@@ -564,7 +609,7 @@ function RunRow({ run }: { run: Run }) {
             <dd>{run.lease_owner ?? "none"}</dd>
           </div>
           <div>
-            <dt>Outcome</dt>
+            <dt>{isCoordinator ? "Lifecycle outcome" : "Task outcome"}</dt>
             <dd>{run.result?.outcome ?? "pending"}</dd>
           </div>
         </dl>

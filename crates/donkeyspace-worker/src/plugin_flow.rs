@@ -773,7 +773,6 @@ async fn run_work_item_lifecycle(
         {
             let github_work_items = work_items
                 .iter()
-                .filter(|item| !projected_issues.contains_key(&item.id))
                 .map(|item| GitHubWorkItem {
                     id: item.id.clone(),
                     spec: item.spec.clone(),
@@ -784,6 +783,36 @@ async fn run_work_item_lifecycle(
                         .collect(),
                     depends_on: item.depends_on.clone(),
                 })
+                .collect::<Vec<_>>();
+
+            if rerun_start {
+                for item in &github_work_items {
+                    let Some(issue_number) = projected_issues.get(&item.id) else {
+                        continue;
+                    };
+                    if let Err(error) = github
+                        .update_projected_work_item(
+                            owner,
+                            repo,
+                            parent_issue_number,
+                            *issue_number,
+                            item,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            issue_number,
+                            work_item = item.id,
+                            "failed to update revised projected issue"
+                        );
+                    }
+                }
+            }
+
+            let github_work_items = github_work_items
+                .into_iter()
+                .filter(|item| !projected_issues.contains_key(&item.id))
                 .collect::<Vec<_>>();
             match github
                 .project_work_items(owner, repo, parent_issue_number, &github_work_items)
