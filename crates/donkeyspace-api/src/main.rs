@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -17,8 +17,9 @@ use donkeyspace_db::{
     connect, create_job, create_retry_job, get_job, get_workflow_item_by_issue_number,
     get_workflow_item_state, github_managed_resource_exists, latest_workflow_job_input,
     list_agent_publications_for_run, list_job_command_results, list_job_outbound_actions,
-    list_job_transitions, list_jobs, list_open_managed_pull_requests_for_base,
-    list_recent_engagement_decisions, list_recent_outbound_actions,
+    list_job_transitions, list_jobs, list_jobs_for_repository,
+    list_open_managed_pull_requests_for_base, list_recent_engagement_decisions,
+    list_recent_outbound_actions, list_recent_outbound_actions_for_repository,
     pending_outbound_comment_exists, record_engagement_decision, record_state_transition,
     record_webhook_delivery, repair_job_exists_for_pr_base, resume_latest_paused_job,
     retry_agent_publication, reviewer_job_exists_for_pr_head, upsert_pull_request,
@@ -63,6 +64,11 @@ struct FacadeResponse {
     tagline: String,
     issue_command: String,
     branch_prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryQuery {
+    repository: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/facade", get(api_facade))
+        .route("/api/repositories", get(api_repositories))
         .route("/api/runs", get(api_runs))
         .route("/api/outbound-actions", get(api_outbound_actions))
         .route("/api/engagement-decisions", get(api_engagement_decisions))
@@ -600,6 +607,21 @@ fn parse_polled_repositories(value: &str) -> Result<Vec<PolledRepository>, Strin
         .collect()
 }
 
+fn parse_repository_query(value: Option<&str>) -> Result<Option<(String, String)>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let repositories = parse_polled_repositories(value)?;
+    if repositories.len() != 1 {
+        return Err("repository filter must select exactly one owner/name".into());
+    }
+    let repository = repositories
+        .into_iter()
+        .next()
+        .expect("checked one repository");
+    Ok(Some((repository.owner, repository.name)))
+}
+
 async fn poll_github_repository(
     state: &AppState,
     client: &GitHubClient,
@@ -845,7 +867,21 @@ async fn api_facade(State(state): State<Arc<AppState>>) -> Json<FacadeResponse> 
     })
 }
 
-async fn api_runs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn api_repositories(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+    let mut repositories = state
+        .configured_repositories
+        .iter()
+        .map(PolledRepository::full_name)
+        .collect::<Vec<_>>();
+    repositories.sort_unstable_by_key(|repository| repository.to_ascii_lowercase());
+    repositories.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Json(repositories)
+}
+
+async fn api_runs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RepositoryQuery>,
+) -> impl IntoResponse {
     let Some(pool) = &state.pool else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -854,7 +890,15 @@ async fn api_runs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     };
 
-    match list_jobs(pool, 50).await {
+    let repository = match parse_repository_query(query.repository.as_deref()) {
+        Ok(repository) => repository,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(ApiError::new(error))).into_response(),
+    };
+    let jobs = match repository {
+        Some((owner, repo)) => list_jobs_for_repository(pool, &owner, &repo, 50).await,
+        None => list_jobs(pool, 50).await,
+    };
+    match jobs {
         Ok(jobs) => Json(jobs).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to list jobs");
@@ -953,7 +997,10 @@ async fn api_run(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> im
     }
 }
 
-async fn api_outbound_actions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn api_outbound_actions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RepositoryQuery>,
+) -> impl IntoResponse {
     let Some(pool) = &state.pool else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -962,7 +1009,17 @@ async fn api_outbound_actions(State(state): State<Arc<AppState>>) -> impl IntoRe
             .into_response();
     };
 
-    match list_recent_outbound_actions(pool, 50).await {
+    let repository = match parse_repository_query(query.repository.as_deref()) {
+        Ok(repository) => repository,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(ApiError::new(error))).into_response(),
+    };
+    let actions = match repository {
+        Some((owner, repo)) => {
+            list_recent_outbound_actions_for_repository(pool, &owner, &repo, 50).await
+        }
+        None => list_recent_outbound_actions(pool, 50).await,
+    };
+    match actions {
         Ok(actions) => Json(actions).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to list outbound actions");
@@ -2498,8 +2555,8 @@ mod tests {
         HumanApprovalAction, JobRecord, PolledRepository, authorize_engagement, can_retry_job,
         engagement_gate, extract_linked_issue_number, github_poll_event_to_ingress,
         is_projected_work_item, issue_number_from_managed_branch, parse_human_approval_command,
-        parse_polled_repositories, permission_rank, poll_backoff, polled_event_sender,
-        polled_repository_input, should_queue_reviewer, should_queue_triage,
+        parse_polled_repositories, parse_repository_query, permission_rank, poll_backoff,
+        polled_event_sender, polled_repository_input, should_queue_reviewer, should_queue_triage,
         webhook_installation_matches, webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
@@ -2713,6 +2770,18 @@ mod tests {
         assert_eq!(repositories[0].name, "rtl");
         assert!(parse_polled_repositories("missing-owner-separator").is_err());
         assert!(parse_polled_repositories("acme/too/many").is_err());
+    }
+
+    #[test]
+    fn repository_query_selects_zero_or_one_repository() {
+        assert_eq!(parse_repository_query(None).unwrap(), None);
+        assert_eq!(parse_repository_query(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_repository_query(Some("acme/rtl")).unwrap(),
+            Some(("acme".into(), "rtl".into()))
+        );
+        assert!(parse_repository_query(Some("acme/rtl,acme/dv")).is_err());
+        assert!(parse_repository_query(Some("invalid")).is_err());
     }
 
     #[test]

@@ -1330,6 +1330,31 @@ pub async fn list_recent_outbound_actions(
     Ok(actions)
 }
 
+pub async fn list_recent_outbound_actions_for_repository(
+    pool: &PgPool,
+    owner: &str,
+    repo: &str,
+    limit: i64,
+) -> Result<Vec<OutboundActionRecord>, DbError> {
+    let actions = sqlx::query_as::<_, OutboundActionRecord>(
+        r#"
+        SELECT *
+        FROM outbound_actions
+        WHERE lower(payload ->> 'owner') = lower($1)
+          AND lower(payload ->> 'repo') = lower($2)
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(actions)
+}
+
 pub async fn list_pending_outbound_actions(
     pool: &PgPool,
     limit: i64,
@@ -1447,6 +1472,31 @@ pub async fn list_jobs(pool: &PgPool, limit: i64) -> Result<Vec<JobRecord>, DbEr
         LIMIT $1
         "#,
     )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(jobs)
+}
+
+pub async fn list_jobs_for_repository(
+    pool: &PgPool,
+    owner: &str,
+    repo: &str,
+    limit: i64,
+) -> Result<Vec<JobRecord>, DbError> {
+    let jobs = sqlx::query_as::<_, JobRecord>(
+        r#"
+        SELECT *
+        FROM jobs
+        WHERE lower(input #>> '{repository,owner,login}') = lower($1)
+          AND lower(input #>> '{repository,name}') = lower($2)
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(owner)
+    .bind(repo)
     .bind(limit)
     .fetch_all(pool)
     .await?;

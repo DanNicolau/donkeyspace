@@ -54,6 +54,38 @@ a {
   margin-top: 6px;
 }
 
+.topbar-actions {
+  align-items: center;
+  display: flex;
+  gap: 18px;
+}
+
+.repository-picker {
+  display: grid;
+  gap: 5px;
+}
+
+.repository-picker span {
+  color: #68736a;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.repository-picker select {
+  background: #ffffff;
+  border: 1px solid #cbd2c7;
+  border-radius: 7px;
+  color: #17201a;
+  font: inherit;
+  min-width: 260px;
+  padding: 9px 34px 9px 11px;
+}
+
+.repository-picker select:focus-visible {
+  outline: 3px solid rgba(37, 92, 72, 0.25);
+  outline-offset: 1px;
+}
+
 .summary-grid {
   display: grid;
   gap: 12px;
@@ -333,6 +365,16 @@ a {
 
   .topbar {
     display: grid;
+  }
+
+  .topbar-actions {
+    align-items: stretch;
+    display: grid;
+  }
+
+  .repository-picker select {
+    min-width: 0;
+    width: 100%;
   }
 
   .summary-grid,

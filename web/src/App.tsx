@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type Facade = {
   display_name: string;
@@ -124,22 +124,14 @@ type GitHubPollStatus = {
   repositories: GitHubPollRepositoryStatus[];
 };
 
-const placeholderRuns: Run[] = [
-  {
-    id: "run_queued",
-    workflow_item_id: null,
-    retry_of_job_id: null,
-    role: "triage",
-    status: "queued",
-    lease_owner: null,
-    result: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  }
-];
+const repositoryStorageKey = "donkeyspace.dashboard.repository";
 
-async function fetchRuns(): Promise<Run[]> {
-  const response = await fetch("/api/runs");
+function repositoryQuery(repository: string): string {
+  return repository ? `?repository=${encodeURIComponent(repository)}` : "";
+}
+
+async function fetchRuns(repository: string): Promise<Run[]> {
+  const response = await fetch(`/api/runs${repositoryQuery(repository)}`);
 
   if (!response.ok) {
     throw new Error(`Failed to load runs: ${response.status}`);
@@ -156,8 +148,16 @@ async function fetchFacade(): Promise<Facade> {
   return response.json();
 }
 
-async function fetchOutboundActions(): Promise<OutboundAction[]> {
-  const response = await fetch("/api/outbound-actions");
+async function fetchRepositories(): Promise<string[]> {
+  const response = await fetch("/api/repositories");
+  if (!response.ok) {
+    throw new Error(`Failed to load repositories: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function fetchOutboundActions(repository: string): Promise<OutboundAction[]> {
+  const response = await fetch(`/api/outbound-actions${repositoryQuery(repository)}`);
 
   if (!response.ok) {
     throw new Error(`Failed to load outbound actions: ${response.status}`);
@@ -215,6 +215,13 @@ async function triggerGitHubPoll(): Promise<void> {
 }
 
 export function App() {
+  const [selectedRepository, setSelectedRepository] = useState(() => {
+    try {
+      return window.localStorage.getItem(repositoryStorageKey) ?? "";
+    } catch {
+      return "";
+    }
+  });
   const facadeQuery = useQuery({
     queryKey: ["facade"],
     queryFn: fetchFacade,
@@ -231,14 +238,14 @@ export function App() {
     document.title = facade.display_name;
   }, [facade.display_name]);
   const runsQuery = useQuery({
-    queryKey: ["runs"],
-    queryFn: fetchRuns,
+    queryKey: ["runs", selectedRepository],
+    queryFn: () => fetchRuns(selectedRepository),
     refetchInterval: 10_000,
     retry: 1
   });
   const actionsQuery = useQuery({
-    queryKey: ["outbound-actions"],
-    queryFn: fetchOutboundActions,
+    queryKey: ["outbound-actions", selectedRepository],
+    queryFn: () => fetchOutboundActions(selectedRepository),
     refetchInterval: 10_000,
     retry: 1
   });
@@ -248,7 +255,43 @@ export function App() {
     refetchInterval: 5_000,
     retry: 1
   });
-  const runs = runsQuery.data ?? placeholderRuns;
+  const repositoriesQuery = useQuery({
+    queryKey: ["repositories"],
+    queryFn: fetchRepositories,
+    staleTime: 60_000,
+    retry: 1
+  });
+  const repositories = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...(repositoriesQuery.data ?? []),
+          ...(pollQuery.data?.repositories.map((repository) => repository.full_name) ?? [])
+        ])
+      ).sort((left, right) => left.localeCompare(right)),
+    [pollQuery.data?.repositories, repositoriesQuery.data]
+  );
+  useEffect(() => {
+    if (
+      selectedRepository &&
+      (repositoriesQuery.isSuccess || pollQuery.isSuccess) &&
+      !repositories.includes(selectedRepository)
+    ) {
+      setSelectedRepository("");
+    }
+  }, [pollQuery.isSuccess, repositories, repositoriesQuery.isSuccess, selectedRepository]);
+  useEffect(() => {
+    try {
+      if (selectedRepository) {
+        window.localStorage.setItem(repositoryStorageKey, selectedRepository);
+      } else {
+        window.localStorage.removeItem(repositoryStorageKey);
+      }
+    } catch {
+      // Storage can be unavailable in locked-down browser contexts.
+    }
+  }, [selectedRepository]);
+  const runs = runsQuery.data ?? [];
   const outboundActions = actionsQuery.data ?? [];
   const activeRuns = runs.filter((run) =>
     ["leased", "running"].includes(run.status)
@@ -270,7 +313,24 @@ export function App() {
           <h1>{facade.display_name}</h1>
           <p>{facade.tagline}</p>
         </div>
-        <a href="/healthz">API health</a>
+        <div className="topbar-actions">
+          <label className="repository-picker">
+            <span>Repository</span>
+            <select
+              aria-label="Dashboard repository"
+              onChange={(event) => setSelectedRepository(event.target.value)}
+              value={selectedRepository}
+            >
+              <option value="">All repositories</option>
+              {repositories.map((repository) => (
+                <option key={repository} value={repository}>
+                  {repository}
+                </option>
+              ))}
+            </select>
+          </label>
+          <a href="/healthz">API health</a>
+        </div>
       </header>
 
       <section className="summary-grid" aria-label="Run summary">
@@ -292,27 +352,43 @@ export function App() {
         </div>
       </section>
 
-      <GitHubPollingPanel status={pollQuery.data} unavailable={pollQuery.isError} />
+      <GitHubPollingPanel
+        repository={selectedRepository}
+        status={pollQuery.data}
+        unavailable={pollQuery.isError}
+      />
 
       <section className="run-panel">
         <div className="panel-header">
-          <h2>Runs</h2>
+          <div>
+            <h2>Runs</h2>
+            <span>{selectedRepository || "All repositories"}</span>
+          </div>
           <span>{runsQuery.isError ? "API unavailable" : "Live API"}</span>
         </div>
         <div className="run-list">
-          {runs.map((run) => (
-            <RunRow
-              isCoordinator={coordinatorRunIds.has(run.id)}
-              key={run.id}
-              run={run}
-            />
-          ))}
+          {runs.length ? (
+            runs.map((run) => (
+              <RunRow
+                isCoordinator={coordinatorRunIds.has(run.id)}
+                key={run.id}
+                run={run}
+              />
+            ))
+          ) : (
+            <div className="empty-state">
+              {runsQuery.isPending ? "Loading runs…" : "No runs for this repository yet."}
+            </div>
+          )}
         </div>
       </section>
 
       <section className="run-panel">
         <div className="panel-header">
-          <h2>GitHub action outbox</h2>
+          <div>
+            <h2>GitHub action outbox</h2>
+            <span>{selectedRepository || "All repositories"}</span>
+          </div>
           <span>{actionsQuery.isError ? "API unavailable" : "Pending writes"}</span>
         </div>
         <div className="action-list">
@@ -327,6 +403,10 @@ export function App() {
                   <div>
                     <dt>Status</dt>
                     <dd>{action.status}</dd>
+                  </div>
+                  <div>
+                    <dt>Repository</dt>
+                    <dd>{actionRepository(action) ?? "unknown"}</dd>
                   </div>
                   <div>
                     <dt>Issue</dt>
@@ -349,9 +429,11 @@ export function App() {
 }
 
 function GitHubPollingPanel({
+  repository,
   status,
   unavailable
 }: {
+  repository: string;
   status: GitHubPollStatus | undefined;
   unavailable: boolean;
 }) {
@@ -376,13 +458,26 @@ function GitHubPollingPanel({
         : status?.enabled
           ? "Polling enabled"
           : "Polling disabled";
+  const visibleRepositories = repository
+    ? status?.repositories.filter((item) => item.full_name === repository) ?? []
+    : status?.repositories ?? [];
+  const selectedStatus = repository ? visibleRepositories[0] : undefined;
+  const lastPoll = repository
+    ? selectedStatus?.last_polled_at ?? null
+    : status?.last_completed_at ?? null;
+  const nextPoll = repository
+    ? selectedStatus?.next_eligible_at ?? null
+    : status?.next_poll_at ?? null;
+  const failures = repository
+    ? selectedStatus?.consecutive_failures ?? 0
+    : status?.consecutive_failures ?? 0;
 
   return (
     <section className="run-panel polling-panel">
       <div className="panel-header">
         <div>
           <h2>GitHub polling</h2>
-          <span>{state}</span>
+          <span>{repository ? `${state} · ${repository}` : state}</span>
         </div>
         <button
           className="retry-button"
@@ -390,7 +485,11 @@ function GitHubPollingPanel({
           onClick={() => triggerMutation.mutate()}
           type="button"
         >
-          {triggerMutation.isPending ? "Requesting…" : "Poll now"}
+          {triggerMutation.isPending
+            ? "Requesting…"
+            : repository
+              ? "Poll all now"
+              : "Poll now"}
         </button>
       </div>
       {status ? (
@@ -402,28 +501,32 @@ function GitHubPollingPanel({
             </div>
             <div>
               <dt>Since last poll</dt>
-              <dd>{formatElapsed(status.last_completed_at, now)}</dd>
+              <dd>{formatElapsed(lastPoll, now)}</dd>
             </div>
             <div>
               <dt>Until next poll</dt>
-              <dd>{formatCountdown(status.next_poll_at, now)}</dd>
+              <dd>{formatCountdown(nextPoll, now)}</dd>
             </div>
             <div>
               <dt>Failures</dt>
-              <dd>{status.consecutive_failures}</dd>
+              <dd>{failures}</dd>
             </div>
           </dl>
-          {status.repositories.map((repository) => (
-            <div className="polling-repository" key={repository.full_name}>
-              <strong>{repository.full_name}</strong>
+          {visibleRepositories.map((item) => (
+            <div className="polling-repository" key={item.full_name}>
+              <strong>{item.full_name}</strong>
               <span>
-                GitHub minimum: {repository.server_interval_seconds ?? "unknown"}s · next in{" "}
-                {formatCountdown(repository.next_eligible_at, now)}
+                GitHub minimum: {item.server_interval_seconds ?? "unknown"}s · next in{" "}
+                {formatCountdown(item.next_eligible_at, now)}
               </span>
-              {repository.last_error ? <p>{repository.last_error}</p> : null}
+              {item.last_error ? <p>{item.last_error}</p> : null}
             </div>
           ))}
-          {status.last_error ? <p className="polling-error">{status.last_error}</p> : null}
+          {(repository ? selectedStatus?.last_error : status.last_error) ? (
+            <p className="polling-error">
+              {repository ? selectedStatus?.last_error : status.last_error}
+            </p>
+          ) : null}
         </div>
       ) : (
         <div className="empty-state">Polling status is unavailable.</div>
@@ -556,6 +659,7 @@ function RunRow({ run, isCoordinator }: { run: Run; isCoordinator: boolean }) {
         <h3>{runIssueTitle(run)}</h3>
         <div className="run-meta">
           <span>{run.id}</span>
+          {runRepository(run) ? <span>{runRepository(run)}</span> : null}
           <span>{runType}</span>
           {run.retry_of_job_id ? (
             <span>Retry of {shortJobId(run.retry_of_job_id)}</span>
@@ -660,6 +764,22 @@ function describeAction(action: OutboundAction): string {
   }
 
   return action.provider;
+}
+
+function actionRepository(action: OutboundAction): string | null {
+  return action.payload.owner && action.payload.repo
+    ? `${action.payload.owner}/${action.payload.repo}`
+    : null;
+}
+
+function runRepository(run: Run): string | null {
+  const repository = run.input?.repository;
+  if (repository?.full_name) {
+    return repository.full_name;
+  }
+  return repository?.owner?.login && repository.name
+    ? `${repository.owner.login}/${repository.name}`
+    : null;
 }
 
 function runIssueTitle(run: Run): string {
