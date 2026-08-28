@@ -480,6 +480,7 @@ async fn run_work_item_lifecycle(
                 let result = pending_approval_result(
                     &saved.pending_approvals,
                     &saved.projected_issues,
+                    &flow.start,
                     &format!("The approval command was not applied: {error}"),
                 );
                 saved.version = CHECKPOINT_VERSION;
@@ -539,6 +540,7 @@ async fn run_work_item_lifecycle(
             let result = pending_approval_result(
                 &saved.pending_approvals,
                 &saved.projected_issues,
+                &flow.start,
                 "Some approvals remain pending.",
             );
             saved.last_result = result.clone();
@@ -858,6 +860,7 @@ async fn run_work_item_lifecycle(
         let result = pending_approval_result(
             &pending,
             &projected_issues,
+            &flow.start,
             "The lifecycle start task completed successfully and requires approval before downstream work begins.",
         );
         write_lifecycle_checkpoint(
@@ -1259,8 +1262,12 @@ async fn run_work_item_lifecycle(
                             key: resume_target.clone(),
                             trigger: ApprovalTrigger::AgentRequested,
                         });
-                        let result =
-                            pending_approval_result(&required_approvals, &projected_issues, &lead);
+                        let result = pending_approval_result(
+                            &required_approvals,
+                            &projected_issues,
+                            &flow.start,
+                            &lead,
+                        );
                         write_lifecycle_checkpoint(
                             &checkpoint_path,
                             &LifecycleCheckpoint {
@@ -1346,8 +1353,12 @@ async fn run_work_item_lifecycle(
                         key: resume_target.clone(),
                         trigger: ApprovalTrigger::AgentRequested,
                     });
-                    let result =
-                        pending_approval_result(&required_approvals, &projected_issues, &lead);
+                    let result = pending_approval_result(
+                        &required_approvals,
+                        &projected_issues,
+                        &flow.start,
+                        &lead,
+                    );
                     write_lifecycle_checkpoint(
                         &checkpoint_path,
                         &LifecycleCheckpoint {
@@ -1434,6 +1445,7 @@ async fn run_work_item_lifecycle(
             let result = pending_approval_result(
                 &required_approvals,
                 &projected_issues,
+                &flow.start,
                 "The configured tasks completed successfully and require approval before their dependents can run.",
             );
             write_lifecycle_checkpoint(
@@ -1614,20 +1626,53 @@ fn select_pending_approvals(
 fn pending_approval_result(
     pending: &[PendingApproval],
     projected_issues: &BTreeMap<String, i64>,
+    start_task: &str,
     lead: &str,
 ) -> RunResult {
-    let targets = pending
+    let subjects = pending
         .iter()
-        .map(|approval| format!("- `{}`", approval_target(&approval.key)))
+        .map(|approval| {
+            let target = approval_target(&approval.key);
+            let artifact = match &approval.key.work_item {
+                Some(work_item) => format!(
+                    "the completed `{}` output for work item `{work_item}`",
+                    approval.key.task
+                ),
+                None if approval.key.task == start_task && !projected_issues.is_empty() => {
+                    "the proposed lifecycle plan and block specifications in the projected work-item issues listed below".to_string()
+                }
+                None => format!("the completed workflow-level `{}` output", approval.key.task),
+            };
+            let consequence = match approval.trigger {
+                ApprovalTrigger::Required => {
+                    "Approving accepts this output as the current checkpoint and authorizes its dependent agent tasks to run. Revising keeps those dependents blocked and reruns this target with your feedback."
+                }
+                ApprovalTrigger::AgentRequested => {
+                    "Approving authorizes this target to rerun from the preserved checkpoint without additional feedback. Revising reruns it with the feedback you provide."
+                }
+            };
+            format!("- `{target}`: Review {artifact}. {consequence}")
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    let review_issues = if projected_issues.is_empty() {
+    let include_all_issues = pending
+        .iter()
+        .any(|approval| approval.key.work_item.is_none() && approval.key.task == start_task);
+    let pending_work_items = pending
+        .iter()
+        .filter_map(|approval| approval.key.work_item.as_deref())
+        .collect::<BTreeSet<_>>();
+    let relevant_issues = projected_issues
+        .iter()
+        .filter(|(item, _)| include_all_issues || pending_work_items.contains(item.as_str()))
+        .collect::<Vec<_>>();
+    let review_issues = if relevant_issues.is_empty() {
         String::new()
     } else {
         format!(
             "\n\nReview the projected work-item issues:\n{}",
-            projected_issues
-                .iter()
+            relevant_issues
+                .into_iter()
                 .map(|(item, number)| format!("- `{item}`: #{number}"))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -1636,11 +1681,11 @@ fn pending_approval_result(
     let single = (pending.len() == 1).then(|| approval_target(&pending[0].key));
     let commands = match single {
         Some(target) => format!(
-            "`{0} approve {target}`\n\nOr request changes with `{0} revise {target}` followed by feedback on subsequent lines.",
+            "To accept the approval subject described above, comment:\n`{0} approve {target}`\n\nTo request changes, comment with the revision command and put specific feedback on the following lines:\n`{0} revise {target}`\n`<describe the required changes>`",
             active_facade().issue_command()
         ),
         None => format!(
-            "Approve everything with `{0} approve all`, approve one target with `{0} approve <task>`, or revise one target with `{0} revise <task>` followed by feedback on subsequent lines.",
+            "Accept every approval subject with `{0} approve all`, accept one with `{0} approve <task>`, or request changes to one with `{0} revise <task>` followed by specific feedback on subsequent lines.",
             active_facade().issue_command()
         ),
     };
@@ -1653,7 +1698,7 @@ fn pending_approval_result(
         tests: Vec::new(),
         changed_files: Vec::new(),
         human_review_reason: Some(format!(
-            "{lead}\n\nPending approvals:\n{targets}{review_issues}\n\nWhat to do:\n{commands}"
+            "{lead}\n\nApproval subjects:\n{subjects}{review_issues}\n\nDecision instructions:\n{commands}"
         )),
         blocked_reason: None,
     }
@@ -3528,13 +3573,42 @@ flows:
             )
             .is_err()
         );
-        let result = pending_approval_result(&pending, &BTreeMap::new(), "Review required.");
-        assert_eq!(result.outcome, Outcome::NeedsHuman);
-        assert!(
-            result
-                .human_review_reason
-                .unwrap()
-                .contains("/donkeyspace approve architect")
+        let result = pending_approval_result(
+            &pending,
+            &BTreeMap::from([("counter_detect".into(), 3)]),
+            "architect",
+            "Review required.",
         );
+        assert_eq!(result.outcome, Outcome::NeedsHuman);
+        let reason = result.human_review_reason.unwrap();
+        assert!(reason.contains("Approval subjects:"));
+        assert!(reason.contains("the proposed lifecycle plan and block specifications"));
+        assert!(reason.contains("`counter_detect`: #3"));
+        assert!(reason.contains("Approving accepts this output as the current checkpoint"));
+        assert!(reason.contains("Revising keeps those dependents blocked"));
+        assert!(reason.contains("/donkeyspace approve architect"));
+        assert!(reason.contains("<describe the required changes>"));
+    }
+
+    #[test]
+    fn agent_requested_approval_explains_that_it_authorizes_a_rerun() {
+        let pending = vec![PendingApproval {
+            key: TaskKey {
+                task: "dv".into(),
+                work_item: Some("counter_detect".into()),
+            },
+            trigger: ApprovalTrigger::AgentRequested,
+        }];
+        let result = pending_approval_result(
+            &pending,
+            &BTreeMap::from([("counter_detect".into(), 3)]),
+            "architect",
+            "DV needs a human decision.",
+        );
+        let reason = result.human_review_reason.unwrap();
+
+        assert!(reason.contains("Review the completed `dv` output for work item `counter_detect`"));
+        assert!(reason.contains("Approving authorizes this target to rerun"));
+        assert!(reason.contains("Revising reruns it with the feedback you provide"));
     }
 }

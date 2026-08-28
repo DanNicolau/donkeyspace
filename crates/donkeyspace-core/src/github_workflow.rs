@@ -132,7 +132,7 @@ pub fn triage_comment_body(
             };
 
             Some(format!(
-                "{name} needs human input before this workflow can continue.\n\nWhat needs attention:\n{reason}\n\nLatest result:\n{}{evidence}\n\nWhat to do:\nUse the exact approval or revision command shown above. If no target-specific command is shown, use `{command} approve` to authorize continuation or `{command} revise` followed by feedback on subsequent lines. Only a newly created command comment from an authorized approver can requeue the workflow.\n\nCurrent state: `{}`",
+                "{name} needs human input before this workflow can continue.\n\nDecision required:\n{reason}\n\nLatest result:\n{}{evidence}\n\nBefore responding:\nReview every approval subject and linked artifact listed above. Approval accepts only the described checkpoint and authorizes the stated next work. Revision keeps dependent work blocked and must include specific requested changes. Use the exact target-specific command shown above; if none is shown, use `{command} approve` or `{command} revise` followed by feedback. Only a newly created command comment from an authorized approver can requeue the workflow.\n\nCurrent state: `{}`",
                 result.summary,
                 workflow_label_text(target_state)
             ))
@@ -335,11 +335,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(body.contains("What needs attention:"));
+        assert!(body.contains("Decision required:"));
         assert!(body.contains("handoff exceeded the policy limit"));
         assert!(body.contains("Failed verification:"));
         assert!(body.contains("`top-level simulation`: 31 cycle-alignment mismatches."));
         assert!(body.contains("Example Agent Platform needs human input"));
+        assert!(body.contains("Review every approval subject and linked artifact"));
+        assert!(body.contains("Revision keeps dependent work blocked"));
         assert!(body.contains("/example-agent approve"));
         assert!(!body.contains("/donkeyspace approve"));
         assert!(body.contains("Current state: `ai:needs-human`"));

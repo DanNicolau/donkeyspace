@@ -243,6 +243,32 @@ a {
   margin-top: 6px;
 }
 
+.decision-request,
+.blocked-reason {
+  border: 1px solid #d8b45b;
+  border-radius: 6px;
+  margin-top: 14px;
+  padding: 12px;
+}
+
+.decision-request {
+  background: #fff8df;
+}
+
+.blocked-reason {
+  background: #fff0ed;
+  border-color: #d89a90;
+}
+
+.decision-request pre,
+.blocked-reason pre {
+  color: #38443c;
+  font-family: inherit;
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .command-results {
   display: grid;
   gap: 8px;

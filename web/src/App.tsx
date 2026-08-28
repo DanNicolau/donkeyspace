@@ -46,6 +46,7 @@ type RunResult = {
   confidence: string;
   risk: string;
   questions: string[];
+  human_review_reason: string | null;
   blocked_reason: string | null;
 };
 
@@ -684,6 +685,21 @@ function RunRow({ run, isCoordinator }: { run: Run; isCoordinator: boolean }) {
               <li key={question}>{question}</li>
             ))}
           </ul>
+        ) : null}
+        {run.result?.outcome === "needs_human" ? (
+          <section className="decision-request">
+            <strong>Decision required</strong>
+            <pre>
+              {run.result.human_review_reason ??
+                "Review the linked workflow artifacts before approving or requesting changes."}
+            </pre>
+          </section>
+        ) : null}
+        {run.result?.blocked_reason ? (
+          <section className="blocked-reason">
+            <strong>Blocked reason</strong>
+            <pre>{run.result.blocked_reason}</pre>
+          </section>
         ) : null}
         <RunCommandResults runId={run.id} />
       </div>
