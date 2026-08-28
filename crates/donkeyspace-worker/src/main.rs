@@ -1208,7 +1208,6 @@ async fn execute_developer_job(
         return Ok(());
     }
 
-    let policy_routing_reason = policy.apply_result_routing(&mut result);
     let issue_num = issue_number(&running_job.input).unwrap_or(0);
     let branch_name = developer_branch_name(issue_num, running_job.id);
     let commit_title = conventional_commit_title(&running_job.input, &changed_files);
@@ -1300,7 +1299,11 @@ async fn execute_developer_job(
     cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        let workflow_state = workflow_state_for_outcome(result.outcome);
+        // Reaching this point means implementation and the required checks
+        // completed and a pull request was opened. Risk routing is an intake
+        // gate; applying it here would relabel a published PR as needs-human
+        // without leaving any resumable approval checkpoint.
+        let workflow_state = completed_implementation_state(result.outcome);
         update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
         record_state_transition(
             pool,
@@ -1308,9 +1311,7 @@ async fn execute_developer_job(
             Some(running_job.id),
             Some(WorkflowState::InProgress.as_str()),
             workflow_state.as_str(),
-            policy_routing_reason
-                .as_deref()
-                .unwrap_or("implementation lifecycle opened pull request"),
+            "implementation lifecycle opened pull request",
         )
         .await?;
 
@@ -1358,6 +1359,11 @@ async fn execute_developer_job(
     );
 
     Ok(())
+}
+
+fn completed_implementation_state(outcome: Outcome) -> WorkflowState {
+    debug_assert_eq!(outcome, Outcome::Implemented);
+    WorkflowState::PrOpen
 }
 
 async fn current_github_issue_is_closed(
@@ -3574,13 +3580,16 @@ struct UpsertCommentPayload {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_run_input, command_summary, conventional_commit_title, git_changed_files,
-        git_changed_files_since, input_issue_is_closed, merge_refused_unrelated_histories,
-        non_empty_string, normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
+        agent_run_input, command_summary, completed_implementation_state,
+        conventional_commit_title, git_changed_files, git_changed_files_since,
+        input_issue_is_closed, merge_refused_unrelated_histories, non_empty_string,
+        normalize_reviewer_result, parse_porcelain_status, policy_managed_labels,
         required_check_failure_summary, reviewer_changed_files, reviewer_comment_body, run_git,
         stage_changed_files, token_usage_exceeded_triage_result,
     };
-    use donkeyspace_core::{Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus};
+    use donkeyspace_core::{
+        Confidence, Outcome, Policy, Risk, RunResult, TestResult, TestStatus, WorkflowState,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -3592,6 +3601,14 @@ mod tests {
         assert!(!input_issue_is_closed(&json!({
             "issue": {"state": "open"}
         })));
+    }
+
+    #[test]
+    fn completed_implementation_with_open_pr_is_pr_open_regardless_of_risk() {
+        assert_eq!(
+            completed_implementation_state(Outcome::Implemented),
+            WorkflowState::PrOpen
+        );
     }
 
     #[test]
