@@ -1613,6 +1613,36 @@ pub async fn fail_job(
     Ok(job)
 }
 
+/// Fail every nonterminal plugin child associated with a lifecycle coordinator.
+///
+/// Child rows remain in place as execution history. This is intended for the
+/// coordinator's terminal error path, where in-memory task tracking may itself
+/// be the source of the failure.
+pub async fn fail_active_plugin_child_jobs(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+    result: &Value,
+) -> Result<Vec<JobRecord>, DbError> {
+    Ok(sqlx::query_as::<_, JobRecord>(
+        r#"
+        UPDATE jobs
+        SET
+            status = 'failed',
+            result = $2,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            updated_at = now()
+        WHERE input #>> '{plugin_execution,coordinator_run_id}' = $1::text
+          AND status IN ('waiting', 'queued', 'leased', 'running', 'paused')
+        RETURNING *
+        "#,
+    )
+    .bind(coordinator_job_id)
+    .bind(result)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn update_workflow_item_state(
     pool: &PgPool,
     workflow_item_id: i64,

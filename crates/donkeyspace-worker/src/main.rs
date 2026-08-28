@@ -7,10 +7,11 @@ use donkeyspace_core::{
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
     acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
-    create_job, create_outbound_action, fail_job, get_job, list_github_repositories,
-    list_github_repositories_for_installation, list_pending_agent_publications,
-    list_pending_outbound_actions, list_ready_developer_candidates, list_repair_candidates,
-    mark_job_running, mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
+    create_job, create_outbound_action, fail_active_plugin_child_jobs, fail_job, get_job,
+    list_github_repositories, list_github_repositories_for_installation,
+    list_pending_agent_publications, list_pending_outbound_actions,
+    list_ready_developer_candidates, list_repair_candidates, mark_job_running,
+    mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
     record_state_transition, set_checkpoint_pull_request, unpublished_agent_publications_exist,
     update_workflow_item_state,
 };
@@ -989,14 +990,60 @@ async fn execute_developer_job(
                 )
                 .await;
             }
+            let blocked_reason = error.to_string();
+            let failure = role_failure_result("Implementation execution failed.", &blocked_reason);
+            let child_failure = json!({
+                "outcome": "failed",
+                "summary": "Cancelled after the plugin lifecycle coordinator failed.",
+                "confidence": "low",
+                "risk": "unknown",
+                "questions": [],
+                "tests": [],
+                "changed_files": [],
+                "human_review_reason": null,
+                "blocked_reason": blocked_reason,
+            });
+            match fail_active_plugin_child_jobs(pool, running_job.id, &child_failure).await {
+                Ok(children) if !children.is_empty() => tracing::warn!(
+                    job_id = %running_job.id,
+                    child_count = children.len(),
+                    "failed unfinished plugin child jobs after coordinator error"
+                ),
+                Ok(_) => {}
+                Err(cleanup_error) => tracing::error!(
+                    job_id = %running_job.id,
+                    %cleanup_error,
+                    "failed to terminate plugin child jobs after coordinator error"
+                ),
+            }
             fail_role_job(
                 pool,
                 &running_job,
                 "Implementation execution failed.",
-                &error.to_string(),
+                &blocked_reason,
                 "implementation execution failed",
             )
             .await?;
+            if let Some(workflow_item_id) = running_job.workflow_item_id {
+                for action in triage_github_issue_actions(
+                    policy,
+                    &running_job.input,
+                    &failure,
+                    WorkflowState::Blocked,
+                ) {
+                    create_outbound_action(
+                        pool,
+                        &OutboundActionInput {
+                            workflow_item_id,
+                            job_id: Some(running_job.id),
+                            provider: "github".to_string(),
+                            action_type: action.action_type,
+                            payload: action.payload,
+                        },
+                    )
+                    .await?;
+                }
+            }
             cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
             tracing::warn!(job_id = %running_job.id, "implementation job failed");
             return Ok(());
@@ -1862,17 +1909,7 @@ async fn fail_role_job(
     blocked_reason: &str,
     transition_reason: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result_value = json!({
-        "outcome": "failed",
-        "summary": summary,
-        "confidence": "low",
-        "risk": "unknown",
-        "questions": [],
-        "tests": [],
-        "changed_files": [],
-        "human_review_reason": null,
-        "blocked_reason": blocked_reason,
-    });
+    let result_value = serde_json::to_value(role_failure_result(summary, blocked_reason))?;
     fail_job(pool, running_job.id, &result_value).await?;
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
@@ -1889,6 +1926,20 @@ async fn fail_role_job(
     }
 
     Ok(())
+}
+
+fn role_failure_result(summary: &str, blocked_reason: &str) -> RunResult {
+    RunResult {
+        outcome: Outcome::Failed,
+        summary: summary.to_string(),
+        confidence: Confidence::Low,
+        risk: Risk::Unknown,
+        questions: Vec::new(),
+        tests: Vec::new(),
+        changed_files: Vec::new(),
+        human_review_reason: None,
+        blocked_reason: Some(blocked_reason.to_string()),
+    }
 }
 
 async fn run_triage(

@@ -5,7 +5,7 @@ use donkeyspace_core::{
     PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult, TestResult, TestStatus,
 };
 use donkeyspace_db::{
-    JobRecord, PgPool, complete_job, create_waiting_job, fail_job,
+    JobRecord, PgPool, complete_job, create_waiting_job, fail_job, get_job,
     record_github_managed_resource_for_workflow_item, start_waiting_job,
 };
 use donkeyspace_github::{GitHubClient, GitHubWorkItem};
@@ -742,9 +742,8 @@ async fn run_work_item_lifecycle(
     if let Some(checkpoint) = &checkpoint {
         graph.restore_completed(&checkpoint.completed_keys)?;
     }
-    let mut revision_keys = BTreeSet::new();
     for target in &revision_targets {
-        revision_keys.extend(graph.restart_from(target)?);
+        graph.restart_from(target)?;
     }
     if checkpoint.is_none() || rerun_start {
         if rerun_start
@@ -887,22 +886,24 @@ async fn run_work_item_lifecycle(
     }
 
     if let Some(tracking) = &tracking {
-        for key in graph.keys() {
-            if !graph.is_completed(key)
-                && (!tracked_jobs.contains_key(key) || revision_keys.contains(key))
-            {
-                let job = create_tracked_job(
-                    tracking,
-                    manifest,
-                    &selection.flow,
-                    flow,
-                    key,
-                    &work_items,
-                    issue_input,
-                )
-                .await?;
-                tracked_jobs.insert(key.clone(), job.id);
-            }
+        let pending_keys = graph
+            .keys()
+            .filter(|key| !graph.is_completed(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in pending_keys {
+            ensure_waiting_tracked_job(
+                tracking,
+                &mut tracked_jobs,
+                &mut finished_jobs,
+                manifest,
+                &selection.flow,
+                flow,
+                &key,
+                &work_items,
+                issue_input,
+            )
+            .await?;
         }
     }
     let max_handoffs = selection
@@ -951,12 +952,29 @@ async fn run_work_item_lifecycle(
             return Err("plugin task graph has no runnable tasks".into());
         }
         for key in &ready {
-            graph.mark_running(key)?;
             if let Some(tracking) = &tracking {
-                start_waiting_job(tracking.pool, tracked_jobs[key])
+                let job_id = ensure_waiting_tracked_job(
+                    tracking,
+                    &mut tracked_jobs,
+                    &mut finished_jobs,
+                    manifest,
+                    &selection.flow,
+                    flow,
+                    key,
+                    &work_items,
+                    issue_input,
+                )
+                .await?;
+                start_waiting_job(tracking.pool, job_id)
                     .await?
-                    .ok_or("plugin child job was not waiting")?;
+                    .ok_or_else(|| {
+                        format!(
+                            "plugin child job `{job_id}` for task `{}` changed state before it could start",
+                            approval_target(key)
+                        )
+                    })?;
             }
+            graph.mark_running(key)?;
         }
         attempt += 1;
         if attempt > 64 {
@@ -1211,11 +1229,11 @@ async fn run_work_item_lifecycle(
                                 if !required_approvals
                                     .iter()
                                     .any(|approval| approval.key == pending_key)
-                                    && (finished_jobs.remove(&pending_key)
-                                        || !tracked_jobs.contains_key(&pending_key))
                                 {
-                                    let job = create_tracked_job(
+                                    ensure_waiting_tracked_job(
                                         tracking,
+                                        &mut tracked_jobs,
+                                        &mut finished_jobs,
                                         manifest,
                                         &selection.flow,
                                         flow,
@@ -1224,7 +1242,6 @@ async fn run_work_item_lifecycle(
                                         issue_input,
                                     )
                                     .await?;
-                                    tracked_jobs.insert(pending_key, job.id);
                                 }
                             }
                         }
@@ -1300,11 +1317,11 @@ async fn run_work_item_lifecycle(
                             if !required_approvals
                                 .iter()
                                 .any(|approval| approval.key == pending_key)
-                                && (finished_jobs.remove(&pending_key)
-                                    || !tracked_jobs.contains_key(&pending_key))
                             {
-                                let job = create_tracked_job(
+                                ensure_waiting_tracked_job(
                                     tracking,
+                                    &mut tracked_jobs,
+                                    &mut finished_jobs,
                                     manifest,
                                     &selection.flow,
                                     flow,
@@ -1313,7 +1330,6 @@ async fn run_work_item_lifecycle(
                                     issue_input,
                                 )
                                 .await?;
-                                tracked_jobs.insert(pending_key, job.id);
                             }
                         }
                     }
@@ -1399,21 +1415,18 @@ async fn run_work_item_lifecycle(
             required_approvals.retain(|approval| !invalidated.contains(&approval.key));
             if let Some(tracking) = &tracking {
                 for invalidated_key in invalidated {
-                    if finished_jobs.remove(&invalidated_key)
-                        || !tracked_jobs.contains_key(&invalidated_key)
-                    {
-                        let job = create_tracked_job(
-                            tracking,
-                            manifest,
-                            &selection.flow,
-                            flow,
-                            &invalidated_key,
-                            &work_items,
-                            issue_input,
-                        )
-                        .await?;
-                        tracked_jobs.insert(invalidated_key, job.id);
-                    }
+                    ensure_waiting_tracked_job(
+                        tracking,
+                        &mut tracked_jobs,
+                        &mut finished_jobs,
+                        manifest,
+                        &selection.flow,
+                        flow,
+                        &invalidated_key,
+                        &work_items,
+                        issue_input,
+                    )
+                    .await?;
                 }
             }
         }
@@ -1717,6 +1730,70 @@ fn min_confidence(left: Confidence, right: Confidence) -> Confidence {
         left
     } else {
         right
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackedJobDisposition {
+    KeepWaiting,
+    ReplaceTerminal,
+    RejectActive,
+}
+
+fn tracked_job_disposition(status: Option<&str>) -> TrackedJobDisposition {
+    match status {
+        Some("waiting") => TrackedJobDisposition::KeepWaiting,
+        Some("completed" | "failed") | None => TrackedJobDisposition::ReplaceTerminal,
+        Some(_) => TrackedJobDisposition::RejectActive,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_waiting_tracked_job(
+    tracking: &LifecycleTracking<'_>,
+    tracked_jobs: &mut BTreeMap<TaskKey, Uuid>,
+    finished_jobs: &mut BTreeSet<TaskKey>,
+    manifest: &PluginManifest,
+    flow_name: &str,
+    flow: &PluginFlow,
+    key: &TaskKey,
+    work_items: &[PluginWorkItem],
+    issue_input: &Value,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let existing = match tracked_jobs.get(key).copied() {
+        Some(job_id) => get_job(tracking.pool, job_id).await?,
+        None => None,
+    };
+    match tracked_job_disposition(existing.as_ref().map(|job| job.status.as_str())) {
+        TrackedJobDisposition::KeepWaiting => {
+            finished_jobs.remove(key);
+            Ok(existing.expect("waiting disposition requires a job").id)
+        }
+        TrackedJobDisposition::ReplaceTerminal => {
+            let job = create_tracked_job(
+                tracking,
+                manifest,
+                flow_name,
+                flow,
+                key,
+                work_items,
+                issue_input,
+            )
+            .await?;
+            tracked_jobs.insert(key.clone(), job.id);
+            finished_jobs.remove(key);
+            Ok(job.id)
+        }
+        TrackedJobDisposition::RejectActive => {
+            let job = existing.expect("active disposition requires a job");
+            Err(format!(
+                "plugin task `{}` already has active child job `{}` in `{}` state",
+                approval_target(key),
+                job.id,
+                job.status
+            )
+            .into())
+        }
     }
 }
 
@@ -2952,6 +3029,38 @@ flows:
         let finished = BTreeSet::from([first, third]);
 
         assert_eq!(unfinished_tracked_keys(&tracked, &finished), vec![second]);
+    }
+
+    #[test]
+    fn repeated_handoff_replaces_terminal_approval_job_without_duplicating_active_work() {
+        // Approval-required tasks have a terminal child row before their graph
+        // key is recorded as completed. A later handoff must trust the row's
+        // status and replace it even when the checkpoint's completed set did
+        // not contain the task.
+        assert_eq!(
+            tracked_job_disposition(Some("completed")),
+            TrackedJobDisposition::ReplaceTerminal
+        );
+        assert_eq!(
+            tracked_job_disposition(Some("failed")),
+            TrackedJobDisposition::ReplaceTerminal
+        );
+        assert_eq!(
+            tracked_job_disposition(None),
+            TrackedJobDisposition::ReplaceTerminal
+        );
+        assert_eq!(
+            tracked_job_disposition(Some("waiting")),
+            TrackedJobDisposition::KeepWaiting
+        );
+        assert_eq!(
+            tracked_job_disposition(Some("running")),
+            TrackedJobDisposition::RejectActive
+        );
+        assert_eq!(
+            tracked_job_disposition(Some("paused")),
+            TrackedJobDisposition::RejectActive
+        );
     }
 
     #[test]
