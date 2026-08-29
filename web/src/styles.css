@@ -686,6 +686,11 @@ a {
   padding: 16px 18px;
 }
 
+.task-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+}
+
 .task-row + .task-row,
 .operations-list article + article {
   border-top: 1px solid #edf0e8;
@@ -706,10 +711,21 @@ a {
   justify-items: end;
 }
 
+.task-row > div:last-child {
+  max-width: 100%;
+  min-width: 0;
+}
+
 .task-row span,
 .task-row small,
 .operations-list small {
   color: #68736a;
+}
+
+.task-row small {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .task-row p,
@@ -934,6 +950,10 @@ a {
 
   .detail-grid {
     grid-template-columns: 1fr;
+  }
+
+  .task-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .detail-state,
