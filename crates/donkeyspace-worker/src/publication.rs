@@ -1,9 +1,10 @@
 use donkeyspace_core::{Outcome, PluginArtifact, PluginArtifactType};
 use donkeyspace_db::{
     AgentPublicationInput, AgentPublicationRecord, LifecycleEventInput, OutboundActionInput,
-    PgPool, get_workflow_by_issue, list_agent_publications_for_run, list_jobs_for_workflow_item,
-    list_lifecycle_events, mark_agent_publication_failed, mark_agent_publication_published,
-    record_lifecycle_event, upsert_agent_publication, upsert_pending_outbound_action,
+    OutboundActionRecord, PgPool, get_workflow_by_issue, list_agent_publications_for_run,
+    list_jobs_for_workflow_item, list_lifecycle_events, mark_agent_publication_failed,
+    mark_agent_publication_published, record_lifecycle_event, upsert_agent_publication,
+    upsert_pending_outbound_action,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -324,14 +325,14 @@ async fn record_publication_event(
 async fn queue_status_comment(
     context: &PublicationContext<'_>,
     related: Option<(i64, &str)>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<OutboundActionRecord>, Box<dyn std::error::Error>> {
     // Projected work-item issues remain concise specifications. The parent
     // issue owns the single live lifecycle summary and links to all attempts.
     if related.is_some() {
-        return Ok(());
+        return Ok(None);
     }
     let Some(workflow_item_id) = context.workflow_item_id else {
-        return Ok(());
+        return Ok(None);
     };
     let publications =
         list_agent_publications_for_run(context.pool, context.coordinator_job_id, None).await?;
@@ -490,7 +491,7 @@ async fn queue_status_comment(
         marker.clone(),
         "<!-- donkeyspace-generated -->".into(),
     ]);
-    upsert_pending_outbound_action(
+    let action = upsert_pending_outbound_action(
         context.pool,
         &OutboundActionInput {
             workflow_item_id,
@@ -508,15 +509,15 @@ async fn queue_status_comment(
         &format!("workflow-status:{workflow_item_id}"),
     )
     .await?;
-    Ok(())
+    Ok(Some(action))
 }
 
 pub async fn queue_lifecycle_status_for_job(
     pool: &PgPool,
     job: &donkeyspace_db::JobRecord,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<OutboundActionRecord>, Box<dyn std::error::Error>> {
     let Some(workflow_item_id) = job.workflow_item_id else {
-        return Ok(());
+        return Ok(None);
     };
     let owner = job
         .input

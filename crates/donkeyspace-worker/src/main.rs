@@ -962,7 +962,10 @@ async fn execute_developer_job(
         // soon as the workflow restarts so GitHub does not contradict the
         // issue label while downstream tasks are being released.
         if lifecycle_selection.is_some() {
-            queue_lifecycle_status_for_job(pool, &running_job).await?;
+            let status_action = queue_lifecycle_status_for_job(pool, &running_job).await?;
+            if let (Some(client), Some(status_action)) = (&github_client, status_action) {
+                process_outbound_action(pool, client, &status_action).await?;
+            }
         }
     }
 
