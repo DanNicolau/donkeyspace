@@ -10,6 +10,7 @@ type EventPage = { events: TimelineEvent[]; next_before_id: number | null };
 type Run = { id: string; role: string; status: string; result: { outcome?: string; summary?: string } | null; input?: { issue?: { number?: number; title?: string }; repository?: { full_name?: string } }; updated_at: string };
 type OutboundAction = { id: number; action_type: string; status: string; last_error: string | null; payload: { owner?: string; repo?: string; issue_number?: number }; created_at: string };
 type PollStatus = { enabled: boolean; running: boolean; pending_manual: boolean; configured_interval_seconds: number; last_completed_at: string | null; next_poll_at: string | null };
+type SummaryStep = { role: string | null; text: string };
 
 const storageKey = "donkeyspace.dashboard.repository";
 const json = async <T,>(url: string, init?: RequestInit): Promise<T> => {
@@ -62,7 +63,7 @@ function WorkflowCard({ workflow }: { workflow: Workflow }) {
   const active = workflow.tasks.filter((task) => ["running", "leased"].includes(task.status));
   const href = `/repositories/${encodeURIComponent(workflow.owner)}/${encodeURIComponent(workflow.repository)}/issues/${workflow.issue_number}`;
   return <article className="workflow-card"><div className="workflow-card-heading"><div><span className="eyebrow">{workflow.owner}/{workflow.repository} · Issue #{workflow.issue_number}</span><h3><a href={href}>{workflow.issue_title}</a></h3></div><StatusPill status={workflow.current_state ?? workflow.coordinator_status ?? "unknown"} /></div>
-    <p className="workflow-summary">{workflow.summary ?? "Agents have not reported an outcome yet."}</p>
+    <RunSummary summary={workflow.summary} tasks={workflow.tasks} compact />
     {active.length ? <div className="agent-strip"><strong>Running now</strong>{active.map((task) => <span key={task.job_id}>{task.task_display_name}{task.work_item ? ` / ${task.work_item}` : ""}</span>)}</div> : null}
     {workflow.pending_approval ? <div className="attention-box"><strong>Decision required</strong><p>{firstParagraph(workflow.pending_approval)}</p></div> : null}
     <div className="workflow-result">{workflow.pull_request_url ? <a href={workflow.pull_request_url} target="_blank" rel="noreferrer">Pull request{workflow.pull_request_number ? ` #${workflow.pull_request_number}` : ""} · {workflow.pull_request_state ?? "open"}</a> : <span><strong>Why no PR:</strong> {workflow.no_pr_reason}</span>}<time title={new Date(workflow.updated_at).toLocaleString()}>{relativeTime(workflow.updated_at)}</time></div>
@@ -76,7 +77,8 @@ function WorkflowDetail({ owner, repo, number }: { owner: string; repo: string; 
   const workflow = workflowQuery.data;
   if (!workflow) return <div className="empty-state panel">{workflowQuery.isError ? "Workflow could not be loaded." : "Loading workflow…"}</div>;
   const events = [...(eventsQuery.data?.events ?? [])].reverse();
-  return <><a className="back-link" href="/">← All issues</a><section className="detail-hero panel"><div><span className="eyebrow">{owner}/{repo} · Issue #{number}</span><h2>{workflow.issue_title}</h2><p>{workflow.summary}</p></div><div className="detail-state"><StatusPill status={workflow.current_state ?? "unknown"} /><a href={workflow.issue_url} target="_blank" rel="noreferrer">Open on GitHub</a></div></section>
+  return <><a className="back-link" href="/">← All issues</a><section className="detail-hero panel"><div><span className="eyebrow">{owner}/{repo} · Issue #{number}</span><h2>{workflow.issue_title}</h2><p>{summaryHeadline(workflow.summary, workflow.tasks)}</p></div><div className="detail-state"><StatusPill status={workflow.current_state ?? "unknown"} /><a href={workflow.issue_url} target="_blank" rel="noreferrer">Open on GitHub</a></div></section>
+    <section className="panel run-summary-panel"><PanelHeading title="Execution summary" subtitle="Agent outcomes in the order they occurred." /><RunSummary summary={workflow.summary} tasks={workflow.tasks} /></section>
     <section className="detail-grid"><section className="panel"><PanelHeading title="Current work" subtitle="Task state is independent per agent." /><div className="task-list">{workflow.tasks.map((task) => <TaskRow key={task.job_id} task={task} />)}{!workflow.tasks.length ? <div className="empty-state">Planning is the only active phase.</div> : null}</div></section>
       <section className="panel"><PanelHeading title="Outcome" subtitle="Latest aggregate lifecycle result." /><div className="outcome-content"><dl><div><dt>Outcome</dt><dd>{workflow.outcome ?? "pending"}</dd></div><div><dt>Coordinator</dt><dd>{workflow.coordinator_status ?? "unknown"}</dd></div></dl>{workflow.pending_approval ? <div className="attention-box"><strong>Decision required</strong><pre>{workflow.pending_approval}</pre></div> : null}{workflow.pull_request_url ? <a className="primary-link" href={workflow.pull_request_url} target="_blank" rel="noreferrer">Open final pull request</a> : <p><strong>Why no PR:</strong> {workflow.no_pr_reason}</p>}</div></section>
     </section>
@@ -87,6 +89,50 @@ function TaskRow({ task }: { task: WorkflowTask }) { return <article className="
 function TimelineRow({ event }: { event: TimelineEvent }) {
   const label = event.task_display_name ?? event.role_display_name ?? humanize(event.event_type);
   return <article className="timeline-row" data-level={event.level}><div className="timeline-marker" /><time title={new Date(event.created_at).toLocaleString()}>{relativeTime(event.created_at)}</time><div><div className="timeline-heading"><strong>{label}{event.work_item ? ` / ${event.work_item}` : ""}</strong>{event.wave ? <span>Wave {event.wave}</span> : null}{["poll", "webhook"].includes(event.source) ? <span>{event.source}</span> : null}</div><p>{event.summary}</p>{event.reason && event.reason !== event.summary ? <details><summary>Reason</summary><pre>{event.reason}</pre></details> : null}{event.handoff_target ? <p className="handoff">Handoff to {event.handoff_target}</p> : null}{event.links?.length ? <div className="event-links">{event.links.map((link) => <a key={link.url} href={link.url} target="_blank" rel="noreferrer">{link.label}</a>)}</div> : null}</div></article>;
+}
+
+function RunSummary({ summary, tasks, compact = false }: { summary: string | null; tasks: WorkflowTask[]; compact?: boolean }) {
+  const steps = parseSummary(summary, tasks);
+  if (!steps.length) return <p className="workflow-summary empty-summary">Agents have not reported an outcome yet.</p>;
+  const visible = compact ? steps.slice(-3) : steps;
+  const hidden = steps.length - visible.length;
+  const roleNames = new Map<string, string>();
+  for (const task of tasks) {
+    roleNames.set(task.role.toLowerCase(), task.role_display_name);
+    roleNames.set(task.task.toLowerCase(), task.task_display_name);
+  }
+  return <div className={`run-summary${compact ? " run-summary-compact" : ""}`}>
+    {compact ? <div className="run-summary-heading"><strong>Recent outcomes</strong><span>{steps.length} report{steps.length === 1 ? "" : "s"}</span></div> : null}
+    <ol start={compact ? hidden + 1 : 1}>{visible.map((step, index) => <li key={`${hidden + index}-${step.role ?? "result"}`}>
+      <span className="summary-step-number" aria-hidden="true">{hidden + index + 1}</span>
+      <div><span className={`summary-role${step.role ? "" : " summary-role-result"}`}>{step.role ? roleNames.get(step.role) ?? humanize(step.role) : "Final result"}</span><p>{step.text}</p></div>
+    </li>)}</ol>
+    {compact && hidden > 0 ? <span className="summary-more">Showing the latest 3 of {steps.length} reports. Open the issue for the full sequence.</span> : null}
+  </div>;
+}
+
+function parseSummary(summary: string | null, tasks: WorkflowTask[]): SummaryStep[] {
+  if (!summary?.trim()) return [];
+  const roleKeys = [...new Set(["architect", "rtl", "dv", "synthesis", ...tasks.flatMap((task) => [task.role, task.task])])]
+    .filter(Boolean)
+    .map((role) => role.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const rolePattern = roleKeys.join("|");
+  const separator = new RegExp(`\\n+|(?=(?:${rolePattern}):\\s)|(?=Completed \\d+ block work item)`, "i");
+  const rolePrefix = new RegExp(`^(${rolePattern}):\\s*(.*)$`, "is");
+  return summary
+    .trim()
+    .split(separator)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const match = entry.match(rolePrefix);
+      return match ? { role: match[1].toLowerCase(), text: match[2].trim() } : { role: null, text: entry };
+    });
+}
+
+function summaryHeadline(summary: string | null, tasks: WorkflowTask[]) {
+  const steps = parseSummary(summary, tasks);
+  return [...steps].reverse().find((step) => step.role === null)?.text ?? (steps.length ? `${steps.length} agent reports recorded.` : "Agents have not reported an outcome yet.");
 }
 
 function OperationsPage() {
