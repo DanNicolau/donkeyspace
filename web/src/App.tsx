@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 type Facade = { display_name: string; tagline: string; issue_command: string; branch_prefix: string };
 type WorkflowTask = { job_id: string; role: string; role_display_name: string; task: string; task_display_name: string; work_item: string | null; status: string; outcome: string | null; summary: string | null; updated_at: string };
@@ -88,7 +88,7 @@ function WorkflowDetail({ owner, repo, number }: { owner: string; repo: string; 
 function TaskRow({ task }: { task: WorkflowTask }) { return <article className="task-row"><div><strong>{task.task_display_name}{task.work_item ? ` / ${task.work_item}` : ""}</strong><span>{task.role_display_name}</span><p>{task.summary ?? "Waiting for an agent result."}</p></div><div><StatusPill status={task.status} /><small>{task.outcome ?? "pending"}</small></div></article>; }
 function TimelineRow({ event }: { event: TimelineEvent }) {
   const label = event.task_display_name ?? event.role_display_name ?? humanize(event.event_type);
-  return <article className="timeline-row" data-level={event.level}><div className="timeline-marker" /><time title={new Date(event.created_at).toLocaleString()}>{relativeTime(event.created_at)}</time><div><div className="timeline-heading"><strong>{label}{event.work_item ? ` / ${event.work_item}` : ""}</strong>{event.wave ? <span>Wave {event.wave}</span> : null}{["poll", "webhook"].includes(event.source) ? <span>{event.source}</span> : null}</div><p>{event.summary}</p>{event.reason && event.reason !== event.summary ? <details><summary>Reason</summary><pre>{event.reason}</pre></details> : null}{event.handoff_target ? <p className="handoff">Handoff to {event.handoff_target}</p> : null}{event.links?.length ? <div className="event-links">{event.links.map((link) => <a key={link.url} href={link.url} target="_blank" rel="noreferrer">{link.label}</a>)}</div> : null}</div></article>;
+  return <article className="timeline-row" data-level={event.level}><div className="timeline-marker" /><time title={new Date(event.created_at).toLocaleString()}>{relativeTime(event.created_at)}</time><div><div className="timeline-heading"><strong>{label}{event.work_item ? ` / ${event.work_item}` : ""}</strong>{event.wave ? <span>Wave {event.wave}</span> : null}{["poll", "webhook"].includes(event.source) ? <span>{event.source}</span> : null}</div><ExpandableText text={event.summary} />{event.reason && event.reason !== event.summary ? <details><summary>Reason</summary><pre>{event.reason}</pre></details> : null}{event.handoff_target ? <p className="handoff">Handoff to {event.handoff_target}</p> : null}{event.links?.length ? <div className="event-links">{event.links.map((link) => <a key={link.url} href={link.url} target="_blank" rel="noreferrer">{link.label}</a>)}</div> : null}</div></article>;
 }
 
 function RunSummary({ summary, tasks, compact = false }: { summary: string | null; tasks: WorkflowTask[]; compact?: boolean }) {
@@ -105,9 +105,30 @@ function RunSummary({ summary, tasks, compact = false }: { summary: string | nul
     {compact ? <div className="run-summary-heading"><strong>Recent outcomes</strong><span>{steps.length} report{steps.length === 1 ? "" : "s"}</span></div> : null}
     <ol start={compact ? hidden + 1 : 1}>{visible.map((step, index) => <li key={`${hidden + index}-${step.role ?? "result"}`}>
       <span className="summary-step-number" aria-hidden="true">{hidden + index + 1}</span>
-      <div><span className={`summary-role${step.role ? "" : " summary-role-result"}`}>{step.role ? roleNames.get(step.role) ?? humanize(step.role) : "Final result"}</span><p>{step.text}</p></div>
+      <div><span className={`summary-role${step.role ? "" : " summary-role-result"}`}>{step.role ? roleNames.get(step.role) ?? humanize(step.role) : "Final result"}</span><ExpandableText text={step.text} compact={compact} /></div>
     </li>)}</ol>
     {compact && hidden > 0 ? <span className="summary-more">Showing the latest 3 of {steps.length} reports. Open the issue for the full sequence.</span> : null}
+  </div>;
+}
+
+function ExpandableText({ text, compact = false }: { text: string; compact?: boolean }) {
+  const paragraph = useRef<HTMLParagraphElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [truncated, setTruncated] = useState(false);
+
+  useLayoutEffect(() => {
+    const element = paragraph.current;
+    if (!element || expanded) return;
+    const measure = () => setTruncated(element.scrollHeight > element.clientHeight + 1);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [expanded, text]);
+
+  return <div className={`expandable-text${compact ? " expandable-text-compact" : ""}${expanded ? " is-expanded" : ""}`}>
+    <p ref={paragraph}>{text}</p>
+    {truncated ? <button type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? "Show less" : "Show more"}</button> : null}
   </div>;
 }
 
