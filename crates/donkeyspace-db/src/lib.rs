@@ -156,6 +156,80 @@ pub struct StateTransitionRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleEventInput {
+    pub workflow_item_id: i64,
+    pub coordinator_job_id: Option<Uuid>,
+    pub job_id: Option<Uuid>,
+    pub dedupe_key: Option<String>,
+    pub event_type: String,
+    pub level: String,
+    pub source: String,
+    pub actor: Option<String>,
+    pub wave: Option<i32>,
+    pub attempt: Option<i32>,
+    pub role: Option<String>,
+    pub role_display_name: Option<String>,
+    pub task: Option<String>,
+    pub task_display_name: Option<String>,
+    pub work_item: Option<String>,
+    pub status: Option<String>,
+    pub outcome: Option<String>,
+    pub summary: String,
+    pub reason: Option<String>,
+    pub handoff_target: Option<String>,
+    pub links: Value,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct LifecycleEventRecord {
+    pub id: i64,
+    pub workflow_item_id: i64,
+    pub coordinator_job_id: Option<Uuid>,
+    pub job_id: Option<Uuid>,
+    #[serde(skip_serializing)]
+    pub dedupe_key: Option<String>,
+    pub event_type: String,
+    pub level: String,
+    pub source: String,
+    pub actor: Option<String>,
+    pub wave: Option<i32>,
+    pub attempt: Option<i32>,
+    pub role: Option<String>,
+    pub role_display_name: Option<String>,
+    pub task: Option<String>,
+    pub task_display_name: Option<String>,
+    pub work_item: Option<String>,
+    pub status: Option<String>,
+    pub outcome: Option<String>,
+    pub summary: String,
+    pub reason: Option<String>,
+    pub handoff_target: Option<String>,
+    pub links: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkflowOverviewRecord {
+    pub id: i64,
+    pub owner: String,
+    pub repository: String,
+    pub issue_number: i64,
+    pub provider_state: String,
+    pub current_state: Option<String>,
+    pub current_labels: Value,
+    pub issue_title: Option<String>,
+    pub latest_job_id: Option<Uuid>,
+    pub latest_job_status: Option<String>,
+    pub latest_outcome: Option<String>,
+    pub latest_summary: Option<String>,
+    pub pull_request_number: Option<i64>,
+    pub pull_request_url: Option<String>,
+    pub pull_request_state: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundActionInput {
     pub workflow_item_id: i64,
     pub job_id: Option<Uuid>,
@@ -197,6 +271,7 @@ pub struct OutboundActionRecord {
     pub payload: Value,
     pub last_error: Option<String>,
     pub provider_resource_id: Option<String>,
+    pub dedupe_key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1039,6 +1114,7 @@ pub async fn record_state_transition(
     to_state: &str,
     reason: &str,
 ) -> Result<(), DbError> {
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r#"
         INSERT INTO state_transitions (workflow_item_id, job_id, from_state, to_state, reason)
@@ -1050,10 +1126,73 @@ pub async fn record_state_transition(
     .bind(from_state)
     .bind(to_state)
     .bind(reason)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
+    sqlx::query(
+        r#"
+        INSERT INTO lifecycle_events (
+            workflow_item_id, coordinator_job_id, job_id, event_type, level,
+            source, status, summary, reason
+        )
+        VALUES ($1, $2, $2, 'workflow_transition', 'milestone', 'system', $3, $4, $4)
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(job_id)
+    .bind(to_state)
+    .bind(reason)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+
     Ok(())
+}
+
+pub async fn record_lifecycle_event(
+    pool: &PgPool,
+    input: &LifecycleEventInput,
+) -> Result<Option<LifecycleEventRecord>, DbError> {
+    Ok(sqlx::query_as::<_, LifecycleEventRecord>(
+        r#"
+        INSERT INTO lifecycle_events (
+            workflow_item_id, coordinator_job_id, job_id, dedupe_key,
+            event_type, level, source, actor, wave, attempt, role,
+            role_display_name, task, task_display_name, work_item, status,
+            outcome, summary, reason, handoff_target, links
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+        )
+        ON CONFLICT (workflow_item_id, dedupe_key) DO NOTHING
+        RETURNING *
+        "#,
+    )
+    .bind(input.workflow_item_id)
+    .bind(input.coordinator_job_id)
+    .bind(input.job_id)
+    .bind(&input.dedupe_key)
+    .bind(&input.event_type)
+    .bind(&input.level)
+    .bind(&input.source)
+    .bind(&input.actor)
+    .bind(input.wave)
+    .bind(input.attempt)
+    .bind(&input.role)
+    .bind(&input.role_display_name)
+    .bind(&input.task)
+    .bind(&input.task_display_name)
+    .bind(&input.work_item)
+    .bind(&input.status)
+    .bind(&input.outcome)
+    .bind(&input.summary)
+    .bind(&input.reason)
+    .bind(&input.handoff_target)
+    .bind(&input.links)
+    .fetch_optional(pool)
+    .await?)
 }
 
 pub async fn create_outbound_action(
@@ -1082,6 +1221,42 @@ pub async fn create_outbound_action(
     .await?;
 
     Ok(action)
+}
+
+/// Coalesce a not-yet-published update for the same external resource.
+/// Completed actions remain immutable history, while rapid lifecycle events
+/// replace the payload of the single pending status update.
+pub async fn upsert_pending_outbound_action(
+    pool: &PgPool,
+    input: &OutboundActionInput,
+    dedupe_key: &str,
+) -> Result<OutboundActionRecord, DbError> {
+    Ok(sqlx::query_as::<_, OutboundActionRecord>(
+        r#"
+        INSERT INTO outbound_actions (
+            workflow_item_id, job_id, provider, action_type, payload, dedupe_key
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL
+        DO UPDATE SET
+            workflow_item_id = EXCLUDED.workflow_item_id,
+            job_id = EXCLUDED.job_id,
+            provider = EXCLUDED.provider,
+            action_type = EXCLUDED.action_type,
+            payload = EXCLUDED.payload,
+            updated_at = now(),
+            last_error = NULL
+        RETURNING *
+        "#,
+    )
+    .bind(input.workflow_item_id)
+    .bind(input.job_id)
+    .bind(&input.provider)
+    .bind(&input.action_type)
+    .bind(&input.payload)
+    .bind(dedupe_key)
+    .fetch_one(pool)
+    .await?)
 }
 
 pub async fn upsert_agent_publication(
@@ -1502,6 +1677,179 @@ pub async fn list_jobs_for_repository(
     .await?;
 
     Ok(jobs)
+}
+
+pub async fn list_jobs_for_workflow_item(
+    pool: &PgPool,
+    workflow_item_id: i64,
+) -> Result<Vec<JobRecord>, DbError> {
+    Ok(sqlx::query_as::<_, JobRecord>(
+        r#"
+        SELECT *
+        FROM jobs
+        WHERE workflow_item_id = $1
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(workflow_item_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn list_workflows(
+    pool: &PgPool,
+    repository: Option<(&str, &str)>,
+    limit: i64,
+) -> Result<Vec<WorkflowOverviewRecord>, DbError> {
+    let (owner, repo) = repository
+        .map(|(owner, repo)| (Some(owner), Some(repo)))
+        .unwrap_or((None, None));
+    Ok(sqlx::query_as::<_, WorkflowOverviewRecord>(
+        r#"
+        SELECT
+            wi.id,
+            r.owner,
+            r.name AS repository,
+            wi.issue_number,
+            wi.provider_state,
+            wi.current_state,
+            wi.current_labels,
+            latest.input #>> '{issue,title}' AS issue_title,
+            latest.id AS latest_job_id,
+            latest.status AS latest_job_status,
+            latest.result ->> 'outcome' AS latest_outcome,
+            latest.result ->> 'summary' AS latest_summary,
+            pr.pr_number AS pull_request_number,
+            pr.html_url AS pull_request_url,
+            pr.state AS pull_request_state,
+            wi.updated_at,
+            wi.created_at
+        FROM workflow_items wi
+        JOIN repositories r ON r.id = wi.repository_id
+        LEFT JOIN LATERAL (
+            SELECT j.*
+            FROM jobs j
+            WHERE j.workflow_item_id = wi.id
+              AND j.input #>> '{plugin_execution,coordinator_run_id}' IS NULL
+            ORDER BY
+                COALESCE((j.input ->> 'donkeyspace_lifecycle_coordinator')::boolean, false) DESC,
+                j.created_at DESC
+            LIMIT 1
+        ) latest ON true
+        LEFT JOIN LATERAL (
+            SELECT p.*
+            FROM pull_requests p
+            WHERE p.workflow_item_id = wi.id
+              AND p.managed_by_donkeyspace = true
+            ORDER BY p.updated_at DESC
+            LIMIT 1
+        ) pr ON true
+        WHERE ($1::text IS NULL OR lower(r.owner) = lower($1))
+          AND ($2::text IS NULL OR lower(r.name) = lower($2))
+          AND latest.id IS NOT NULL
+        ORDER BY
+            CASE wi.current_state
+                WHEN 'needs_human' THEN 0
+                WHEN 'blocked' THEN 1
+                WHEN 'in_progress' THEN 2
+                WHEN 'ready' THEN 3
+                WHEN 'pr_open' THEN 4
+                ELSE 5
+            END,
+            wi.updated_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn get_workflow_by_issue(
+    pool: &PgPool,
+    owner: &str,
+    repo: &str,
+    issue_number: i64,
+) -> Result<Option<WorkflowOverviewRecord>, DbError> {
+    Ok(sqlx::query_as::<_, WorkflowOverviewRecord>(
+        r#"
+        SELECT
+            wi.id,
+            r.owner,
+            r.name AS repository,
+            wi.issue_number,
+            wi.provider_state,
+            wi.current_state,
+            wi.current_labels,
+            latest.input #>> '{issue,title}' AS issue_title,
+            latest.id AS latest_job_id,
+            latest.status AS latest_job_status,
+            latest.result ->> 'outcome' AS latest_outcome,
+            latest.result ->> 'summary' AS latest_summary,
+            pr.pr_number AS pull_request_number,
+            pr.html_url AS pull_request_url,
+            pr.state AS pull_request_state,
+            wi.updated_at,
+            wi.created_at
+        FROM workflow_items wi
+        JOIN repositories r ON r.id = wi.repository_id
+        LEFT JOIN LATERAL (
+            SELECT j.*
+            FROM jobs j
+            WHERE j.workflow_item_id = wi.id
+              AND j.input #>> '{plugin_execution,coordinator_run_id}' IS NULL
+            ORDER BY
+                COALESCE((j.input ->> 'donkeyspace_lifecycle_coordinator')::boolean, false) DESC,
+                j.created_at DESC
+            LIMIT 1
+        ) latest ON true
+        LEFT JOIN LATERAL (
+            SELECT p.*
+            FROM pull_requests p
+            WHERE p.workflow_item_id = wi.id
+              AND p.managed_by_donkeyspace = true
+            ORDER BY p.updated_at DESC
+            LIMIT 1
+        ) pr ON true
+        WHERE lower(r.owner) = lower($1)
+          AND lower(r.name) = lower($2)
+          AND wi.issue_number = $3
+          AND latest.id IS NOT NULL
+        "#,
+    )
+    .bind(owner)
+    .bind(repo)
+    .bind(issue_number)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn list_lifecycle_events(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    before_id: Option<i64>,
+    milestones_only: bool,
+    limit: i64,
+) -> Result<Vec<LifecycleEventRecord>, DbError> {
+    Ok(sqlx::query_as::<_, LifecycleEventRecord>(
+        r#"
+        SELECT *
+        FROM lifecycle_events
+        WHERE workflow_item_id = $1
+          AND ($2::bigint IS NULL OR id < $2)
+          AND (NOT $3 OR level = 'milestone')
+        ORDER BY id DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(workflow_item_id)
+    .bind(before_id)
+    .bind(milestones_only)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
 }
 
 pub async fn get_job(pool: &PgPool, id: Uuid) -> Result<Option<JobRecord>, DbError> {

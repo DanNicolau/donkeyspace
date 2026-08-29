@@ -1,16 +1,17 @@
 use donkeyspace_core::{Outcome, PluginArtifact, PluginArtifactType};
 use donkeyspace_db::{
-    AgentPublicationInput, AgentPublicationRecord, OutboundActionInput, PgPool,
-    create_outbound_action, list_agent_publications_for_run, mark_agent_publication_failed,
-    mark_agent_publication_published, upsert_agent_publication,
+    AgentPublicationInput, AgentPublicationRecord, LifecycleEventInput, OutboundActionInput,
+    PgPool, get_workflow_by_issue, list_agent_publications_for_run, list_jobs_for_workflow_item,
+    list_lifecycle_events, mark_agent_publication_failed, mark_agent_publication_published,
+    record_lifecycle_event, upsert_agent_publication, upsert_pending_outbound_action,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{env, fs, io::Read, path::Path, process::Stdio};
+use std::{collections::BTreeMap, env, fs, io::Read, path::Path, process::Stdio};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::{active_facade, repo_context::write_askpass_script};
+use crate::{active_dashboard_public_url, active_facade, repo_context::write_askpass_script};
 
 const MAX_DIAGNOSTIC_FILES: usize = 256;
 const MAX_DIAGNOSTIC_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -100,9 +101,9 @@ pub async fn publish_checkpoint(
         },
     )
     .await?;
-    let push_result = push_publication(context, &record).await;
+    push_publication(context, &record).await?;
+    record_publication_event(context, &record).await?;
     queue_status_comment(context, None).await?;
-    push_result?;
     Ok(record)
 }
 
@@ -263,7 +264,8 @@ pub async fn publish_attempt(
         },
     )
     .await?;
-    let push_result = push_publication(context, &record).await;
+    push_publication(context, &record).await?;
+    record_publication_event(context, &record).await?;
     queue_status_comment(context, None).await?;
     if let Some(issue_number) = attempt.related_issue_number {
         queue_status_comment(
@@ -272,100 +274,223 @@ pub async fn publish_attempt(
         )
         .await?;
     }
-    push_result?;
     Ok(record)
+}
+
+async fn record_publication_event(
+    context: &PublicationContext<'_>,
+    publication: &AgentPublicationRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(workflow_item_id) = context.workflow_item_id else {
+        return Ok(());
+    };
+    record_lifecycle_event(
+        context.pool,
+        &LifecycleEventInput {
+            workflow_item_id,
+            coordinator_job_id: Some(context.coordinator_job_id),
+            job_id: publication.job_id,
+            dedupe_key: Some(format!("publication:{}:published", publication.id)),
+            event_type: "artifact_published".into(),
+            level: "milestone".into(),
+            source: "worker".into(),
+            actor: None,
+            wave: publication.attempt.map(|attempt| attempt / 100),
+            attempt: publication.attempt,
+            role: None,
+            role_display_name: None,
+            task: publication.task.clone(),
+            task_display_name: publication.task.clone(),
+            work_item: publication.work_item.clone(),
+            status: Some("published".into()),
+            outcome: publication.outcome.clone(),
+            summary: format!(
+                "Published {} branch `{}`.",
+                publication.kind, publication.branch_name
+            ),
+            reason: None,
+            handoff_target: None,
+            links: json!([{
+                "kind": "branch",
+                "label": publication.branch_name,
+                "url": publication.html_url,
+            }]),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn queue_status_comment(
     context: &PublicationContext<'_>,
     related: Option<(i64, &str)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Projected work-item issues remain concise specifications. The parent
+    // issue owns the single live lifecycle summary and links to all attempts.
+    if related.is_some() {
+        return Ok(());
+    }
     let Some(workflow_item_id) = context.workflow_item_id else {
         return Ok(());
     };
     let publications =
         list_agent_publications_for_run(context.pool, context.coordinator_job_id, None).await?;
-    let (issue_number, marker, heading, visible) = match related {
-        Some((issue_number, work_item)) => {
-            let visible = publications
-                .iter()
-                .filter(|publication| publication.work_item.as_deref() == Some(work_item))
-                .collect::<Vec<_>>();
-            (
-                issue_number,
-                format!(
-                    "<!-- donkeyspace-publication-status:{}:{} -->",
-                    context.coordinator_job_id, work_item
-                ),
-                format!(
-                    "{} agent artifacts for `{work_item}`",
-                    active_facade().display_name
-                ),
-                visible,
-            )
-        }
-        None => (
-            context.issue_number,
-            format!(
-                "<!-- donkeyspace-publication-status:{} -->",
-                context.coordinator_job_id
-            ),
-            format!("{} agent workspace status", active_facade().display_name),
-            publications.iter().collect::<Vec<_>>(),
-        ),
-    };
+    let workflow = get_workflow_by_issue(
+        context.pool,
+        context.owner,
+        context.repo,
+        context.issue_number,
+    )
+    .await?
+    .ok_or("workflow item disappeared while publishing status")?;
+    let jobs = list_jobs_for_workflow_item(context.pool, workflow_item_id).await?;
+    let events = list_lifecycle_events(context.pool, workflow_item_id, None, true, 8).await?;
+    let marker = "<!-- donkeyspace-lifecycle-status -->".to_string();
     let mut lines = vec![
-        format!("### {heading}"),
+        format!("### {} lifecycle status", active_facade().display_name),
         String::new(),
         format!("Run: `{}`", context.coordinator_job_id),
+        format!(
+            "Current state: `{}`",
+            workflow.current_state.as_deref().unwrap_or("unclassified")
+        ),
         String::new(),
-        "| Kind | Agent task | Outcome | Publication | Branch |".into(),
-        "| --- | --- | --- | --- | --- |".into(),
+        "#### Current agents".into(),
+        String::new(),
+        "| Agent task | State | Outcome |".into(),
+        "| --- | --- | --- |".into(),
     ];
-    for publication in visible {
-        let task = publication
-            .task
-            .as_deref()
-            .map(|task| match publication.work_item.as_deref() {
-                Some(work_item) => format!("{task}/{work_item}"),
-                None => task.to_string(),
-            })
-            .unwrap_or_else(|| "accepted checkpoint".into());
-        let publication_status = publication.last_error.as_deref().map_or_else(
-            || publication.status.clone(),
-            |error| format!("{}: {}", publication.status, truncate(error, 160)),
-        );
-        lines.push(format!(
-            "| {} | {} | {} | {} | [{}]({}) |",
-            publication.kind,
-            task,
-            publication.outcome.as_deref().unwrap_or("—"),
-            publication_status.replace('|', "\\|").replace('\n', "<br>"),
-            publication.branch_name,
-            publication.html_url,
-        ));
+    let mut current = BTreeMap::new();
+    let coordinator_id = context.coordinator_job_id.to_string();
+    for job in &jobs {
+        if job
+            .input
+            .pointer("/plugin_execution/coordinator_run_id")
+            .and_then(Value::as_str)
+            != Some(coordinator_id.as_str())
+        {
+            continue;
+        }
+        let Some(task) = job
+            .input
+            .pointer("/plugin_execution/task")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let work_item = job
+            .input
+            .pointer("/plugin_execution/work_item/id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        current.insert((task.to_string(), work_item.to_string()), job);
     }
-    if related.is_none()
-        && let Some(pull_request_url) = publications.iter().find_map(|publication| {
-            publication
-                .metadata
-                .get("pull_request_url")
-                .and_then(Value::as_str)
-        })
-    {
+    for job in current.into_values() {
+        let task = job
+            .input
+            .pointer("/plugin_execution/task_display_name")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                job.input
+                    .pointer("/plugin_execution/task")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or(&job.role);
+        let work_item = job
+            .input
+            .pointer("/plugin_execution/work_item/id")
+            .and_then(Value::as_str);
+        let label = work_item.map_or_else(|| task.into(), |item| format!("{task} / `{item}`"));
+        let outcome = job
+            .result
+            .as_ref()
+            .and_then(|result| result.get("outcome"))
+            .and_then(Value::as_str)
+            .unwrap_or("—");
+        lines.push(format!("| {} | {} | {} |", label, job.status, outcome));
+    }
+    let coordinator = jobs.iter().find(|job| job.id == context.coordinator_job_id);
+    let pending_approval = coordinator
+        .and_then(|job| job.result.as_ref())
+        .and_then(|result| result.get("human_review_reason"))
+        .and_then(Value::as_str);
+    if let Some(reason) = pending_approval {
         lines.extend([
             String::new(),
-            format!("Final pull request: {pull_request_url}"),
+            "#### Decision required".into(),
+            String::new(),
+            reason.into(),
         ]);
     }
     lines.extend([
         String::new(),
-        "Attempt and diagnostic branches are snapshots and are not merged automatically.".into(),
+        "#### Recent milestones".into(),
+        String::new(),
+    ]);
+    if events.is_empty() {
+        lines.push("Timeline tracking has not recorded a milestone for this workflow yet.".into());
+    } else {
+        for event in events.iter().rev() {
+            let source = matches!(event.source.as_str(), "poll" | "webhook")
+                .then(|| format!(" via {}", event.source))
+                .unwrap_or_default();
+            let wave = event
+                .wave
+                .map(|wave| format!("Wave {wave}: "))
+                .unwrap_or_default();
+            lines.push(format!("- {wave}{}{}", event.summary, source));
+        }
+    }
+    if let Some(pull_request_url) = publications.iter().find_map(|publication| {
+        publication
+            .metadata
+            .get("pull_request_url")
+            .and_then(Value::as_str)
+    }) {
+        lines.extend([
+            String::new(),
+            format!("Final pull request: {pull_request_url}"),
+        ]);
+    } else {
+        let explanation = if let Some(reason) = pending_approval {
+            truncate(reason.split("\n\n").next().unwrap_or(reason), 300)
+        } else if let Some(job) = jobs.iter().find(|job| job.status == "running") {
+            format!("Agent `{}` is still running.", job.role)
+        } else if let Some(job) = jobs.iter().find(|job| job.status == "waiting") {
+            format!("Agent `{}` is waiting for dependencies.", job.role)
+        } else {
+            "The workflow has not completed all required work yet.".into()
+        };
+        lines.extend([String::new(), format!("Why no PR yet: {explanation}")]);
+    }
+    if let Some(base) = active_dashboard_public_url() {
+        lines.extend([
+            String::new(),
+            format!(
+                "[Open the full lifecycle timeline]({}/repositories/{}/{}/issues/{})",
+                base.trim_end_matches('/'),
+                context.owner,
+                context.repo,
+                context.issue_number
+            ),
+        ]);
+    }
+    if !publications.is_empty() {
+        lines.extend([String::new(), "#### Artifacts".into(), String::new()]);
+        for publication in &publications {
+            let task = publication.task.as_deref().unwrap_or("workspace");
+            lines.push(format!(
+                "- {} `{task}`: [{}]({})",
+                publication.kind, publication.branch_name, publication.html_url
+            ));
+        }
+    }
+    lines.extend([
         String::new(),
         marker.clone(),
         "<!-- donkeyspace-generated -->".into(),
     ]);
-    create_outbound_action(
+    upsert_pending_outbound_action(
         context.pool,
         &OutboundActionInput {
             workflow_item_id,
@@ -375,14 +500,53 @@ async fn queue_status_comment(
             payload: json!({
                 "owner": context.owner,
                 "repo": context.repo,
-                "issue_number": issue_number,
+                "issue_number": context.issue_number,
                 "marker": marker,
                 "body": lines.join("\n"),
             }),
         },
+        &format!("workflow-status:{workflow_item_id}"),
     )
     .await?;
     Ok(())
+}
+
+pub async fn queue_lifecycle_status_for_job(
+    pool: &PgPool,
+    job: &donkeyspace_db::JobRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(workflow_item_id) = job.workflow_item_id else {
+        return Ok(());
+    };
+    let owner = job
+        .input
+        .pointer("/repository/owner/login")
+        .and_then(Value::as_str)
+        .ok_or("workflow input is missing repository owner")?;
+    let repo = job
+        .input
+        .pointer("/repository/name")
+        .and_then(Value::as_str)
+        .ok_or("workflow input is missing repository name")?;
+    let issue_number = job
+        .input
+        .pointer("/issue/number")
+        .and_then(Value::as_i64)
+        .ok_or("workflow input is missing issue number")?;
+    queue_status_comment(
+        &PublicationContext {
+            pool,
+            coordinator_job_id: job.id,
+            workflow_item_id: Some(workflow_item_id),
+            issue_number,
+            owner,
+            repo,
+            workspace_path: Path::new("."),
+            token: None,
+        },
+        None,
+    )
+    .await
 }
 
 fn truncate(value: &str, max: usize) -> String {

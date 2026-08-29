@@ -80,6 +80,7 @@ installation:
 
 roles:
   architect:
+    display_name: Design Architect
     command: [/plugin/bin/run-agent, architect]
   rtl:
     command: [/plugin/bin/run-agent, rtl]
@@ -99,6 +100,8 @@ flows:
     tasks:
       architect:
         role: architect
+        display_name: Block specification
+        approval_subject: proposed block specifications
         write: [docs/design]
         approval: required
       rtl:
@@ -114,11 +117,14 @@ flows:
         write: ["dv/{work_item}"]
       dv_verify:
         role: dv
+        display_name: Design verification
         scope: work_item
         dependencies: [rtl, dv_prepare]
         read: [docs/design, rtl, "dv/{work_item}"]
         write: ["dv/{work_item}"]
         allowed_handoffs: [rtl]
+        handoff_descriptions:
+          rtl: Verification found an RTL-correctable defect.
       synthesis:
         role: syn
         scope: work_item
@@ -132,6 +138,12 @@ The optional `facade` supplies user-facing defaults. Core validates and applies
 these values across the dashboard, GitHub prose and commands, and generated Git
 identity. Policy and private instance configuration may override individual
 fields without changing the plugin.
+
+Optional role and task `display_name` values, task `approval_subject` values,
+handoff descriptions keyed by an allowed target, and artifact or diagnostic
+display names customize lifecycle timelines without embedding plugin-specific
+terminology in core. Donkeyspace snapshots resolved wording into each event so
+later manifest edits do not rewrite history.
 
 `max_parallel_tasks` bounds the number of simultaneously running ready tasks;
 it defaults to four. `scope: workflow` is the default. A lifecycle start task must have workflow

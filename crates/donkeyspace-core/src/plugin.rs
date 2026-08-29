@@ -84,6 +84,8 @@ pub struct PluginEnvironmentVariable {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PluginRole {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub command: Vec<String>,
     #[serde(default)]
     pub image: Option<String>,
@@ -184,6 +186,10 @@ pub enum PluginApprovalMode {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PluginTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_subject: Option<String>,
     #[serde(alias = "agent")]
     pub role: String,
     #[serde(default)]
@@ -209,6 +215,8 @@ pub struct PluginTask {
     #[serde(default)]
     pub allowed_handoffs: Vec<String>,
     #[serde(default)]
+    pub handoff_descriptions: BTreeMap<String, String>,
+    #[serde(default)]
     pub transitions: BTreeMap<String, String>,
     #[serde(default)]
     pub terminal: bool,
@@ -227,6 +235,8 @@ pub struct PluginArtifact {
     pub kind: PluginArtifactType,
     #[serde(default)]
     pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -361,6 +371,9 @@ impl PluginManifest {
             validate_filesystem_template(&resource.path, &self.parameters, false)?;
         }
         for (name, role) in &self.roles {
+            if let Some(display_name) = &role.display_name {
+                validate_display_text("role display_name", display_name)?;
+            }
             if role.command.is_empty() {
                 return Err(PluginError::Invalid(format!(
                     "role `{name}` command is empty"
@@ -407,6 +420,12 @@ impl PluginManifest {
                 validate_filesystem_template(path, &self.parameters, false)?;
             }
             for (task_name, task) in &flow.tasks {
+                if let Some(display_name) = &task.display_name {
+                    validate_display_text("task display_name", display_name)?;
+                }
+                if let Some(subject) = &task.approval_subject {
+                    validate_display_text("task approval_subject", subject)?;
+                }
                 if !self.roles.contains_key(&task.role) {
                     return Err(PluginError::Invalid(format!(
                         "task `{task_name}` references unknown role `{}`",
@@ -425,6 +444,9 @@ impl PluginManifest {
                 }
                 validate_resource_assignments(&task.resources, &self.resources, task_name)?;
                 for artifact in &task.artifacts {
+                    if let Some(display_name) = &artifact.display_name {
+                        validate_display_text("artifact display_name", display_name)?;
+                    }
                     if artifact.path.contains(['*', '?', '[', ']']) {
                         return Err(PluginError::Invalid(format!(
                             "task `{task_name}` artifact paths must be exact"
@@ -433,6 +455,9 @@ impl PluginManifest {
                     validate_filesystem_template(&artifact.path, &self.parameters, true)?;
                 }
                 for diagnostic in &task.diagnostics {
+                    if let Some(display_name) = &diagnostic.display_name {
+                        validate_display_text("diagnostic display_name", display_name)?;
+                    }
                     if diagnostic.path.contains(['*', '?', '[', ']']) {
                         return Err(PluginError::Invalid(format!(
                             "task `{task_name}` diagnostic paths must be exact"
@@ -461,11 +486,28 @@ impl PluginManifest {
                         )));
                     }
                 }
+                for (target, description) in &task.handoff_descriptions {
+                    if !task.allowed_handoffs.contains(target) {
+                        return Err(PluginError::Invalid(format!(
+                            "task `{task_name}` describes undeclared handoff `{target}`"
+                        )));
+                    }
+                    validate_display_text("handoff description", description)?;
+                }
             }
             validate_task_graph(flow_name, flow)?;
         }
         Ok(())
     }
+}
+
+fn validate_display_text(field: &str, value: &str) -> Result<(), PluginError> {
+    if value.trim().is_empty() || value.len() > 160 || value.chars().any(char::is_control) {
+        return Err(PluginError::Invalid(format!(
+            "{field} must be nonempty single-line text no longer than 160 bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn is_environment_name(value: &str) -> bool {
@@ -713,7 +755,7 @@ api_version: 1
 id: example.rtl
 runtime: { default_image: example:dev }
 roles:
-  architect: { command: [run, architect] }
+  architect: { display_name: Design Architect, command: [run, architect] }
   rtl: { command: [run, rtl] }
   dv: { command: [run, dv] }
 flows:
@@ -724,6 +766,8 @@ flows:
     tasks:
       architect:
         role: architect
+        display_name: Block specification
+        approval_subject: generated block specification
         write: [docs/design]
         approval: required
       rtl:
@@ -743,6 +787,7 @@ flows:
         read: [docs/design, rtl, dv]
         write: ["dv/{work_item}"]
         allowed_handoffs: [rtl]
+        handoff_descriptions: { rtl: Verification found an RTL defect. }
 "#,
         )
         .unwrap();
@@ -755,6 +800,16 @@ flows:
         assert_eq!(
             manifest.flows["blocks"].tasks["rtl"].approval,
             PluginApprovalMode::None
+        );
+        assert_eq!(
+            manifest.roles["architect"].display_name.as_deref(),
+            Some("Design Architect")
+        );
+        assert_eq!(
+            manifest.flows["blocks"].tasks["architect"]
+                .approval_subject
+                .as_deref(),
+            Some("generated block specification")
         );
     }
 

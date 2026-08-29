@@ -5,8 +5,8 @@ use donkeyspace_core::{
     PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult, TestResult, TestStatus,
 };
 use donkeyspace_db::{
-    JobRecord, PgPool, complete_job, create_waiting_job, fail_job, get_job,
-    record_github_managed_resource_for_workflow_item, start_waiting_job,
+    JobRecord, LifecycleEventInput, PgPool, complete_job, create_waiting_job, fail_job, get_job,
+    record_github_managed_resource_for_workflow_item, record_lifecycle_event, start_waiting_job,
 };
 use donkeyspace_github::{GitHubClient, GitHubWorkItem};
 use futures::future::join_all;
@@ -33,6 +33,144 @@ pub struct LifecycleTracking<'a> {
     pub coordinator: &'a JobRecord,
     pub github: Option<&'a GitHubClient>,
     pub publication: Option<PublicationContext<'a>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_plugin_task_event(
+    tracking: Option<&LifecycleTracking<'_>>,
+    manifest: &PluginManifest,
+    flow: &PluginFlow,
+    key: &TaskKey,
+    job_id: Option<Uuid>,
+    event_type: &str,
+    level: &str,
+    status: Option<&str>,
+    outcome: Option<&str>,
+    summary: &str,
+    reason: Option<&str>,
+    handoff_target: Option<&str>,
+    wave: Option<u32>,
+    attempt: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(tracking) = tracking else {
+        return Ok(());
+    };
+    let Some(workflow_item_id) = tracking.coordinator.workflow_item_id else {
+        return Ok(());
+    };
+    let task = &flow.tasks[&key.task];
+    let role = &manifest.roles[&task.role];
+    let identity = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        tracking.coordinator.id,
+        event_type,
+        key.task,
+        key.work_item.as_deref().unwrap_or("workflow"),
+        job_id.map_or_else(|| "-".into(), |value| value.to_string()),
+        wave.map_or_else(|| "-".into(), |value| value.to_string()),
+        attempt.map_or_else(|| "-".into(), |value| value.to_string()),
+    );
+    record_lifecycle_event(
+        tracking.pool,
+        &LifecycleEventInput {
+            workflow_item_id,
+            coordinator_job_id: Some(tracking.coordinator.id),
+            job_id,
+            dedupe_key: Some(identity),
+            event_type: event_type.into(),
+            level: level.into(),
+            source: "worker".into(),
+            actor: None,
+            wave: wave.map(|value| value as i32),
+            attempt: attempt.map(|value| value as i32),
+            role: Some(task.role.clone()),
+            role_display_name: role
+                .display_name
+                .clone()
+                .or_else(|| Some(task.role.clone())),
+            task: Some(key.task.clone()),
+            task_display_name: task.display_name.clone().or_else(|| Some(key.task.clone())),
+            work_item: key.work_item.clone(),
+            status: status.map(Into::into),
+            outcome: outcome.map(Into::into),
+            summary: concise_event_text(summary),
+            reason: reason.map(concise_event_text),
+            handoff_target: handoff_target.map(Into::into),
+            links: json!([]),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn concise_event_text(value: &str) -> String {
+    let value = value.split("\n\n").next().unwrap_or(value).trim();
+    let mut shortened = value.chars().take(600).collect::<String>();
+    if value.chars().count() > 600 {
+        shortened.push('…');
+    }
+    shortened
+}
+
+fn outcome_name(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Ready => "ready",
+        Outcome::Implemented => "implemented",
+        Outcome::Reviewed => "reviewed",
+        Outcome::NeedsInfo => "needs_info",
+        Outcome::NeedsChanges => "needs_changes",
+        Outcome::NeedsHuman => "needs_human",
+        Outcome::Blocked => "blocked",
+        Outcome::Failed => "failed",
+    }
+}
+
+async fn record_flow_event(
+    tracking: Option<&LifecycleTracking<'_>>,
+    event_type: &str,
+    level: &str,
+    summary: &str,
+    reason: Option<&str>,
+    wave: Option<u32>,
+    dedupe_suffix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(tracking) = tracking else {
+        return Ok(());
+    };
+    let Some(workflow_item_id) = tracking.coordinator.workflow_item_id else {
+        return Ok(());
+    };
+    record_lifecycle_event(
+        tracking.pool,
+        &LifecycleEventInput {
+            workflow_item_id,
+            coordinator_job_id: Some(tracking.coordinator.id),
+            job_id: Some(tracking.coordinator.id),
+            dedupe_key: Some(format!(
+                "{}:{event_type}:{dedupe_suffix}",
+                tracking.coordinator.id
+            )),
+            event_type: event_type.into(),
+            level: level.into(),
+            source: "worker".into(),
+            actor: None,
+            wave: wave.map(|value| value as i32),
+            attempt: None,
+            role: None,
+            role_display_name: None,
+            task: None,
+            task_display_name: None,
+            work_item: None,
+            status: None,
+            outcome: None,
+            summary: concise_event_text(summary),
+            reason: reason.map(concise_event_text),
+            handoff_target: None,
+            links: json!([]),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 const CHECKPOINT_VERSION: u32 = 3;
@@ -480,7 +618,7 @@ async fn run_work_item_lifecycle(
                 let result = pending_approval_result(
                     &saved.pending_approvals,
                     &saved.projected_issues,
-                    &flow.start,
+                    flow,
                     &format!("The approval command was not applied: {error}"),
                 );
                 saved.version = CHECKPOINT_VERSION;
@@ -540,7 +678,7 @@ async fn run_work_item_lifecycle(
             let result = pending_approval_result(
                 &saved.pending_approvals,
                 &saved.projected_issues,
-                &flow.start,
+                flow,
                 "Some approvals remain pending.",
             );
             saved.last_result = result.clone();
@@ -600,6 +738,27 @@ async fn run_work_item_lifecycle(
         }
         let mut accumulated_tests = Vec::<TestResult>::new();
         let attempt = 1u32;
+        let planner_key = TaskKey {
+            work_item: None,
+            task: flow.start.clone(),
+        };
+        record_plugin_task_event(
+            tracking.as_ref(),
+            manifest,
+            flow,
+            &planner_key,
+            tracking.as_ref().map(|tracking| tracking.coordinator.id),
+            "task_started",
+            "milestone",
+            Some("running"),
+            None,
+            "Planning started.",
+            None,
+            None,
+            None,
+            Some(attempt),
+        )
+        .await?;
         let planner_execution = execute_task(
             selection,
             manifest,
@@ -619,6 +778,23 @@ async fn run_work_item_lifecycle(
             Ok(planner) => planner,
             Err(error) => {
                 let reason = error.to_string();
+                record_plugin_task_event(
+                    tracking.as_ref(),
+                    manifest,
+                    flow,
+                    &planner_key,
+                    tracking.as_ref().map(|tracking| tracking.coordinator.id),
+                    "task_failed",
+                    "milestone",
+                    Some("failed"),
+                    Some("failed"),
+                    "Planning failed.",
+                    Some(&reason),
+                    None,
+                    None,
+                    Some(attempt),
+                )
+                .await?;
                 publish_task_attempt(
                     tracking.as_ref(),
                     selection,
@@ -639,6 +815,23 @@ async fn run_work_item_lifecycle(
                 return Err(error);
             }
         };
+        record_plugin_task_event(
+            tracking.as_ref(),
+            manifest,
+            flow,
+            &planner_key,
+            tracking.as_ref().map(|tracking| tracking.coordinator.id),
+            "task_completed",
+            "milestone",
+            Some("completed"),
+            Some(outcome_name(planner.result.outcome)),
+            &planner.result.summary,
+            planner.result.human_review_reason.as_deref(),
+            None,
+            None,
+            Some(attempt),
+        )
+        .await?;
         accumulated_tests.extend(planner.result.tests.clone());
         let requested_work_items = planner.work_items.clone();
         let aggregate_risk = planner.result.risk;
@@ -860,7 +1053,7 @@ async fn run_work_item_lifecycle(
         let result = pending_approval_result(
             &pending,
             &projected_issues,
-            &flow.start,
+            flow,
             "The lifecycle start task completed successfully and requires approval before downstream work begins.",
         );
         write_lifecycle_checkpoint(
@@ -954,6 +1147,22 @@ async fn run_work_item_lifecycle(
             }
             return Err("plugin task graph has no runnable tasks".into());
         }
+        let wave = attempt;
+        let released = ready
+            .iter()
+            .map(approval_target)
+            .collect::<Vec<_>>()
+            .join(", ");
+        record_flow_event(
+            tracking.as_ref(),
+            "wave_started",
+            "milestone",
+            &format!("Wave {wave} started: {released}."),
+            None,
+            Some(wave),
+            &wave.to_string(),
+        )
+        .await?;
         for key in &ready {
             if let Some(tracking) = &tracking {
                 let job_id = ensure_waiting_tracked_job(
@@ -976,6 +1185,23 @@ async fn run_work_item_lifecycle(
                             approval_target(key)
                         )
                     })?;
+                record_plugin_task_event(
+                    Some(tracking),
+                    manifest,
+                    flow,
+                    key,
+                    Some(job_id),
+                    "task_started",
+                    "milestone",
+                    Some("running"),
+                    None,
+                    "Agent task started.",
+                    None,
+                    None,
+                    Some(wave),
+                    Some(wave),
+                )
+                .await?;
             }
             graph.mark_running(key)?;
         }
@@ -1033,6 +1259,30 @@ async fn run_work_item_lifecycle(
                         .await?;
                         finished_jobs.insert(key.clone());
                     }
+                    record_plugin_task_event(
+                        tracking.as_ref(),
+                        manifest,
+                        flow,
+                        &key,
+                        tracking.as_ref().map(|_| tracked_jobs[&key]),
+                        "task_completed",
+                        "milestone",
+                        Some("completed"),
+                        Some(outcome_name(execution.result.outcome)),
+                        &execution.result.summary,
+                        execution
+                            .result
+                            .human_review_reason
+                            .as_deref()
+                            .or(execution.result.blocked_reason.as_deref()),
+                        execution
+                            .handoff
+                            .as_ref()
+                            .map(|handoff| handoff.target.as_str()),
+                        Some(wave),
+                        Some(wave),
+                    )
+                    .await?;
                     successful_executions.push((key, execution));
                 }
                 Err(error) => {
@@ -1042,6 +1292,23 @@ async fn run_work_item_lifecycle(
                         fail_job(tracking.pool, tracked_jobs[&key], &result).await?;
                         finished_jobs.insert(key.clone());
                     }
+                    record_plugin_task_event(
+                        tracking.as_ref(),
+                        manifest,
+                        flow,
+                        &key,
+                        tracking.as_ref().map(|_| tracked_jobs[&key]),
+                        "task_failed",
+                        "milestone",
+                        Some("failed"),
+                        Some("failed"),
+                        "Agent task failed.",
+                        Some(&reason),
+                        None,
+                        Some(wave),
+                        Some(wave),
+                    )
+                    .await?;
                     execution_errors.push((key, attempt * 100 + offset as u32, reason));
                 }
             }
@@ -1212,6 +1479,28 @@ async fn run_work_item_lifecycle(
                         }
                         return Err(reason.into());
                     }
+                    let handoff_summary = task
+                        .handoff_descriptions
+                        .get(&handoff.target)
+                        .map(String::as_str)
+                        .unwrap_or("An agent requested changes from another task.");
+                    record_plugin_task_event(
+                        tracking.as_ref(),
+                        manifest,
+                        flow,
+                        &key,
+                        tracking.as_ref().map(|_| tracked_jobs[&key]),
+                        "handoff_requested",
+                        "milestone",
+                        None,
+                        Some("needs_changes"),
+                        handoff_summary,
+                        Some(&handoff.reason),
+                        Some(&handoff.target),
+                        Some(wave),
+                        Some(wave),
+                    )
+                    .await?;
                     let edge = (
                         key.work_item.clone(),
                         key.task.clone(),
@@ -1265,7 +1554,7 @@ async fn run_work_item_lifecycle(
                         let result = pending_approval_result(
                             &required_approvals,
                             &projected_issues,
-                            &flow.start,
+                            flow,
                             &lead,
                         );
                         write_lifecycle_checkpoint(
@@ -1356,7 +1645,7 @@ async fn run_work_item_lifecycle(
                     let result = pending_approval_result(
                         &required_approvals,
                         &projected_issues,
-                        &flow.start,
+                        flow,
                         &lead,
                     );
                     write_lifecycle_checkpoint(
@@ -1423,6 +1712,21 @@ async fn run_work_item_lifecycle(
         }
         for target in feedback {
             let invalidated = graph.restart_from(&target)?;
+            let invalidated_names = invalidated
+                .iter()
+                .map(approval_target)
+                .collect::<Vec<_>>()
+                .join(", ");
+            record_flow_event(
+                tracking.as_ref(),
+                "repair_wave_created",
+                "milestone",
+                &format!("Repair work was released for {invalidated_names}."),
+                Some("A task handoff invalidated its target and dependent results."),
+                Some(wave + 1),
+                &format!("{}:{}", wave + 1, approval_target(&target)),
+            )
+            .await?;
             required_approvals.retain(|approval| !invalidated.contains(&approval.key));
             if let Some(tracking) = &tracking {
                 for invalidated_key in invalidated {
@@ -1445,7 +1749,7 @@ async fn run_work_item_lifecycle(
             let result = pending_approval_result(
                 &required_approvals,
                 &projected_issues,
-                &flow.start,
+                flow,
                 "The configured tasks completed successfully and require approval before their dependents can run.",
             );
             write_lifecycle_checkpoint(
@@ -1626,22 +1930,30 @@ fn select_pending_approvals(
 fn pending_approval_result(
     pending: &[PendingApproval],
     projected_issues: &BTreeMap<String, i64>,
-    start_task: &str,
+    flow: &PluginFlow,
     lead: &str,
 ) -> RunResult {
+    let start_task = &flow.start;
     let subjects = pending
         .iter()
         .map(|approval| {
             let target = approval_target(&approval.key);
-            let artifact = match &approval.key.work_item {
-                Some(work_item) => format!(
+            let configured_subject = flow.tasks[&approval.key.task]
+                .approval_subject
+                .as_deref();
+            let artifact = match (&approval.key.work_item, configured_subject) {
+                (Some(work_item), Some(subject)) => {
+                    format!("the {subject} for work item `{work_item}`")
+                }
+                (None, Some(subject)) => format!("the {subject}"),
+                (Some(work_item), None) => format!(
                     "the completed `{}` output for work item `{work_item}`",
                     approval.key.task
                 ),
-                None if approval.key.task == start_task && !projected_issues.is_empty() => {
+                (None, None) if approval.key.task == *start_task && !projected_issues.is_empty() => {
                     "the proposed lifecycle plan and block specifications in the projected work-item issues listed below".to_string()
                 }
-                None => format!("the completed workflow-level `{}` output", approval.key.task),
+                (None, None) => format!("the completed workflow-level `{}` output", approval.key.task),
             };
             let consequence = match approval.trigger {
                 ApprovalTrigger::Required => {
@@ -1657,7 +1969,7 @@ fn pending_approval_result(
         .join("\n");
     let include_all_issues = pending
         .iter()
-        .any(|approval| approval.key.work_item.is_none() && approval.key.task == start_task);
+        .any(|approval| approval.key.work_item.is_none() && approval.key.task == *start_task);
     let pending_work_items = pending
         .iter()
         .filter_map(|approval| approval.key.work_item.as_deref())
@@ -1857,6 +2169,8 @@ async fn create_tracked_job(
         .as_deref()
         .and_then(|id| work_items.iter().find(|item| item.id == id));
     if let Value::Object(map) = &mut input {
+        let task = &flow.tasks[&key.task];
+        let role = &manifest.roles[&task.role];
         map.insert(
             "plugin_execution".into(),
             json!({
@@ -1864,18 +2178,38 @@ async fn create_tracked_job(
                 "plugin_id": manifest.id,
                 "flow": flow_name,
                 "task": key.task,
+                "task_display_name": task.display_name.as_deref().unwrap_or(&key.task),
+                "role_display_name": role.display_name.as_deref().unwrap_or(&task.role),
                 "work_item": work_item,
-                "dependencies": flow.tasks[&key.task].dependencies,
+                "dependencies": task.dependencies,
             }),
         );
     }
-    Ok(create_waiting_job(
+    let job = create_waiting_job(
         tracking.pool,
         tracking.coordinator.workflow_item_id,
         &flow.tasks[&key.task].role,
         &input,
     )
-    .await?)
+    .await?;
+    record_plugin_task_event(
+        Some(tracking),
+        manifest,
+        flow,
+        key,
+        Some(job.id),
+        "task_waiting",
+        "detail",
+        Some("waiting"),
+        None,
+        "Waiting for dependencies.",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    Ok(job)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2955,6 +3289,29 @@ mod tests {
         serde_yaml::from_str(input).unwrap()
     }
 
+    fn approval_manifest() -> PluginManifest {
+        test_manifest(
+            r#"
+api_version: 1
+id: test.approvals
+runtime: { default_image: test:dev }
+roles:
+  architect: { command: [true] }
+  dv: { command: [true] }
+  rtl: { command: [true] }
+flows:
+  blocks:
+    start: architect
+    replaces_default_lifecycle: true
+    work_items_path: docs/index.json
+    tasks:
+      architect: { role: architect, approval: required }
+      rtl: { role: rtl }
+      dv: { role: dv, allowed_handoffs: [rtl] }
+"#,
+        )
+    }
+
     fn temporary_root() -> PathBuf {
         env::temp_dir().join(format!("donkeyspace-plugin-test-{}", uuid::Uuid::now_v7()))
     }
@@ -3044,6 +3401,7 @@ flows:
             path: "logs".into(),
             kind: PluginArtifactType::Directory,
             required: false,
+            display_name: None,
         }];
 
         assert!(!diagnostics_present_at(&root, &diagnostics));
@@ -3427,6 +3785,7 @@ flows:
             path: "src/output.txt".into(),
             kind: PluginArtifactType::File,
             required: true,
+            display_name: None,
         };
         assert!(validate_artifacts(&root, std::slice::from_ref(&file), &["src".into()]).is_ok());
         let wrong_type = PluginArtifact {
@@ -3556,6 +3915,7 @@ flows:
 
     #[test]
     fn revision_requires_feedback_and_one_target() {
+        let manifest = approval_manifest();
         let pending = vec![PendingApproval {
             key: TaskKey {
                 task: "architect".into(),
@@ -3576,7 +3936,7 @@ flows:
         let result = pending_approval_result(
             &pending,
             &BTreeMap::from([("counter_detect".into(), 3)]),
-            "architect",
+            &manifest.flows["blocks"],
             "Review required.",
         );
         assert_eq!(result.outcome, Outcome::NeedsHuman);
@@ -3592,6 +3952,7 @@ flows:
 
     #[test]
     fn agent_requested_approval_explains_that_it_authorizes_a_rerun() {
+        let manifest = approval_manifest();
         let pending = vec![PendingApproval {
             key: TaskKey {
                 task: "dv".into(),
@@ -3602,7 +3963,7 @@ flows:
         let result = pending_approval_result(
             &pending,
             &BTreeMap::from([("counter_detect".into(), 3)]),
-            "architect",
+            &manifest.flows["blocks"],
             "DV needs a human decision.",
         );
         let reason = result.human_review_reason.unwrap();

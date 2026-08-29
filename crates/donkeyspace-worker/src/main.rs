@@ -5,13 +5,13 @@ use donkeyspace_core::{
     WorkflowState, triage_github_issue_actions, workflow_state_for_outcome,
 };
 use donkeyspace_db::{
-    CommandResultInput, DbConfig, JobRecord, OutboundActionInput, OutboundActionRecord,
-    acquire_next_queued_job, apply_migrations, complete_job, connect, create_command_result,
-    create_job, create_outbound_action, fail_active_plugin_child_jobs, fail_job, get_job,
-    list_github_repositories, list_github_repositories_for_installation,
+    CommandResultInput, DbConfig, JobRecord, LifecycleEventInput, OutboundActionInput,
+    OutboundActionRecord, acquire_next_queued_job, apply_migrations, complete_job, connect,
+    create_command_result, create_job, create_outbound_action, fail_active_plugin_child_jobs,
+    fail_job, get_job, list_github_repositories, list_github_repositories_for_installation,
     list_pending_agent_publications, list_pending_outbound_actions,
     list_ready_developer_candidates, list_repair_candidates, mark_job_running,
-    mark_outbound_action_completed, mark_outbound_action_failed, pause_job,
+    mark_outbound_action_completed, mark_outbound_action_failed, pause_job, record_lifecycle_event,
     record_state_transition, set_checkpoint_pull_request, unpublished_agent_publications_exist,
     update_workflow_item_state,
 };
@@ -42,7 +42,7 @@ mod repo_context;
 use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
 use publication::{
     AttemptPublication, PublicationContext, publish_attempt, publish_checkpoint,
-    push_existing_publication, queue_publication_status,
+    push_existing_publication, queue_lifecycle_status_for_job, queue_publication_status,
 };
 use repo_context::{
     RepoContextConfig, build_repository_context, cleanup_repository_context,
@@ -51,9 +51,61 @@ use repo_context::{
 
 static GITHUB_AUTH: OnceLock<GitHubCredentialProvider> = OnceLock::new();
 static ACTIVE_FACADE: OnceLock<Facade> = OnceLock::new();
+static ACTIVE_DASHBOARD_PUBLIC_URL: OnceLock<Option<String>> = OnceLock::new();
 
 pub(crate) fn active_facade() -> &'static Facade {
     ACTIVE_FACADE.get_or_init(Facade::default)
+}
+
+pub(crate) fn active_dashboard_public_url() -> Option<&'static str> {
+    ACTIVE_DASHBOARD_PUBLIC_URL
+        .get()
+        .and_then(|value| value.as_deref())
+}
+
+async fn record_coordinator_event(
+    pool: &donkeyspace_db::PgPool,
+    job: &JobRecord,
+    event_type: &str,
+    summary: &str,
+    reason: Option<&str>,
+    outcome: Option<Outcome>,
+    links: Value,
+) -> Result<(), donkeyspace_db::DbError> {
+    let Some(workflow_item_id) = job.workflow_item_id else {
+        return Ok(());
+    };
+    record_lifecycle_event(
+        pool,
+        &LifecycleEventInput {
+            workflow_item_id,
+            coordinator_job_id: Some(job.id),
+            job_id: Some(job.id),
+            dedupe_key: Some(format!(
+                "coordinator:{}:{event_type}:{}",
+                job.id, job.updated_at
+            )),
+            event_type: event_type.into(),
+            level: "milestone".into(),
+            source: "worker".into(),
+            actor: None,
+            wave: None,
+            attempt: None,
+            role: None,
+            role_display_name: None,
+            task: None,
+            task_display_name: None,
+            work_item: None,
+            status: None,
+            outcome: outcome.map(|outcome| format!("{outcome:?}").to_ascii_lowercase()),
+            summary: summary.into(),
+            reason: reason.map(Into::into),
+            handoff_target: None,
+            links,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Parser)]
@@ -113,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let policy = load_policy()?;
     let _ = ACTIVE_FACADE.set(policy.facade.resolve());
+    let _ = ACTIVE_DASHBOARD_PUBLIC_URL.set(policy.dashboard.public_url.clone());
     let _ = lifecycle_start_role(&policy)?;
 
     let pool = if let Some(database_url) = args.database_url {
@@ -760,7 +813,19 @@ async fn fail_triage_job(
             "triage execution failed",
         )
         .await?;
+        record_coordinator_event(
+            pool,
+            running_job,
+            "workflow_failed",
+            summary,
+            Some(blocked_reason),
+            Some(Outcome::Failed),
+            json!([]),
+        )
+        .await?;
     }
+
+    queue_lifecycle_status_for_job(pool, running_job).await?;
 
     Ok(())
 }
@@ -1100,7 +1165,21 @@ async fn execute_developer_job(
                 )
                 .await?;
             }
+            if paused {
+                record_coordinator_event(
+                    pool,
+                    &running_job,
+                    "approval_required",
+                    "The workflow is waiting for a human decision.",
+                    result.human_review_reason.as_deref(),
+                    Some(result.outcome),
+                    json!([]),
+                )
+                .await?;
+            }
         }
+
+        queue_lifecycle_status_for_job(pool, &running_job).await?;
 
         tracing::info!(
             job_id = %running_job.id,
@@ -1267,11 +1346,11 @@ async fn execute_developer_job(
                 &pull_request_body,
             )
             .await?;
-        Ok::<_, Box<dyn std::error::Error>>((owner, repo, pull_request_url))
+        Ok::<_, Box<dyn std::error::Error>>(pull_request_url)
     }
     .await;
 
-    let (owner, repo, pull_request_url) = match pull_request {
+    let pull_request_url = match pull_request {
         Ok(pull_request) => pull_request,
         Err(error) => {
             fail_role_job(
@@ -1331,25 +1410,23 @@ async fn execute_developer_job(
             .await?;
         }
 
-        if let Some(issue_number) = issue_number(&running_job.input) {
-            create_outbound_action(
-                pool,
-                &OutboundActionInput {
-                    workflow_item_id,
-                    job_id: Some(running_job.id),
-                    provider: "github".to_string(),
-                    action_type: "issue.create_comment".to_string(),
-                    payload: json!({
-                        "owner": owner,
-                        "repo": repo,
-                        "issue_number": issue_number,
-                        "body": format!("{} implementation lifecycle opened a pull request: {pull_request_url}\n\n<!-- donkeyspace-generated -->", active_facade().display_name),
-                    }),
-                },
-            )
-            .await?;
-        }
+        record_coordinator_event(
+            pool,
+            &running_job,
+            "pull_request_opened",
+            "The implementation lifecycle opened a pull request.",
+            None,
+            Some(result.outcome),
+            json!([{
+                "kind": "pull_request",
+                "label": format!("Pull request for issue #{}", issue_num),
+                "url": pull_request_url,
+            }]),
+        )
+        .await?;
     }
+
+    queue_lifecycle_status_for_job(pool, &running_job).await?;
 
     tracing::info!(
         job_id = %running_job.id,
@@ -1929,7 +2006,19 @@ async fn fail_role_job(
             transition_reason,
         )
         .await?;
+        record_coordinator_event(
+            pool,
+            running_job,
+            "workflow_failed",
+            summary,
+            Some(blocked_reason),
+            Some(Outcome::Failed),
+            json!([]),
+        )
+        .await?;
     }
+
+    queue_lifecycle_status_for_job(pool, running_job).await?;
 
     Ok(())
 }

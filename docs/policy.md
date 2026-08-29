@@ -183,6 +183,8 @@ retry creates a new job linked through `retry_of_job_id`.
 
 ```yaml
 dashboard:
+  # Optional externally reachable dashboard origin used in GitHub status links.
+  public_url: https://agents.example.com
   expose_policy: true
   allow_retry: true
   allow_cancel: true
@@ -190,4 +192,5 @@ dashboard:
 
 `dashboard.allow_retry` gates the retry API. `dashboard.expose_policy` and
 `dashboard.allow_cancel` are parsed but not implemented. The dashboard does not
-edit policy.
+edit policy. When `dashboard.public_url` is omitted, lifecycle status comments
+remain self-contained and do not publish a broken dashboard link.

@@ -12,15 +12,16 @@ use donkeyspace_core::{
     WorkflowState, normalize_workflow_labels,
 };
 use donkeyspace_db::{
-    DbConfig, EngagementDecisionInput, JobRecord, PgPool, PullRequestInput, RepositoryInput,
-    WorkflowItemInput, acquire_job_lease, active_job_exists_for_workflow_item, apply_migrations,
-    connect, create_job, create_retry_job, get_job, get_workflow_item_by_issue_number,
-    get_workflow_item_state, github_managed_resource_exists, latest_workflow_job_input,
-    list_agent_publications_for_run, list_job_command_results, list_job_outbound_actions,
-    list_job_transitions, list_jobs, list_jobs_for_repository,
-    list_open_managed_pull_requests_for_base, list_recent_engagement_decisions,
-    list_recent_outbound_actions, list_recent_outbound_actions_for_repository,
-    pending_outbound_comment_exists, record_engagement_decision, record_state_transition,
+    DbConfig, EngagementDecisionInput, JobRecord, LifecycleEventInput, PgPool, PullRequestInput,
+    RepositoryInput, WorkflowItemInput, acquire_job_lease, active_job_exists_for_workflow_item,
+    apply_migrations, connect, create_job, create_retry_job, get_job, get_workflow_by_issue,
+    get_workflow_item_by_issue_number, get_workflow_item_state, github_managed_resource_exists,
+    latest_workflow_job_input, list_agent_publications_for_run, list_job_command_results,
+    list_job_outbound_actions, list_job_transitions, list_jobs, list_jobs_for_repository,
+    list_jobs_for_workflow_item, list_lifecycle_events, list_open_managed_pull_requests_for_base,
+    list_recent_engagement_decisions, list_recent_outbound_actions,
+    list_recent_outbound_actions_for_repository, list_workflows, pending_outbound_comment_exists,
+    record_engagement_decision, record_lifecycle_event, record_state_transition,
     record_webhook_delivery, repair_job_exists_for_pr_base, resume_latest_paused_job,
     retry_agent_publication, reviewer_job_exists_for_pr_head, upsert_pull_request,
     upsert_repository, upsert_workflow_item, webhook_delivery_exists,
@@ -69,6 +70,18 @@ struct FacadeResponse {
 #[derive(Debug, Deserialize)]
 struct RepositoryQuery {
     repository: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowEventsQuery {
+    before_id: Option<i64>,
+    #[serde(default = "default_event_level")]
+    level: String,
+    limit: Option<i64>,
+}
+
+fn default_event_level() -> String {
+    "milestone".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +230,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/facade", get(api_facade))
         .route("/api/repositories", get(api_repositories))
         .route("/api/runs", get(api_runs))
+        .route("/api/workflows", get(api_workflows))
+        .route(
+            "/api/workflows/{owner}/{repo}/issues/{number}",
+            get(api_workflow),
+        )
+        .route(
+            "/api/workflows/{owner}/{repo}/issues/{number}/events",
+            get(api_workflow_events),
+        )
         .route("/api/outbound-actions", get(api_outbound_actions))
         .route("/api/engagement-decisions", get(api_engagement_decisions))
         .route("/api/github-poll/status", get(api_github_poll_status))
@@ -909,6 +931,332 @@ async fn api_runs(
                 .into_response()
         }
     }
+}
+
+async fn api_workflows(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RepositoryQuery>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+    let repository = match parse_repository_query(query.repository.as_deref()) {
+        Ok(repository) => repository,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(ApiError::new(error))).into_response(),
+    };
+    let workflows = match list_workflows(
+        pool,
+        repository
+            .as_ref()
+            .map(|(owner, repo)| (owner.as_str(), repo.as_str())),
+        50,
+    )
+    .await
+    {
+        Ok(workflows) => workflows,
+        Err(error) => {
+            tracing::error!(%error, "failed to list workflows");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to list workflows")),
+            )
+                .into_response();
+        }
+    };
+    let mut summaries = Vec::with_capacity(workflows.len());
+    for workflow in workflows {
+        match workflow_summary(pool, workflow).await {
+            Ok(summary) => summaries.push(summary),
+            Err(error) => {
+                tracing::error!(%error, "failed to build workflow summary");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::new("failed to build workflow summary")),
+                )
+                    .into_response();
+            }
+        }
+    }
+    Json(summaries).into_response()
+}
+
+async fn api_workflow(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+    let Some(workflow) = (match get_workflow_by_issue(pool, &owner, &repo, number).await {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            tracing::error!(%error, "failed to fetch workflow");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to fetch workflow")),
+            )
+                .into_response();
+        }
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new("workflow not found")),
+        )
+            .into_response();
+    };
+    match workflow_summary(pool, workflow).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to build workflow detail");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to build workflow detail")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_workflow_events(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+    Query(query): Query<WorkflowEventsQuery>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+    if !matches!(query.level.as_str(), "milestone" | "all") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new("event level must be milestone or all")),
+        )
+            .into_response();
+    }
+    let workflow = match get_workflow_by_issue(pool, &owner, &repo, number).await {
+        Ok(Some(workflow)) => workflow,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new("workflow not found")),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve workflow timeline");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to resolve workflow timeline")),
+            )
+                .into_response();
+        }
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    match list_lifecycle_events(
+        pool,
+        workflow.id,
+        query.before_id,
+        query.level == "milestone",
+        limit,
+    )
+    .await
+    {
+        Ok(events) => {
+            let next_before_id = (events.len() as i64 == limit)
+                .then(|| events.last().map(|event| event.id))
+                .flatten();
+            Json(LifecycleEventPage {
+                events,
+                next_before_id,
+            })
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to fetch workflow timeline");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to fetch workflow timeline")),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn workflow_summary(
+    pool: &PgPool,
+    workflow: donkeyspace_db::WorkflowOverviewRecord,
+) -> Result<WorkflowSummary, donkeyspace_db::DbError> {
+    let jobs = list_jobs_for_workflow_item(pool, workflow.id).await?;
+    let coordinator_id = workflow.latest_job_id;
+    let publication_pr_url = if let Some(coordinator_id) = coordinator_id {
+        list_agent_publications_for_run(pool, coordinator_id, None)
+            .await?
+            .into_iter()
+            .find_map(|publication| {
+                publication
+                    .metadata
+                    .get("pull_request_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    } else {
+        None
+    };
+    let pull_request_url = workflow.pull_request_url.clone().or(publication_pr_url);
+    let mut latest = BTreeMap::<(String, String), &JobRecord>::new();
+    for job in &jobs {
+        if job
+            .input
+            .pointer("/plugin_execution/coordinator_run_id")
+            .and_then(Value::as_str)
+            != coordinator_id.map(|id| id.to_string()).as_deref()
+        {
+            continue;
+        }
+        let Some(task) = job
+            .input
+            .pointer("/plugin_execution/task")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let work_item = job
+            .input
+            .pointer("/plugin_execution/work_item/id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        latest.insert((task.into(), work_item.into()), job);
+    }
+    let tasks = latest
+        .into_values()
+        .map(|job| WorkflowTaskSummary {
+            job_id: job.id,
+            role: job.role.clone(),
+            role_display_name: job
+                .input
+                .pointer("/plugin_execution/role_display_name")
+                .and_then(Value::as_str)
+                .unwrap_or(&job.role)
+                .into(),
+            task: job
+                .input
+                .pointer("/plugin_execution/task")
+                .and_then(Value::as_str)
+                .unwrap_or(&job.role)
+                .into(),
+            task_display_name: job
+                .input
+                .pointer("/plugin_execution/task_display_name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    job.input
+                        .pointer("/plugin_execution/task")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or(&job.role)
+                .into(),
+            work_item: job
+                .input
+                .pointer("/plugin_execution/work_item/id")
+                .and_then(Value::as_str)
+                .map(Into::into),
+            status: job.status.clone(),
+            outcome: job
+                .result
+                .as_ref()
+                .and_then(|result| result.get("outcome"))
+                .and_then(Value::as_str)
+                .map(Into::into),
+            summary: job
+                .result
+                .as_ref()
+                .and_then(|result| result.get("summary"))
+                .and_then(Value::as_str)
+                .map(Into::into),
+            updated_at: job.updated_at,
+        })
+        .collect::<Vec<_>>();
+    let pending_approval: Option<String> = jobs
+        .iter()
+        .filter(|job| Some(job.id) == coordinator_id)
+        .filter_map(|job| job.result.as_ref())
+        .find_map(|result| {
+            result
+                .get("human_review_reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let no_pr_reason = if pull_request_url.is_some() {
+        None
+    } else if let Some(reason) = &pending_approval {
+        Some(first_paragraph(reason))
+    } else if let Some(task) = tasks.iter().find(|task| task.status == "running") {
+        Some(format!("Waiting for {} to finish.", task.task_display_name))
+    } else if let Some(task) = tasks.iter().find(|task| task.status == "waiting") {
+        Some(format!(
+            "{} is waiting for its dependencies.",
+            task.task_display_name
+        ))
+    } else if workflow.current_state.as_deref() == Some("blocked") {
+        Some(
+            workflow
+                .latest_summary
+                .clone()
+                .unwrap_or_else(|| "The workflow is blocked.".into()),
+        )
+    } else {
+        Some("The workflow has not completed all required work yet.".into())
+    };
+    Ok(WorkflowSummary {
+        id: workflow.id,
+        owner: workflow.owner.clone(),
+        repository: workflow.repository.clone(),
+        issue_number: workflow.issue_number,
+        issue_title: workflow
+            .issue_title
+            .unwrap_or_else(|| "Untitled issue".into()),
+        issue_url: format!(
+            "https://github.com/{}/{}/issues/{}",
+            workflow.owner, workflow.repository, workflow.issue_number
+        ),
+        provider_state: workflow.provider_state,
+        current_state: workflow.current_state,
+        current_labels: workflow.current_labels,
+        coordinator_job_id: coordinator_id,
+        coordinator_status: workflow.latest_job_status,
+        outcome: workflow.latest_outcome,
+        summary: workflow.latest_summary,
+        pending_approval,
+        tasks,
+        pull_request_number: workflow.pull_request_number,
+        pull_request_url,
+        pull_request_state: workflow.pull_request_state,
+        no_pr_reason,
+        updated_at: workflow.updated_at,
+        created_at: workflow.created_at,
+    })
+}
+
+fn first_paragraph(value: &str) -> String {
+    value
+        .split("\n\n")
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .chars()
+        .take(400)
+        .collect()
 }
 
 async fn api_run(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> impl IntoResponse {
@@ -1625,6 +1973,14 @@ async fn persist_issue_webhook(
     }
     if let Value::Object(map) = &mut payload_value {
         map.insert(
+            "donkeyspace_ingress".into(),
+            json!({
+                "delivery_id": delivery,
+                "source": ingress_source(delivery),
+                "event": event,
+            }),
+        );
+        map.insert(
             "donkeyspace_engagement".into(),
             json!({
                 "decision_id": audit.id,
@@ -1634,12 +1990,21 @@ async fn persist_issue_webhook(
                 "reason": authorization.reason,
             }),
         );
-        if let Some(action) = human_approval {
+        if let Some(action) = human_approval.clone() {
             map.insert(
                 "donkeyspace_human_decision".into(),
                 serde_json::to_value(action).expect("approval action serializes"),
             );
         }
+    }
+
+    if policy.lifecycle.plugin.is_some()
+        && let Value::Object(map) = &mut payload_value
+    {
+        map.insert(
+            "donkeyspace_lifecycle_coordinator".into(),
+            Value::Bool(true),
+        );
     }
 
     if active_job_exists_for_workflow_item(pool, workflow_item_id).await? {
@@ -1655,6 +2020,42 @@ async fn persist_issue_webhook(
     if gate == EngagementGate::NeedsHumanResume
         && let Some(job) = resume_latest_paused_job(pool, workflow_item_id, &payload_value).await?
     {
+        let (event_type, summary) = match human_approval.as_ref() {
+            Some(HumanApprovalAction::Approve { target }) => (
+                "approval_received",
+                format!(
+                    "Approval accepted{}.",
+                    target
+                        .as_deref()
+                        .map(|target| format!(" for {target}"))
+                        .unwrap_or_default()
+                ),
+            ),
+            Some(HumanApprovalAction::Revise { target, .. }) => (
+                "revision_received",
+                format!(
+                    "Revision requested{}.",
+                    target
+                        .as_deref()
+                        .map(|target| format!(" for {target}"))
+                        .unwrap_or_default()
+                ),
+            ),
+            None => (
+                "workflow_resumed",
+                "Authorized feedback resumed the workflow.".into(),
+            ),
+        };
+        record_ingress_lifecycle_event(
+            pool,
+            workflow_item_id,
+            Some(job.id),
+            delivery,
+            event_type,
+            &summary,
+            payload.sender.as_ref().map(|sender| sender.login.as_str()),
+        )
+        .await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -1670,9 +2071,19 @@ async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Queued(Box::new(job)));
     }
 
-    let initial_role =
-        lifecycle_start_role(policy)?.unwrap_or_else(|| AgentRole::Triage.as_str().to_string());
+    let lifecycle_role = lifecycle_start_role(policy)?;
+    let initial_role = lifecycle_role.unwrap_or_else(|| AgentRole::Triage.as_str().to_string());
     let job = create_job(pool, Some(workflow_item_id), &initial_role, &payload_value).await?;
+    record_ingress_lifecycle_event(
+        pool,
+        workflow_item_id,
+        Some(job.id),
+        delivery,
+        "issue_received",
+        "Issue accepted for agent work.",
+        payload.sender.as_ref().map(|sender| sender.login.as_str()),
+    )
+    .await?;
     record_state_transition(
         pool,
         workflow_item_id,
@@ -1687,6 +2098,53 @@ async fn persist_issue_webhook(
     .await?;
 
     Ok(WebhookPersistOutcome::Queued(Box::new(job)))
+}
+
+fn ingress_source(delivery: &str) -> &'static str {
+    if delivery.starts_with("github-poll:") {
+        "poll"
+    } else {
+        "webhook"
+    }
+}
+
+async fn record_ingress_lifecycle_event(
+    pool: &PgPool,
+    workflow_item_id: i64,
+    coordinator_job_id: Option<Uuid>,
+    delivery: &str,
+    event_type: &str,
+    summary: &str,
+    actor: Option<&str>,
+) -> Result<(), donkeyspace_db::DbError> {
+    record_lifecycle_event(
+        pool,
+        &LifecycleEventInput {
+            workflow_item_id,
+            coordinator_job_id,
+            job_id: coordinator_job_id,
+            dedupe_key: Some(format!("ingress:{delivery}:{event_type}")),
+            event_type: event_type.into(),
+            level: "milestone".into(),
+            source: ingress_source(delivery).into(),
+            actor: actor.map(Into::into),
+            wave: None,
+            attempt: None,
+            role: None,
+            role_display_name: None,
+            task: None,
+            task_display_name: None,
+            work_item: None,
+            status: None,
+            outcome: None,
+            summary: summary.into(),
+            reason: None,
+            handoff_target: None,
+            links: json!([]),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn is_projected_work_item(body: &str) -> bool {
@@ -2532,6 +2990,51 @@ struct RunDetail {
     outbound_actions: Vec<donkeyspace_db::OutboundActionRecord>,
     command_results: Vec<donkeyspace_db::CommandResultRecord>,
     publications: Vec<donkeyspace_db::AgentPublicationRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowTaskSummary {
+    job_id: Uuid,
+    role: String,
+    role_display_name: String,
+    task: String,
+    task_display_name: String,
+    work_item: Option<String>,
+    status: String,
+    outcome: Option<String>,
+    summary: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowSummary {
+    id: i64,
+    owner: String,
+    repository: String,
+    issue_number: i64,
+    issue_title: String,
+    issue_url: String,
+    provider_state: String,
+    current_state: Option<String>,
+    current_labels: Value,
+    coordinator_job_id: Option<Uuid>,
+    coordinator_status: Option<String>,
+    outcome: Option<String>,
+    summary: Option<String>,
+    pending_approval: Option<String>,
+    tasks: Vec<WorkflowTaskSummary>,
+    pull_request_number: Option<i64>,
+    pull_request_url: Option<String>,
+    pull_request_state: Option<String>,
+    no_pr_reason: Option<String>,
+    updated_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleEventPage {
+    events: Vec<donkeyspace_db::LifecycleEventRecord>,
+    next_before_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]

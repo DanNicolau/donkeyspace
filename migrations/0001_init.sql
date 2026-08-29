@@ -198,3 +198,45 @@ CREATE INDEX IF NOT EXISTS agent_publications_job_idx
     ON agent_publications(job_id, created_at);
 CREATE INDEX IF NOT EXISTS agent_publications_status_idx
     ON agent_publications(status, updated_at);
+
+-- Immutable, user-facing history for a workflow item.  Mutable job rows remain
+-- the scheduler authority; this table records the ordered semantic sequence
+-- which produced their current state.
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+    id BIGSERIAL PRIMARY KEY,
+    workflow_item_id BIGINT NOT NULL REFERENCES workflow_items(id),
+    coordinator_job_id UUID REFERENCES jobs(id),
+    job_id UUID REFERENCES jobs(id),
+    dedupe_key TEXT,
+    event_type TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'milestone',
+    source TEXT NOT NULL DEFAULT 'worker',
+    actor TEXT,
+    wave INTEGER,
+    attempt INTEGER,
+    role TEXT,
+    role_display_name TEXT,
+    task TEXT,
+    task_display_name TEXT,
+    work_item TEXT,
+    status TEXT,
+    outcome TEXT,
+    summary TEXT NOT NULL,
+    reason TEXT,
+    handoff_target TEXT,
+    links JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (workflow_item_id, dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS lifecycle_events_workflow_order_idx
+    ON lifecycle_events(workflow_item_id, id DESC);
+CREATE INDEX IF NOT EXISTS lifecycle_events_coordinator_idx
+    ON lifecycle_events(coordinator_job_id, id DESC);
+CREATE INDEX IF NOT EXISTS lifecycle_events_task_idx
+    ON lifecycle_events(workflow_item_id, task, work_item, id DESC);
+
+ALTER TABLE outbound_actions ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS outbound_actions_pending_dedupe_idx
+    ON outbound_actions(dedupe_key)
+    WHERE status = 'pending' AND dedupe_key IS NOT NULL;

@@ -30,6 +30,9 @@ a time. Humans remain responsible for merging pull requests.
    repair agent runs only when the base branch cannot be merged cleanly.
 8. GitHub labels and comments communicate the result; PostgreSQL retains the
    job, transition, command, PR, and outbound-action records.
+9. Semantic lifecycle events record the trigger source, agent waves, task
+   outcomes, approvals, handoffs, publications, and final PR as an ordered
+   issue-level history.
 
 In the default lifecycle, review findings do not automatically requeue
 development. Lifecycle plugins may define bounded task feedback edges.
@@ -72,10 +75,12 @@ PostgreSQL stores:
 - pending, completed, or failed outbound GitHub actions.
 - accepted-checkpoint and forensic-attempt branch publications, including
   retry state and commit links.
+- bounded user-facing lifecycle events; prompts and raw logs are deliberately
+  excluded, while diagnostic branches remain available as links.
 
 The action outbox records label and comment writes before the worker sends them
-to GitHub. Policy snapshot tables exist, but policy snapshots and decisions are
-not yet exposed as a complete audit trail.
+to GitHub. Rapid parent-issue status updates coalesce into one pending upsert,
+so GitHub contains one live lifecycle comment rather than a comment per event.
 
 ## Agent Runtime
 

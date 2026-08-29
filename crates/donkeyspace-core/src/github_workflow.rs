@@ -68,12 +68,13 @@ pub fn triage_github_issue_actions(
 
     if let Some(body) = triage_comment_body(policy, result, target_state) {
         actions.push(GitHubIssueAction {
-            action_type: "issue.create_comment".to_string(),
+            action_type: "issue.upsert_comment".to_string(),
             payload: serde_json::json!({
                 "owner": owner,
                 "repo": repo,
                 "issue_number": issue_number,
-                "body": body,
+                "marker": "<!-- donkeyspace-lifecycle-status -->",
+                "body": format!("{body}\n\n<!-- donkeyspace-lifecycle-status -->\n<!-- donkeyspace-generated -->"),
             }),
         });
     }
@@ -199,7 +200,11 @@ mod tests {
         assert_eq!(actions[1].payload["owner"], "owner");
         assert_eq!(actions[1].payload["repo"], "repo");
         assert_eq!(actions[1].payload["label"], "ai:ready");
-        assert_eq!(actions[2].action_type, "issue.create_comment");
+        assert_eq!(actions[2].action_type, "issue.upsert_comment");
+        assert_eq!(
+            actions[2].payload["marker"],
+            "<!-- donkeyspace-lifecycle-status -->"
+        );
     }
 
     #[test]

@@ -61,6 +61,13 @@ impl Policy {
             ));
         }
         policy.facade.validate().map_err(PolicyError::Invalid)?;
+        if let Some(public_url) = &policy.dashboard.public_url
+            && !(public_url.starts_with("https://") || public_url.starts_with("http://localhost"))
+        {
+            return Err(PolicyError::Invalid(
+                "dashboard.public_url must use HTTPS (or http://localhost for development)".into(),
+            ));
+        }
         policy.workflow.engagement.validate()?;
         Ok(policy)
     }
@@ -529,6 +536,8 @@ pub struct AutomationPolicy {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DashboardPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     #[serde(default)]
     pub expose_policy: bool,
     #[serde(default)]
