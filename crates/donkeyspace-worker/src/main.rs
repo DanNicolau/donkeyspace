@@ -956,6 +956,14 @@ async fn execute_developer_job(
                 process_outbound_action(pool, client, &outbound_action).await?;
             }
         }
+
+        // A resumed plugin coordinator may still have a needs-human comment
+        // from its previous checkpoint. Publish the running projection as
+        // soon as the workflow restarts so GitHub does not contradict the
+        // issue label while downstream tasks are being released.
+        if lifecycle_selection.is_some() {
+            queue_lifecycle_status_for_job(pool, &running_job).await?;
+        }
     }
 
     let repository_context = match build_repository_context(
