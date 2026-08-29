@@ -66,7 +66,13 @@ pub fn triage_github_issue_actions(
         });
     }
 
-    if let Some(body) = triage_comment_body(policy, result, target_state) {
+    // Plugin lifecycles publish one richer, coalesced status comment from the
+    // lifecycle coordinator. Keeping the legacy triage comment enabled here
+    // creates two writers for the same marker and lets delivery order decide
+    // which view survives on GitHub.
+    if policy.lifecycle.plugin.is_none()
+        && let Some(body) = triage_comment_body(policy, result, target_state)
+    {
         actions.push(GitHubIssueAction {
             action_type: "issue.upsert_comment".to_string(),
             payload: serde_json::json!({
@@ -204,6 +210,50 @@ mod tests {
         assert_eq!(
             actions[2].payload["marker"],
             "<!-- donkeyspace-lifecycle-status -->"
+        );
+    }
+
+    #[test]
+    fn plugin_lifecycle_leaves_status_comment_to_coordinator() {
+        let mut policy = policy();
+        policy.lifecycle.plugin = Some(crate::PluginFlowSelection {
+            manifest_path: "/plugins/hardware/plugin.yml".to_string(),
+            flow: "hardware".to_string(),
+            max_handoffs_per_edge: None,
+            environment: Default::default(),
+            parameters: Default::default(),
+            task_access_overrides: Default::default(),
+        });
+        let result = RunResult {
+            outcome: Outcome::NeedsHuman,
+            summary: "Specification is ready for approval.".to_string(),
+            confidence: Confidence::High,
+            risk: Risk::Low,
+            questions: Vec::new(),
+            tests: Vec::new(),
+            changed_files: Vec::new(),
+            human_review_reason: Some("Approve the specification.".to_string()),
+            blocked_reason: None,
+        };
+
+        let actions = triage_github_issue_actions(
+            &policy,
+            &json!({
+                "repository": {
+                    "name": "repo",
+                    "owner": {"login": "owner"}
+                },
+                "issue": {"number": 42}
+            }),
+            &result,
+            WorkflowState::NeedsHuman,
+        );
+
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.action_type != "issue.upsert_comment")
         );
     }
 
