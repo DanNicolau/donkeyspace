@@ -125,6 +125,93 @@ fn outcome_name(outcome: Outcome) -> &'static str {
     }
 }
 
+pub fn configured_pull_request_title(
+    selection: &PluginFlowSelection,
+    issue_input: &Value,
+    issue_number: i64,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let manifest = PluginManifest::from_path(&selection.manifest_path)?;
+    let flow = manifest
+        .flows
+        .get(&selection.flow)
+        .ok_or_else(|| format!("plugin `{}` has no flow `{}`", manifest.id, selection.flow))?;
+    let Some(template) = flow.pull_request_title.as_deref() else {
+        return Ok(None);
+    };
+    let title = template
+        .replace("{issue_number}", &issue_number.to_string())
+        .replace("{issue_title}", &publication_issue_title(issue_input));
+    Ok(Some(limit_publication_title(&title)))
+}
+
+fn checkpoint_commit_title(
+    flow: &PluginFlow,
+    keys: &[TaskKey],
+    issue_input: &Value,
+    issue_number: i64,
+) -> Option<String> {
+    let mut tags = Vec::new();
+    let mut descriptions = Vec::new();
+    let mut work_items = Vec::new();
+    for key in keys {
+        let task = &flow.tasks[&key.task];
+        if let Some(tag) = &task.publication_tag
+            && !tags.contains(tag)
+        {
+            tags.push(tag.clone());
+        }
+        let description = task.display_name.as_deref().unwrap_or(&key.task);
+        if !descriptions.iter().any(|value| value == description) {
+            descriptions.push(description.to_string());
+        }
+        if let Some(work_item) = &key.work_item
+            && !work_items.contains(work_item)
+        {
+            work_items.push(work_item.clone());
+        }
+    }
+    if tags.is_empty() {
+        return None;
+    }
+    let tags = tags
+        .iter()
+        .map(|tag| format!("[{tag}]"))
+        .collect::<String>();
+    let subject = if work_items.is_empty() {
+        publication_issue_title(issue_input)
+    } else {
+        work_items.join(", ")
+    };
+    Some(limit_publication_title(&format!(
+        "{tags} {}: {subject} (#{issue_number})",
+        descriptions.join(" + ")
+    )))
+}
+
+fn publication_issue_title(issue_input: &Value) -> String {
+    let value = issue_input
+        .pointer("/issue/title")
+        .and_then(Value::as_str)
+        .unwrap_or("Implementation");
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        "Implementation".into()
+    } else {
+        normalized
+    }
+}
+
+fn limit_publication_title(value: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let value = value.trim();
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    let mut shortened = value.chars().take(MAX_CHARS - 1).collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
 async fn record_flow_event(
     tracking: Option<&LifecycleTracking<'_>>,
     event_type: &str,
@@ -386,6 +473,7 @@ pub async fn run(
                     tracking.as_ref(),
                     selection,
                     &stage_name,
+                    stage.publication_tag.as_deref(),
                     attempt,
                     &stage_root,
                     repo_path,
@@ -441,6 +529,7 @@ pub async fn run(
                     tracking.as_ref(),
                     selection,
                     &stage_name,
+                    stage.publication_tag.as_deref(),
                     attempt,
                     &stage_root,
                     repo_path,
@@ -463,12 +552,23 @@ pub async fn run(
                 && let Err(error) = publish_checkpoint(
                     publication,
                     repo_path,
-                    &format!(
-                        "chore({}): checkpoint {} for issue #{}",
-                        active_facade().command,
-                        stage_name,
-                        publication.issue_number
-                    ),
+                    &checkpoint_commit_title(
+                        flow,
+                        &[TaskKey {
+                            work_item: None,
+                            task: stage_name.clone(),
+                        }],
+                        issue_input,
+                        publication.issue_number,
+                    )
+                    .unwrap_or_else(|| {
+                        format!(
+                            "chore({}): checkpoint {} for issue #{}",
+                            active_facade().command,
+                            stage_name,
+                            publication.issue_number
+                        )
+                    }),
                 )
                 .await
             {
@@ -479,6 +579,7 @@ pub async fn run(
                     tracking.as_ref(),
                     selection,
                     &stage_name,
+                    stage.publication_tag.as_deref(),
                     attempt,
                     &stage_root,
                     repo_path,
@@ -494,6 +595,7 @@ pub async fn run(
                 tracking.as_ref(),
                 selection,
                 &stage_name,
+                stage.publication_tag.as_deref(),
                 attempt,
                 &stage_root,
                 repo_path,
@@ -844,12 +946,20 @@ async fn run_work_item_lifecycle(
             && let Err(error) = publish_checkpoint(
                 publication,
                 repo_path,
-                &format!(
-                    "chore({}): checkpoint {} for issue #{}",
-                    active_facade().command,
-                    flow.start,
-                    publication.issue_number
-                ),
+                &checkpoint_commit_title(
+                    flow,
+                    std::slice::from_ref(&planner_key),
+                    issue_input,
+                    publication.issue_number,
+                )
+                .unwrap_or_else(|| {
+                    format!(
+                        "chore({}): checkpoint {} for issue #{}",
+                        active_facade().command,
+                        flow.start,
+                        publication.issue_number
+                    )
+                }),
             )
             .await
         {
@@ -1319,18 +1429,28 @@ async fn run_work_item_lifecycle(
             && let Some(publication) = tracking
                 .as_ref()
                 .and_then(|tracking| tracking.publication.as_ref())
-            && let Err(error) = publish_checkpoint(
-                publication,
-                repo_path,
-                &format!(
+        {
+            let checkpoint_keys = successful_executions
+                .iter()
+                .filter(|(_, execution)| execution.result.outcome == Outcome::Implemented)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            let commit_title = checkpoint_commit_title(
+                flow,
+                &checkpoint_keys,
+                issue_input,
+                publication.issue_number,
+            )
+            .unwrap_or_else(|| {
+                format!(
                     "chore({}): checkpoint task wave for issue #{}",
                     active_facade().command,
                     publication.issue_number
-                ),
-            )
-            .await
-        {
-            tracing::warn!(%error, "plugin task-wave checkpoint publication failed");
+                )
+            });
+            if let Err(error) = publish_checkpoint(publication, repo_path, &commit_title).await {
+                tracing::warn!(%error, "plugin task-wave checkpoint publication failed");
+            }
         }
         for (key, execution) in &successful_executions {
             let work_item = key
@@ -2398,6 +2518,7 @@ async fn publish_task_attempt(
             &AttemptPublication {
                 job_id,
                 task: task_name,
+                publication_tag: task.publication_tag.as_deref(),
                 work_item: work_item.map(|item| item.id.as_str()),
                 attempt,
                 outcome,
@@ -2423,6 +2544,7 @@ async fn publish_serial_stage_attempt(
     tracking: Option<&LifecycleTracking<'_>>,
     selection: &PluginFlowSelection,
     stage_name: &str,
+    publication_tag: Option<&str>,
     attempt: u32,
     stage_root: &Path,
     aggregate_repo: &Path,
@@ -2441,6 +2563,7 @@ async fn publish_serial_stage_attempt(
         &AttemptPublication {
             job_id: tracking.map(|tracking| tracking.coordinator.id),
             task: stage_name,
+            publication_tag,
             work_item: None,
             attempt,
             outcome,
@@ -3287,6 +3410,46 @@ mod tests {
 
     fn test_selection(input: &str) -> PluginFlowSelection {
         serde_yaml::from_str(input).unwrap()
+    }
+
+    #[test]
+    fn checkpoint_titles_use_plugin_tags_and_work_items() {
+        let manifest = test_manifest(
+            r#"
+api_version: 1
+id: example.hardware
+runtime: { default_image: example:dev }
+roles:
+  rtl: { command: [run, rtl] }
+  dv: { command: [run, dv] }
+flows:
+  blocks:
+    start: rtl
+    tasks:
+      rtl: { role: rtl, display_name: RTL implementation, publication_tag: RTL }
+      dv: { role: dv, display_name: Design verification, publication_tag: DV }
+"#,
+        );
+        let keys = vec![
+            TaskKey {
+                work_item: Some("counter_detect".into()),
+                task: "rtl".into(),
+            },
+            TaskKey {
+                work_item: Some("counter_detect".into()),
+                task: "dv".into(),
+            },
+        ];
+        assert_eq!(
+            checkpoint_commit_title(
+                &manifest.flows["blocks"],
+                &keys,
+                &json!({"issue": {"title": "Counter Detect"}}),
+                11,
+            )
+            .as_deref(),
+            Some("[RTL][DV] RTL implementation + Design verification: counter_detect (#11)")
+        );
     }
 
     fn approval_manifest() -> PluginManifest {

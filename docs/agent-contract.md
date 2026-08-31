@@ -135,7 +135,12 @@ Allowed `risk` values:
 
 Developer agents modify files in the checkout only. They must not commit, push, apply labels, or open pull requests directly. When a developer result is `implemented`, the worker inspects `git status`, commits actual checkout changes, pushes `donkeyspace/issue-{issue_number}-{job_id_short}`, opens a PR, and transitions the issue to `pr_open`.
 
-Commit and PR titles use Conventional Commit formatting. The current heuristic chooses `docs:` for README or documentation-only changes, `fix:` for bug/failure language, `feat:` for add/create/feature language, and `chore:` otherwise.
+Commit and PR titles use Conventional Commit formatting by default. The current
+heuristic chooses `docs:` for README or documentation-only changes, `fix:` for
+bug/failure language, `feat:` for add/create/feature language, and `chore:`
+otherwise. Lifecycle plugins may instead provide task `publication_tag` values
+for checkpoint and attempt commits and a flow-level `pull_request_title`
+template for the final aggregate commit and PR.
 
 ## Reviewer PR Behavior
 

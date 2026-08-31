@@ -1300,7 +1300,13 @@ async fn execute_developer_job(
 
     let issue_num = issue_number(&running_job.input).unwrap_or(0);
     let branch_name = developer_branch_name(issue_num, running_job.id);
-    let commit_title = conventional_commit_title(&running_job.input, &changed_files);
+    let commit_title = match lifecycle_selection {
+        Some(selection) => {
+            plugin_flow::configured_pull_request_title(selection, &running_job.input, issue_num)?
+                .unwrap_or_else(|| conventional_commit_title(&running_job.input, &changed_files))
+        }
+        None => conventional_commit_title(&running_job.input, &changed_files),
+    };
     let commit_body = developer_commit_body(&running_job, &result, &changed_files);
     let workspace = workspace_path(running_job.id, repo_context_config);
     if let Err(error) = push_developer_branch(
@@ -2750,6 +2756,7 @@ async fn publish_job_attempt(
         &AttemptPublication {
             job_id: Some(job.id),
             task,
+            publication_tag: None,
             work_item: None,
             attempt: 1,
             outcome,

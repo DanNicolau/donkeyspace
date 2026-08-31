@@ -92,6 +92,7 @@ roles:
 flows:
   rtl_blocks:
     start: architect
+    pull_request_title: "[RTL][DV][SYN] Implement and verify {issue_title} (#{issue_number})"
     replaces_default_lifecycle: true
     work_items_path: docs/design/blocks/index.json
     project_github_issues: true
@@ -101,11 +102,13 @@ flows:
       architect:
         role: architect
         display_name: Block specification
+        publication_tag: SPEC
         approval_subject: proposed block specifications
         write: [docs/design]
         approval: required
       rtl:
         role: rtl
+        publication_tag: RTL
         scope: work_item
         depends_on_work_items: true
         read: [docs/design, rtl]
@@ -118,6 +121,7 @@ flows:
       dv_verify:
         role: dv
         display_name: Design verification
+        publication_tag: DV
         scope: work_item
         dependencies: [rtl, dv_prepare]
         read: [docs/design, rtl, "dv/{work_item}"]
@@ -127,6 +131,7 @@ flows:
           rtl: Verification found an RTL-correctable defect.
       synthesis:
         role: syn
+        publication_tag: SYN
         scope: work_item
         dependencies: [rtl]
         read: [docs/design, rtl]
@@ -144,6 +149,13 @@ handoff descriptions keyed by an allowed target, and artifact or diagnostic
 display names customize lifecycle timelines without embedding plugin-specific
 terminology in core. Donkeyspace snapshots resolved wording into each event so
 later manifest edits do not rewrite history.
+
+Task `publication_tag` values customize checkpoint and forensic-attempt commit
+subjects, rendered in brackets such as `[RTL]` or `[SYN]`. A flow may also set
+`pull_request_title`; Donkeyspace expands `{issue_title}` and `{issue_number}`
+and uses the result for both the final aggregate commit (when one is needed)
+and pull-request title. Plugins that omit these fields retain Donkeyspace's
+generic Conventional Commit titles.
 
 `max_parallel_tasks` bounds the number of simultaneously running ready tasks;
 it defaults to four. `scope: workflow` is the default. A lifecycle start task must have workflow

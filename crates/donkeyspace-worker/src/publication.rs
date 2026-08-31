@@ -33,6 +33,7 @@ pub struct PublicationContext<'a> {
 pub struct AttemptPublication<'a> {
     pub job_id: Option<Uuid>,
     pub task: &'a str,
+    pub publication_tag: Option<&'a str>,
     pub work_item: Option<&'a str>,
     pub attempt: u32,
     pub outcome: Option<Outcome>,
@@ -216,23 +217,22 @@ pub async fn publish_attempt(
         None,
     )
     .await?;
-    git(
-        &local_repo,
-        &[
-            "commit",
-            "-m",
-            &format!(
-                "chore({}): preserve {} {} for issue #{}",
-                active_facade().command,
-                attempt.task,
-                kind,
-                context.issue_number
-            ),
-        ],
-        None,
-        None,
-    )
-    .await?;
+    let commit_title = match attempt.publication_tag {
+        Some(tag) => format!(
+            "[{tag}] Preserve {} {} for issue #{}",
+            attempt.work_item.unwrap_or(attempt.task),
+            kind,
+            context.issue_number
+        ),
+        None => format!(
+            "chore({}): preserve {} {} for issue #{}",
+            active_facade().command,
+            attempt.task,
+            kind,
+            context.issue_number
+        ),
+    };
+    git(&local_repo, &["commit", "-m", &commit_title], None, None).await?;
     let sha = git(&local_repo, &["rev-parse", "HEAD"], None, None)
         .await?
         .trim()
@@ -1024,6 +1024,7 @@ mod tests {
         let attempt = AttemptPublication {
             job_id: Some(id),
             task: "synthesis/task",
+            publication_tag: None,
             work_item: Some("counter detect"),
             attempt: 301,
             outcome: Some(Outcome::Failed),

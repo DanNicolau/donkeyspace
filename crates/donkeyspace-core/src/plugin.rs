@@ -152,6 +152,10 @@ pub type PluginAgent = PluginRole;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PluginFlow {
     pub start: String,
+    /// Optional final commit and pull-request title template. Supported
+    /// placeholders are `{issue_title}` and `{issue_number}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_title: Option<String>,
     #[serde(default)]
     pub replaces_default_lifecycle: bool,
     #[serde(default)]
@@ -190,6 +194,10 @@ pub struct PluginTask {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_subject: Option<String>,
+    /// Short plugin-owned label used in publication commit messages, rendered
+    /// in brackets (for example `RTL` becomes `[RTL]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_tag: Option<String>,
     #[serde(alias = "agent")]
     pub role: String,
     #[serde(default)]
@@ -389,6 +397,9 @@ impl PluginManifest {
             validate_resource_assignments(&role.resources, &self.resources, name)?;
         }
         for (flow_name, flow) in &self.flows {
+            if let Some(template) = &flow.pull_request_title {
+                validate_publication_title_template(template)?;
+            }
             if !flow.tasks.contains_key(&flow.start) {
                 return Err(PluginError::Invalid(format!(
                     "flow `{flow_name}` has unknown start task"
@@ -425,6 +436,9 @@ impl PluginManifest {
                 }
                 if let Some(subject) = &task.approval_subject {
                     validate_display_text("task approval_subject", subject)?;
+                }
+                if let Some(tag) = &task.publication_tag {
+                    validate_publication_tag(tag)?;
                 }
                 if !self.roles.contains_key(&task.role) {
                     return Err(PluginError::Invalid(format!(
@@ -506,6 +520,38 @@ fn validate_display_text(field: &str, value: &str) -> Result<(), PluginError> {
         return Err(PluginError::Invalid(format!(
             "{field} must be nonempty single-line text no longer than 160 bytes"
         )));
+    }
+    Ok(())
+}
+
+fn validate_publication_tag(value: &str) -> Result<(), PluginError> {
+    if value.is_empty()
+        || value.len() > 16
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(PluginError::Invalid(
+            "task publication_tag must contain 1-16 ASCII letters, digits, hyphens, or underscores"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_publication_title_template(value: &str) -> Result<(), PluginError> {
+    if value.trim().is_empty() || value.len() > 200 || value.chars().any(char::is_control) {
+        return Err(PluginError::Invalid(
+            "flow pull_request_title must be nonempty single-line text no longer than 200 bytes"
+                .into(),
+        ));
+    }
+    for placeholder in placeholders(value)? {
+        if !matches!(placeholder.as_str(), "issue_title" | "issue_number") {
+            return Err(PluginError::Invalid(format!(
+                "flow pull_request_title has unsupported placeholder `{{{placeholder}}}`"
+            )));
+        }
     }
     Ok(())
 }
@@ -761,6 +807,7 @@ roles:
 flows:
   blocks:
     start: architect
+    pull_request_title: "[RTL][DV] Implement and verify {issue_title} (#{issue_number})"
     replaces_default_lifecycle: true
     work_items_path: docs/design/blocks/index.json
     tasks:
@@ -772,6 +819,7 @@ flows:
         approval: required
       rtl:
         role: rtl
+        publication_tag: RTL
         scope: work_item
         read: [docs/design]
         write: ["rtl/{work_item}.sv"]
@@ -800,6 +848,16 @@ flows:
         assert_eq!(
             manifest.flows["blocks"].tasks["rtl"].approval,
             PluginApprovalMode::None
+        );
+        assert_eq!(
+            manifest.flows["blocks"].pull_request_title.as_deref(),
+            Some("[RTL][DV] Implement and verify {issue_title} (#{issue_number})")
+        );
+        assert_eq!(
+            manifest.flows["blocks"].tasks["rtl"]
+                .publication_tag
+                .as_deref(),
+            Some("RTL")
         );
         assert_eq!(
             manifest.roles["architect"].display_name.as_deref(),
