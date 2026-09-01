@@ -224,7 +224,7 @@ cleared from UI state and never written to instance configuration.
 Connect a local plugin repository with the same control plane used by the TUI:
 
 ```sh
-donkeyspace connect plugin --path ../donkey-kong --flow rtl_blocks
+donkeyspace connect plugin --path ../example-plugin --flow implementation
 donkeyspace plugin list
 ```
 
