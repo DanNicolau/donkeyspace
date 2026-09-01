@@ -158,6 +158,30 @@ still requires a public webhook URL, so polling registrations use the official
 documentation's `https://example.com/github/events` example with delivery
 explicitly disabled; Donkeyspace does not send repository events there.
 
+Changing only an existing App's webhook URL does not subscribe it to events.
+In the App's **Permissions & events** settings, also select `Issues`,
+`Issue comment`, `Pull request`, and `Push`. The Operations page and
+`donkeyspace status` report the configured URL, missing subscriptions, recent
+deliveries reported by GitHub, deliveries accepted by Donkeyspace, and events
+ingested through polling. This distinction makes a reachable reverse proxy or
+successful synthetic ping visible without presenting it as proof that GitHub
+is delivering subscribed events.
+
+After an existing App's URL and subscriptions are verified, switch a polling
+instance to webhook ingress and restart it:
+
+```sh
+donkeyspace configure ingress --webhook-url https://hooks.example/webhooks/github
+donkeyspace down
+donkeyspace up
+donkeyspace status
+```
+
+A URL with no path receives `/webhooks/github` automatically. A URL with an
+explicit path such as `/webhooks/github` is used exactly, which supports routing through a
+shared reverse proxy. To return to polling, run `donkeyspace configure ingress
+--polling --interval-seconds 60` and restart.
+
 Polling uses a configurable 60-second local interval, conditional requests, and
 GitHub's `X-Poll-Interval` as the effective minimum for each repository. Change
 the local interval with `donkeyspace configure polling --interval-seconds N`,
@@ -174,6 +198,7 @@ DONKEYSPACE_GITHUB_AUTH_MODE=app|pat
 DONKEYSPACE_GITHUB_APP_ID
 DONKEYSPACE_GITHUB_INSTALLATION_ID
 DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE
+DONKEYSPACE_GITHUB_INGRESS_MODE=webhook|polling
 DONKEYSPACE_WEBHOOK_SECRET_FILE
 DONKEYSPACE_GITHUB_REPOSITORIES
 DONKEYSPACE_GITHUB_POLL_REPOSITORIES

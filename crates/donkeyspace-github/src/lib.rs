@@ -247,6 +247,24 @@ pub struct GitHubRepository {
     pub private: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GitHubAppWebhookDelivery {
+    pub id: Option<u64>,
+    pub event: Option<String>,
+    pub action: Option<String>,
+    pub status: Option<String>,
+    pub status_code: Option<u16>,
+    pub delivered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GitHubAppWebhookStatus {
+    pub url: Option<String>,
+    pub content_type: Option<String>,
+    pub subscribed_events: Vec<String>,
+    pub deliveries: Vec<GitHubAppWebhookDelivery>,
+}
+
 impl std::fmt::Debug for GitHubCredentialProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -408,6 +426,65 @@ impl GitHubCredentialProvider {
         repositories.dedup_by(|left, right| left.full_name == right.full_name);
         Ok(repositories)
     }
+
+    pub async fn app_webhook_status(
+        &self,
+    ) -> Result<Option<GitHubAppWebhookStatus>, GitHubClientError> {
+        let Some(app_client) = &self.app_client else {
+            return Ok(None);
+        };
+        let app: Value = app_client.get("/app", None::<&()>).await?;
+        let hook: Value = app_client.get("/app/hook/config", None::<&()>).await?;
+        let deliveries: Value = app_client
+            .get(
+                "/app/hook/deliveries",
+                Some(&serde_json::json!({"per_page": 10})),
+            )
+            .await?;
+
+        parse_app_webhook_status(&app, &hook, &deliveries).map(Some)
+    }
+}
+
+fn parse_app_webhook_status(
+    app: &Value,
+    hook: &Value,
+    deliveries: &Value,
+) -> Result<GitHubAppWebhookStatus, GitHubClientError> {
+    let mut subscribed_events = app["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    subscribed_events.sort_unstable();
+    subscribed_events.dedup();
+    let deliveries = deliveries
+        .as_array()
+        .ok_or_else(|| {
+            GitHubClientError::InvalidResponse(
+                "GitHub App webhook deliveries response is not an array".into(),
+            )
+        })?
+        .iter()
+        .map(|delivery| GitHubAppWebhookDelivery {
+            id: delivery["id"].as_u64(),
+            event: delivery["event"].as_str().map(str::to_string),
+            action: delivery["action"].as_str().map(str::to_string),
+            status: delivery["status"].as_str().map(str::to_string),
+            status_code: delivery["status_code"]
+                .as_u64()
+                .and_then(|status| u16::try_from(status).ok()),
+            delivered_at: delivery["delivered_at"].as_str().map(str::to_string),
+        })
+        .collect();
+    Ok(GitHubAppWebhookStatus {
+        url: hook["url"].as_str().map(str::to_string),
+        content_type: hook["content_type"].as_str().map(str::to_string),
+        subscribed_events,
+        deliveries,
+    })
 }
 
 fn parse_repository(value: &Value) -> Result<GitHubRepository, GitHubClientError> {
@@ -1079,8 +1156,9 @@ fn workflow_label_color(label: &str) -> &'static str {
 mod tests {
     use super::{
         GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubWorkItem, SignatureError,
-        parse_repository, projected_work_item_body, select_installation_id,
-        validate_installation_response, validate_members_permission_response, verify_signature,
+        parse_app_webhook_status, parse_repository, projected_work_item_body,
+        select_installation_id, validate_installation_response,
+        validate_members_permission_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
     use http_body_util::Full;
@@ -1101,6 +1179,29 @@ mod tests {
     #[test]
     fn rejects_missing_signature() {
         assert!(verify_signature("secret", b"{}", None).is_err());
+    }
+
+    #[test]
+    fn parses_app_webhook_configuration_and_deliveries() {
+        let status = parse_app_webhook_status(
+            &json!({"events": ["push", "issue_comment", "push"]}),
+            &json!({"url": "https://hooks.example/webhooks/github", "content_type": "json"}),
+            &json!([{
+                "id": 42,
+                "event": "issue_comment",
+                "action": "created",
+                "status": "OK",
+                "status_code": 202,
+                "delivered_at": "2026-09-01T20:00:00Z"
+            }]),
+        )
+        .unwrap();
+        assert_eq!(status.subscribed_events, vec!["issue_comment", "push"]);
+        assert_eq!(status.deliveries[0].status_code, Some(202));
+        assert_eq!(
+            status.url.as_deref(),
+            Some("https://hooks.example/webhooks/github")
+        );
     }
 
     #[test]

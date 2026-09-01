@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     payload JSONB NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS webhook_deliveries_received_at_idx
+    ON webhook_deliveries(received_at DESC);
 
 CREATE TABLE IF NOT EXISTS engagement_decisions (
     id BIGSERIAL PRIMARY KEY,

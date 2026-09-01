@@ -73,6 +73,7 @@ struct ConfigureArgs {
 enum ConfigureTarget {
     Ports(PortArgs),
     Polling(PollingArgs),
+    Ingress(IngressArgs),
     Facade(FacadeArgs),
     GithubAccess(GitHubAccessArgs),
 }
@@ -81,6 +82,17 @@ enum ConfigureTarget {
 struct PollingArgs {
     #[arg(long)]
     interval_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct IngressArgs {
+    #[arg(long, value_name = "HTTPS_URL")]
+    webhook_url: Option<String>,
+    #[arg(long)]
+    polling: bool,
+    #[arg(long, requires = "polling")]
+    interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -357,6 +369,32 @@ async fn run() -> Result<(), SetupError> {
                     );
                 }
             }
+            ConfigureTarget::Ingress(args) => {
+                let stack_running = instance
+                    .deployment_status()
+                    .map(|status| {
+                        status
+                            .services
+                            .iter()
+                            .any(|service| service.state.eq_ignore_ascii_case("running"))
+                    })
+                    .unwrap_or(false);
+                let ingress = if let Some(public_url) = args.webhook_url {
+                    donkeyspace_cli::IngressMode::Webhook { public_url }
+                } else {
+                    donkeyspace_cli::IngressMode::Polling {
+                        interval_seconds: args.interval_seconds.unwrap_or(60),
+                    }
+                };
+                let kind = ingress.kind();
+                instance.configure_github_ingress(ingress)?;
+                println!("GitHub ingress saved: {kind}");
+                if stack_running {
+                    println!(
+                        "restart required: run `donkeyspace down` followed by `donkeyspace up`"
+                    );
+                }
+            }
             ConfigureTarget::Facade(args) => {
                 let stack_running = instance
                     .deployment_status()
@@ -520,6 +558,26 @@ mod tests {
             panic!("expected configure polling command");
         };
         assert_eq!(args.interval_seconds, 8);
+
+        let configure = Cli::try_parse_from([
+            "donkeyspace",
+            "configure",
+            "ingress",
+            "--webhook-url",
+            "https://hooks.example/webhooks/github",
+        ])
+        .unwrap();
+        let Some(Command::Configure(ConfigureArgs {
+            target: ConfigureTarget::Ingress(args),
+        })) = configure.command
+        else {
+            panic!("expected configure ingress command");
+        };
+        assert_eq!(
+            args.webhook_url.as_deref(),
+            Some("https://hooks.example/webhooks/github")
+        );
+        assert!(!args.polling);
     }
 
     #[test]

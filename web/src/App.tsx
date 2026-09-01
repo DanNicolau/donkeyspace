@@ -19,6 +19,13 @@ type EffectiveConfiguration = {
   capabilities: string[];
   warnings: string[];
 };
+type GitHubAppDelivery = { event: string | null; action: string | null; status: string | null; status_code: number | null; delivered_at: string | null };
+type GitHubIngressStatus = {
+  configured_mode: string;
+  webhook: { endpoint_enabled: boolean; last_received_at: string | null; last_event: string | null; deliveries_24h: number; app: { url: string | null; subscribed_events: string[]; missing_events: string[]; deliveries: GitHubAppDelivery[] } | null; app_error: string | null };
+  polling: PollStatus;
+  poll_deliveries: { last_received_at: string | null; last_event: string | null; deliveries_24h: number };
+};
 type SummaryStep = { role: string | null; text: string };
 
 const storageKey = "donkeyspace.dashboard.repository";
@@ -171,9 +178,9 @@ function OperationsPage() {
   const [repository, setRepository] = useRepositorySelection();
   const runs = useQuery({ queryKey: ["runs", repository], queryFn: () => json<Run[]>(`/api/runs${repositoryQuery(repository)}`), refetchInterval: 10_000 });
   const actions = useQuery({ queryKey: ["outbound-actions", repository], queryFn: () => json<OutboundAction[]>(`/api/outbound-actions${repositoryQuery(repository)}`), refetchInterval: 10_000 });
-  const poll = useQuery({ queryKey: ["poll-status"], queryFn: () => json<PollStatus>("/api/github-poll/status"), refetchInterval: 5_000 });
   const configuration = useQuery({ queryKey: ["configuration"], queryFn: () => json<EffectiveConfiguration>("/api/configuration"), staleTime: 30_000 });
-  return <><PageHeading title="Operations" subtitle="Polling controls, raw jobs, and GitHub delivery diagnostics." picker={<RepositoryPicker value={repository} onChange={setRepository} />} /><ConfigurationPanel configuration={configuration.data} /><PollingPanel status={poll.data} />
+  const ingress = useQuery({ queryKey: ["ingress-status"], queryFn: () => json<GitHubIngressStatus>("/api/github-ingress/status"), refetchInterval: 30_000 });
+  return <><PageHeading title="Operations" subtitle="Ingress health, runtime configuration, raw jobs, and GitHub delivery diagnostics." picker={<RepositoryPicker value={repository} onChange={setRepository} />} /><ConfigurationPanel configuration={configuration.data} /><IngressPanel status={ingress.data} error={ingress.error} />
     <section className="panel"><PanelHeading title="Raw jobs" subtitle={repository || "All repositories"} /><div className="operations-list">{(runs.data ?? []).map((run) => <article key={run.id}><div><strong>{run.input?.issue?.title ?? "Untitled issue"}</strong><code>{run.id}</code><p>{run.result?.summary ?? `Issue #${run.input?.issue?.number ?? "?"}`}</p></div><div><StatusPill status={run.status} /><small>{run.role} · {run.result?.outcome ?? "pending"}</small></div></article>)}</div></section>
     <section className="panel"><PanelHeading title="GitHub action outbox" subtitle="Pending and completed writes" /><div className="operations-list">{(actions.data ?? []).map((action) => <article key={action.id}><div><strong>{action.action_type}</strong><p>{action.last_error ?? `${action.payload.owner ?? "?"}/${action.payload.repo ?? "?"} #${action.payload.issue_number ?? "?"}`}</p></div><StatusPill status={action.status} /></article>)}</div></section>
   </>;
@@ -183,10 +190,25 @@ function ConfigurationPanel({ configuration }: { configuration?: EffectiveConfig
     <dl><div><dt>Policy</dt><dd>{configuration?.policy_source ?? "—"}</dd></div><div><dt>GitHub auth</dt><dd>{humanize(configuration?.github.auth_mode ?? "unknown")}</dd></div><div><dt>Ingress</dt><dd>{humanize(configuration?.github.ingress_mode ?? "unknown")}</dd></div><div><dt>Repositories</dt><dd>{configuration?.github.repositories.join(", ") || "None"}</dd></div><div><dt>Plugin</dt><dd>{configuration?.plugin ? `${configuration.plugin.id}:${configuration.plugin.flow}` : "Disabled"}</dd></div><div><dt>Capabilities</dt><dd>{configuration?.capabilities.map(humanize).join(", ") ?? "—"}</dd></div></dl>
   </section>;
 }
-function PollingPanel({ status }: { status?: PollStatus }) {
-  const queryClient = useQueryClient(); const trigger = useMutation({ mutationFn: () => json<unknown>("/api/github-poll/trigger", { method: "POST" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["poll-status"] }) }); const [now, setNow] = useState(Date.now());
+function IngressPanel({ status, error }: { status?: GitHubIngressStatus; error: Error | null }) {
+  const queryClient = useQueryClient(); const trigger = useMutation({ mutationFn: () => json<unknown>("/api/github-poll/trigger", { method: "POST" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["ingress-status"] }) }); const [now, setNow] = useState(Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
-  return <section className="panel polling-panel"><PanelHeading title="GitHub polling" subtitle={status?.running ? "Polling now" : status?.enabled ? "Enabled" : "Disabled"} /><div className="polling-content"><dl><div><dt>Since last poll</dt><dd>{elapsed(status?.last_completed_at, now)}</dd></div><div><dt>Until next poll</dt><dd>{countdown(status?.next_poll_at, now)}</dd></div><div><dt>Interval</dt><dd>{status?.configured_interval_seconds ?? "—"}s</dd></div></dl><button disabled={trigger.isPending || status?.running} onClick={() => trigger.mutate()}>{trigger.isPending ? "Requesting…" : status?.running ? "Polling…" : "Poll now"}</button></div></section>;
+  const app = status?.webhook.app; const latest = app?.deliveries[0]; const missing = app?.missing_events ?? [];
+  const webhookState = error ? "unavailable" : !status?.webhook.endpoint_enabled ? "disabled" : status.webhook.app_error || !app ? "unavailable" : missing.length ? "misconfigured" : latest ? "healthy" : "waiting";
+  const poll = status?.polling;
+  return <section className="panel ingress-panel"><PanelHeading title="GitHub ingress" subtitle={status ? `Configured mode: ${humanize(status.configured_mode)}` : error ? "Status unavailable" : "Loading status…"} />
+    <div className="ingress-grid">
+      <article className="ingress-card"><div className="ingress-card-heading"><h3>Webhooks</h3><StatusPill status={webhookState} /></div>
+        <dl><div><dt>Public App URL</dt><dd>{app?.url ?? "Not reported"}</dd></div><div><dt>GitHub subscriptions</dt><dd>{app ? app.subscribed_events.length : "—"}</dd></div><div><dt>Latest GitHub delivery</dt><dd>{latest ? `${latest.event ?? "unknown"} · HTTP ${latest.status_code ?? "?"}` : "None"}</dd></div><div><dt>Accepted by Donkeyspace</dt><dd>{status ? `${status.webhook.deliveries_24h} in 24h` : "—"}</dd></div><div><dt>Last accepted webhook</dt><dd>{status?.webhook.last_received_at ? `${status.webhook.last_event ?? "event"} · ${elapsed(status.webhook.last_received_at, now)} ago` : "Not yet"}</dd></div></dl>
+        {missing.length ? <div className="ingress-warning"><strong>Missing GitHub App events</strong><p>{missing.join(", ")}. GitHub will not send these events until they are selected in the App settings.</p></div> : null}
+        {status?.webhook.app_error ? <div className="ingress-warning"><strong>App status unavailable</strong><p>{status.webhook.app_error}</p></div> : null}
+      </article>
+      <article className="ingress-card"><div className="ingress-card-heading"><h3>Polling fallback</h3><StatusPill status={poll?.running ? "running" : poll?.enabled ? "enabled" : "disabled"} /></div>
+        <dl><div><dt>Since last poll</dt><dd>{elapsed(poll?.last_completed_at, now)}</dd></div><div><dt>Until next poll</dt><dd>{countdown(poll?.next_poll_at, now)}</dd></div><div><dt>Interval</dt><dd>{poll ? `${poll.configured_interval_seconds}s` : "—"}</dd></div><div><dt>Ingested by polling</dt><dd>{status ? `${status.poll_deliveries.deliveries_24h} in 24h` : "—"}</dd></div><div><dt>Last polled event</dt><dd>{status?.poll_deliveries.last_received_at ? `${status.poll_deliveries.last_event ?? "event"} · ${elapsed(status.poll_deliveries.last_received_at, now)} ago` : "Not yet"}</dd></div></dl>
+        <button disabled={trigger.isPending || poll?.running || !poll?.enabled} onClick={() => trigger.mutate()}>{trigger.isPending ? "Requesting…" : poll?.running ? "Polling…" : "Poll now"}</button>
+      </article>
+    </div>
+  </section>;
 }
 
 function PageHeading({ title, subtitle, picker }: { title: string; subtitle: string; picker: React.ReactNode }) { return <section className="page-heading"><div><h2>{title}</h2><p>{subtitle}</p></div>{picker}</section>; }
