@@ -26,6 +26,8 @@ const PORT_SUGGESTION_ATTEMPTS: u16 = 100;
 const CONFIG_FILE: &str = "instance.json";
 const GENERATED_ENV: &str = "compose.env";
 const PENDING_GITHUB_FILE: &str = "pending-github.json";
+const REQUIRED_GITHUB_WEBHOOK_EVENTS: [&str; 4] =
+    ["issue_comment", "issues", "pull_request", "push"];
 
 #[derive(Debug, Error)]
 pub enum SetupError {
@@ -205,6 +207,20 @@ impl IngressMode {
             Self::Webhook { .. } => None,
         }
     }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Polling { .. } => "polling",
+            Self::Webhook { .. } => "webhook",
+        }
+    }
+
+    pub fn public_url(&self) -> Option<&str> {
+        match self {
+            Self::Polling { .. } => None,
+            Self::Webhook { public_url } => Some(public_url),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -265,6 +281,56 @@ pub struct ServiceStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploymentStatus {
     pub services: Vec<ServiceStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubIngressRuntimeStatus {
+    configured_mode: String,
+    webhook: GitHubWebhookRuntimeStatus,
+    polling: GitHubPollingRuntimeStatus,
+    poll_deliveries: GitHubDeliveryRuntimeStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubWebhookRuntimeStatus {
+    endpoint_enabled: bool,
+    last_received_at: Option<String>,
+    last_event: Option<String>,
+    deliveries_24h: i64,
+    app: Option<GitHubAppWebhookRuntimeStatus>,
+    app_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubAppWebhookRuntimeStatus {
+    url: Option<String>,
+    subscribed_events: Vec<String>,
+    missing_events: Vec<String>,
+    deliveries: Vec<GitHubAppDeliveryRuntimeStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubAppDeliveryRuntimeStatus {
+    event: Option<String>,
+    status: Option<String>,
+    status_code: Option<u16>,
+    delivered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubPollingRuntimeStatus {
+    enabled: bool,
+    running: bool,
+    configured_interval_seconds: u64,
+    last_success_at: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubDeliveryRuntimeStatus {
+    last_received_at: Option<String>,
+    last_event: Option<String>,
+    deliveries_24h: i64,
 }
 
 impl DeploymentStatus {
@@ -438,6 +504,33 @@ impl Instance {
                     "polling interval is unavailable while webhook ingress is active".into(),
                 ));
             }
+        }
+        self.save()
+    }
+
+    pub fn configure_github_ingress(&mut self, ingress: IngressMode) -> Result<(), SetupError> {
+        validate_ingress(&ingress)?;
+        let github = self
+            .config
+            .as_mut()
+            .and_then(|config| config.github.as_mut())
+            .ok_or_else(|| SetupError::Config("GitHub is not connected".into()))?;
+        if matches!(github, GitHubInstanceConfig::Pat { .. })
+            && matches!(ingress, IngressMode::Webhook { .. })
+        {
+            return Err(SetupError::Config(
+                "webhook ingress requires GitHub App authentication".into(),
+            ));
+        }
+        match github {
+            GitHubInstanceConfig::App {
+                ingress: configured,
+                ..
+            }
+            | GitHubInstanceConfig::Pat {
+                ingress: configured,
+                ..
+            } => *configured = ingress,
         }
         self.save()
     }
@@ -1180,6 +1273,85 @@ impl Instance {
             }
             .await;
             checks.push(doctor_result("GitHub connection", result));
+            if let GitHubInstanceConfig::App {
+                app_id,
+                installation_id,
+                private_key_file,
+                ingress: IngressMode::Webhook { public_url },
+                ..
+            } = github
+            {
+                let webhook_status = async {
+                    GitHubCredentialProvider::new(GitHubAuthConfig::App {
+                        app_id: *app_id,
+                        installation_id: *installation_id,
+                        private_key_file: private_key_file.clone(),
+                    })?
+                    .app_webhook_status()
+                    .await
+                    .map_err(SetupError::from)
+                }
+                .await;
+                checks.push(match webhook_status {
+                    Ok(Some(status)) => {
+                        let missing = REQUIRED_GITHUB_WEBHOOK_EVENTS
+                            .iter()
+                            .filter(|required| {
+                                !status
+                                    .subscribed_events
+                                    .iter()
+                                    .any(|event| event == **required)
+                            })
+                            .copied()
+                            .collect::<Vec<_>>();
+                        let expected_url = github_webhook_url(public_url);
+                        if status.url.as_deref() != Some(expected_url.as_str()) {
+                            DoctorCheck {
+                                name: "GitHub webhook".into(),
+                                level: CheckLevel::Fail,
+                                detail: format!(
+                                    "App URL is {}; expected {expected_url}",
+                                    status.url.as_deref().unwrap_or("not configured")
+                                ),
+                            }
+                        } else if !missing.is_empty() {
+                            DoctorCheck {
+                                name: "GitHub webhook".into(),
+                                level: CheckLevel::Fail,
+                                detail: format!(
+                                    "App is missing event subscriptions: {}",
+                                    missing.join(", ")
+                                ),
+                            }
+                        } else if status.deliveries.is_empty() {
+                            DoctorCheck {
+                                name: "GitHub webhook".into(),
+                                level: CheckLevel::Warning,
+                                detail: "URL and subscriptions are configured; GitHub reports no deliveries yet".into(),
+                            }
+                        } else {
+                            DoctorCheck {
+                                name: "GitHub webhook".into(),
+                                level: CheckLevel::Pass,
+                                detail: format!(
+                                    "URL and subscriptions are configured; GitHub reports {} recent delivery or deliveries",
+                                    status.deliveries.len()
+                                ),
+                            }
+                        }
+                    }
+                    Ok(None) => DoctorCheck {
+                        name: "GitHub webhook".into(),
+                        level: CheckLevel::Fail,
+                        detail: "App webhook status is unavailable for these credentials".into(),
+                    },
+                    Err(error) => DoctorCheck {
+                        name: "GitHub webhook".into(),
+                        level: CheckLevel::Fail,
+                        detail: error.to_string(),
+                    },
+                });
+            }
         } else {
             checks.push(DoctorCheck {
                 name: "GitHub connection".into(),
@@ -1266,7 +1438,9 @@ impl Instance {
 
     pub fn status(&self) -> Result<(), SetupError> {
         self.compose(&["ps"], false)?;
-        self.print_endpoints()
+        self.print_endpoints()?;
+        self.print_github_ingress_status();
+        Ok(())
     }
 
     pub fn compose_config(&self) -> Result<(), SetupError> {
@@ -1328,6 +1502,47 @@ impl Instance {
         println!("Dashboard: {}", self.dashboard_url()?);
         println!("API: {}", self.api_url()?);
         Ok(())
+    }
+
+    fn print_github_ingress_status(&self) {
+        let configured = self
+            .config
+            .as_ref()
+            .and_then(|config| config.github.as_ref());
+        let ingress = configured.map(|github| match github {
+            GitHubInstanceConfig::App { ingress, .. }
+            | GitHubInstanceConfig::Pat { ingress, .. } => ingress,
+        });
+        match ingress {
+            Some(IngressMode::Polling { interval_seconds }) => {
+                println!("GitHub ingress: polling ({interval_seconds}s configured interval)")
+            }
+            Some(IngressMode::Webhook { public_url }) => {
+                println!("GitHub ingress: webhook ({public_url})")
+            }
+            None => {
+                println!("GitHub ingress: not configured");
+                return;
+            }
+        }
+
+        match self.fetch_github_ingress_status() {
+            Ok(status) => print_github_ingress_runtime_status(&status),
+            Err(error) => println!("Ingress runtime: unavailable ({error})"),
+        }
+    }
+
+    fn fetch_github_ingress_status(&self) -> Result<GitHubIngressRuntimeStatus, SetupError> {
+        let config = self.require_config()?;
+        let mut stream = TcpStream::connect(("127.0.0.1", config.api_port))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.write_all(
+            b"GET /api/github-ingress/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        parse_github_ingress_response(&response)
     }
 
     fn compose(&self, arguments: &[&str], destructive: bool) -> Result<(), SetupError> {
@@ -1478,6 +1693,7 @@ impl Instance {
                             webhook_secret_file.display()
                         ),
                         "DONKEYSPACE_WEBHOOK_SECRET_FILE=/run/secrets/github_webhook_secret".into(),
+                        format!("DONKEYSPACE_GITHUB_INGRESS_MODE={}", ingress.kind()),
                         format!("DONKEYSPACE_GITHUB_REPOSITORIES={}", repositories.join(",")),
                         format!(
                             "DONKEYSPACE_GITHUB_POLL_REPOSITORIES={}",
@@ -1501,6 +1717,7 @@ impl Instance {
                     ..
                 } => lines.extend([
                     "DONKEYSPACE_GITHUB_AUTH_MODE=pat".into(),
+                    format!("DONKEYSPACE_GITHUB_INGRESS_MODE={}", ingress.kind()),
                     format!("DONKEYSPACE_GITHUB_REPOSITORIES={}", repositories.join(",")),
                     format!(
                         "DONKEYSPACE_GITHUB_POLL_REPOSITORIES={}",
@@ -1895,7 +2112,7 @@ fn github_app_manifest(
 ) -> Value {
     let hook_attributes = match ingress {
         IngressMode::Webhook { public_url } => json!({
-            "url": format!("{}/webhooks/github", public_url.trim_end_matches('/')),
+            "url": github_webhook_url(public_url),
             "active": true
         }),
         // GitHub's manifest schema requires a public hook URL even when
@@ -1918,6 +2135,20 @@ fn github_app_manifest(
         },
         "default_events": ["issues", "issue_comment", "pull_request", "push"]
     })
+}
+
+fn github_webhook_url(public_url: &str) -> String {
+    let public_url = public_url.trim_end_matches('/');
+    let path = public_url
+        .strip_prefix("https://")
+        .and_then(|remainder| remainder.split_once('/'))
+        .map(|(_, path)| path)
+        .unwrap_or_default();
+    if path.is_empty() {
+        format!("{public_url}/webhooks/github")
+    } else {
+        public_url.to_string()
+    }
 }
 
 fn manifest_callback_code(
@@ -2117,6 +2348,130 @@ fn doctor_result(name: &str, result: Result<(), SetupError>) -> DoctorCheck {
     }
 }
 
+fn parse_github_ingress_response(
+    response: &[u8],
+) -> Result<GitHubIngressRuntimeStatus, SetupError> {
+    let separator = b"\r\n\r\n";
+    let body_offset = response
+        .windows(separator.len())
+        .position(|window| window == separator)
+        .map(|position| position + separator.len())
+        .ok_or_else(|| SetupError::Config("API returned a malformed HTTP response".into()))?;
+    let headers = std::str::from_utf8(&response[..body_offset])
+        .map_err(|_| SetupError::Config("API returned invalid HTTP headers".into()))?;
+    if !headers
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with("HTTP/1.1 200 ") || line.starts_with("HTTP/1.0 200 "))
+    {
+        return Err(SetupError::Config(
+            headers
+                .lines()
+                .next()
+                .unwrap_or("unknown HTTP status")
+                .into(),
+        ));
+    }
+    Ok(serde_json::from_slice(&response[body_offset..])?)
+}
+
+fn print_github_ingress_runtime_status(status: &GitHubIngressRuntimeStatus) {
+    println!("Ingress runtime mode: {}", status.configured_mode);
+    println!(
+        "Webhook endpoint: {}",
+        if status.webhook.endpoint_enabled {
+            "signature verification enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(error) = &status.webhook.app_error {
+        println!("GitHub App webhook: status unavailable ({error})");
+    } else if let Some(app) = &status.webhook.app {
+        if app.missing_events.is_empty() {
+            println!(
+                "GitHub App webhook: subscribed ({})",
+                app.subscribed_events.join(", ")
+            );
+        } else {
+            println!(
+                "GitHub App webhook: misconfigured; missing {}",
+                app.missing_events.join(", ")
+            );
+        }
+        println!(
+            "GitHub App webhook URL: {}",
+            app.url.as_deref().unwrap_or("not configured")
+        );
+        if let Some(delivery) = app.deliveries.first() {
+            println!(
+                "Latest GitHub delivery: {} · {} · HTTP {} · {}",
+                delivery.event.as_deref().unwrap_or("unknown event"),
+                delivery.status.as_deref().unwrap_or("unknown status"),
+                delivery
+                    .status_code
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                delivery.delivered_at.as_deref().unwrap_or("unknown time")
+            );
+        } else {
+            println!("Latest GitHub delivery: none reported by GitHub");
+        }
+    }
+    println!(
+        "Accepted webhooks: {} in 24h{}",
+        status.webhook.deliveries_24h,
+        format_delivery_suffix(
+            status.webhook.last_event.as_deref(),
+            status.webhook.last_received_at.as_deref()
+        )
+    );
+    let polling_detail = if status.polling.enabled {
+        format!(
+            " ({}s interval; last success {})",
+            status.polling.configured_interval_seconds,
+            status
+                .polling
+                .last_success_at
+                .as_deref()
+                .unwrap_or("not yet")
+        )
+    } else {
+        String::new()
+    };
+    println!(
+        "Polling: {}{}",
+        if status.polling.enabled {
+            if status.polling.running {
+                "running"
+            } else {
+                "enabled"
+            }
+        } else {
+            "disabled"
+        },
+        polling_detail
+    );
+    if let Some(error) = &status.polling.last_error {
+        println!("Polling error: {error}");
+    }
+    println!(
+        "Polled deliveries: {} in 24h{}",
+        status.poll_deliveries.deliveries_24h,
+        format_delivery_suffix(
+            status.poll_deliveries.last_event.as_deref(),
+            status.poll_deliveries.last_received_at.as_deref()
+        )
+    );
+}
+
+fn format_delivery_suffix(event: Option<&str>, received_at: Option<&str>) -> String {
+    match (event, received_at) {
+        (Some(event), Some(received_at)) => format!("; last {event} at {received_at}"),
+        _ => String::new(),
+    }
+}
+
 fn parse_compose_status(bytes: &[u8]) -> Result<DeploymentStatus, SetupError> {
     let text = String::from_utf8_lossy(bytes);
     if text.trim().is_empty() {
@@ -2298,6 +2653,22 @@ mod tests {
         assert_eq!(
             manifest["hook_attributes"]["url"],
             "https://donkeyspace.example/webhooks/github"
+        );
+    }
+
+    #[test]
+    fn webhook_manifest_preserves_an_explicit_proxy_path() {
+        let manifest = github_app_manifest(
+            "0123456789abcdef",
+            "http://127.0.0.1:8787/callback",
+            &IngressMode::Webhook {
+                public_url: "https://hooks.example/webhooks/github".into(),
+            },
+            "Donkeyspace",
+        );
+        assert_eq!(
+            manifest["hook_attributes"]["url"],
+            "https://hooks.example/webhooks/github"
         );
     }
 
@@ -2630,6 +3001,52 @@ mod tests {
     }
 
     #[test]
+    fn github_app_ingress_can_switch_from_polling_to_webhook() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("donkeyspace-ingress-test-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let mut instance = Instance {
+            directory: directory.clone(),
+            config: Some(InstanceConfig {
+                schema_version: SCHEMA_VERSION,
+                source_tree: "/src".into(),
+                runtime_source: RuntimeSource::LocalBuild,
+                api_port: 8080,
+                web_port: 5173,
+                codex_home: None,
+                github: Some(GitHubInstanceConfig::App {
+                    app_id: 1,
+                    installation_id: 2,
+                    private_key_file: "/tmp/key".into(),
+                    webhook_secret_file: "/tmp/secret".into(),
+                    repositories: vec!["owner/repo".into()],
+                    ingress: IngressMode::polling(),
+                }),
+                github_access: BTreeMap::new(),
+                github_approvers: BTreeMap::new(),
+                plugins: BTreeMap::new(),
+                active_plugin: None,
+                facade: FacadeConfig::default(),
+            }),
+        };
+        instance
+            .configure_github_ingress(IngressMode::Webhook {
+                public_url: "https://hooks.example/webhooks/github".into(),
+            })
+            .unwrap();
+        instance
+            .write_compose_env(instance.config().unwrap())
+            .unwrap();
+        let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
+        assert!(environment.contains("DONKEYSPACE_GITHUB_INGRESS_MODE=webhook\n"));
+        assert!(environment.contains("DONKEYSPACE_GITHUB_POLL_REPOSITORIES=\n"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn failed_command_description_redacts_environment_values() {
         let mut command = Command::new("docker");
         command
@@ -2662,6 +3079,29 @@ mod tests {
         assert_eq!(status.services.len(), 2);
         assert_eq!(status.services[0].name, "postgres");
         assert_eq!(status.services[1].name, "worker");
+    }
+
+    #[test]
+    fn parses_github_ingress_http_response() {
+        let body = br#"{"configured_mode":"polling","webhook":{"endpoint_enabled":true,"last_received_at":null,"last_event":null,"last_delivery_id":null,"deliveries_24h":0,"app":{"url":"https://hooks.example/webhooks/github","content_type":"json","subscribed_events":[],"missing_events":["issue_comment"],"deliveries":[]},"app_error":null},"polling":{"enabled":true,"running":false,"pending_manual":false,"configured_interval_seconds":60,"last_started_at":null,"last_completed_at":null,"last_success_at":null,"last_error":null,"consecutive_failures":0,"next_poll_at":null,"repositories":[]},"poll_deliveries":{"last_received_at":null,"last_event":null,"deliveries_24h":0}}"#;
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+        response.extend_from_slice(body);
+        let status = parse_github_ingress_response(&response).unwrap();
+        assert_eq!(status.configured_mode, "polling");
+        assert!(status.webhook.endpoint_enabled);
+        assert_eq!(
+            status.webhook.app.unwrap().missing_events,
+            vec!["issue_comment"]
+        );
+    }
+
+    #[test]
+    fn rejects_unsuccessful_github_ingress_http_response() {
+        let error = parse_github_ingress_response(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("503 Service Unavailable"));
     }
 
     #[test]

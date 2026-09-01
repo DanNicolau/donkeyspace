@@ -15,16 +15,16 @@ use donkeyspace_db::{
     DbConfig, EngagementDecisionInput, JobRecord, LifecycleEventInput, PgPool, PullRequestInput,
     RepositoryInput, WorkflowItemInput, acquire_job_lease, active_job_exists_for_workflow_item,
     apply_migrations, connect, create_job, create_retry_job, get_job, get_workflow_by_issue,
-    get_workflow_item_by_issue_number, get_workflow_item_state, github_managed_resource_exists,
-    latest_workflow_job_input, list_agent_publications_for_run, list_job_command_results,
-    list_job_outbound_actions, list_job_transitions, list_jobs, list_jobs_for_repository,
-    list_jobs_for_workflow_item, list_lifecycle_events, list_open_managed_pull_requests_for_base,
-    list_recent_engagement_decisions, list_recent_outbound_actions,
-    list_recent_outbound_actions_for_repository, list_workflows, pending_outbound_comment_exists,
-    record_engagement_decision, record_lifecycle_event, record_state_transition,
-    record_webhook_delivery, repair_job_exists_for_pr_base, resume_latest_paused_job,
-    retry_agent_publication, reviewer_job_exists_for_pr_head, upsert_pull_request,
-    upsert_repository, upsert_workflow_item, webhook_delivery_exists,
+    get_workflow_item_by_issue_number, get_workflow_item_state, github_ingress_delivery_stats,
+    github_managed_resource_exists, latest_workflow_job_input, list_agent_publications_for_run,
+    list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
+    list_jobs_for_repository, list_jobs_for_workflow_item, list_lifecycle_events,
+    list_open_managed_pull_requests_for_base, list_recent_engagement_decisions,
+    list_recent_outbound_actions, list_recent_outbound_actions_for_repository, list_workflows,
+    pending_outbound_comment_exists, record_engagement_decision, record_lifecycle_event,
+    record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
+    resume_latest_paused_job, retry_agent_publication, reviewer_job_exists_for_pr_head,
+    upsert_pull_request, upsert_repository, upsert_workflow_item, webhook_delivery_exists,
 };
 use donkeyspace_github::{
     GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider,
@@ -47,6 +47,7 @@ use uuid::Uuid;
 struct AppState {
     configuration: EffectiveConfigurationResponse,
     webhook_secret: Option<String>,
+    configured_ingress_mode: String,
     github_auth: Option<GitHubCredentialProvider>,
     pool: Option<PgPool>,
     policy: Policy,
@@ -201,6 +202,44 @@ struct GitHubPollTriggerResponse {
     already_pending: bool,
 }
 
+const REQUIRED_GITHUB_WEBHOOK_EVENTS: [&str; 4] =
+    ["issue_comment", "issues", "pull_request", "push"];
+
+#[derive(Debug, Serialize)]
+struct GitHubIngressStatusResponse {
+    configured_mode: String,
+    webhook: GitHubWebhookStatusResponse,
+    polling: GitHubPollStatusResponse,
+    poll_deliveries: GitHubPollDeliveryStatusResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubWebhookStatusResponse {
+    endpoint_enabled: bool,
+    last_received_at: Option<DateTime<Utc>>,
+    last_event: Option<String>,
+    last_delivery_id: Option<String>,
+    deliveries_24h: i64,
+    app: Option<GitHubAppWebhookStatusResponse>,
+    app_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubAppWebhookStatusResponse {
+    url: Option<String>,
+    content_type: Option<String>,
+    subscribed_events: Vec<String>,
+    missing_events: Vec<String>,
+    deliveries: Vec<donkeyspace_github::GitHubAppWebhookDelivery>,
+}
+
+#[derive(Debug, Serialize)]
+struct GitHubPollDeliveryStatusResponse {
+    last_received_at: Option<DateTime<Utc>>,
+    last_event: Option<String>,
+    deliveries_24h: i64,
+}
+
 #[derive(Debug)]
 struct GitHubIngressEvent {
     event_name: &'static str,
@@ -284,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         configuration,
         webhook_secret,
+        configured_ingress_mode,
         github_auth,
         pool,
         policy,
@@ -315,6 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/engagement-decisions", get(api_engagement_decisions))
         .route("/api/github-poll/status", get(api_github_poll_status))
         .route("/api/github-poll/trigger", post(api_github_poll_trigger))
+        .route("/api/github-ingress/status", get(api_github_ingress_status))
         .route("/api/runs/{id}", get(api_run))
         .route("/api/runs/{id}/transitions", get(api_run_transitions))
         .route("/api/runs/{id}/lease", post(api_lease_run))
@@ -498,6 +539,78 @@ impl PolledRepository {
 
 async fn api_github_poll_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.github_poller.status().await)
+}
+
+async fn api_github_ingress_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!(ApiError::new("database is not configured"))),
+        )
+            .into_response();
+    };
+    let stats = match github_ingress_delivery_stats(pool).await {
+        Ok(stats) => stats,
+        Err(error) => {
+            tracing::error!(%error, "failed to load github ingress delivery statistics");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!(ApiError::new("failed to load github ingress status"))),
+            )
+                .into_response();
+        }
+    };
+    let (app, app_error) = match &state.github_auth {
+        Some(provider) => match provider.app_webhook_status().await {
+            Ok(status) => (status.map(github_app_webhook_status_response), None),
+            Err(error) => {
+                tracing::warn!(%error, "failed to inspect github app webhook status");
+                (None, Some(error.to_string()))
+            }
+        },
+        None => (None, None),
+    };
+    Json(GitHubIngressStatusResponse {
+        configured_mode: state.configured_ingress_mode.clone(),
+        webhook: GitHubWebhookStatusResponse {
+            endpoint_enabled: state.webhook_secret.is_some(),
+            last_received_at: stats.webhook_last_received_at,
+            last_event: stats.webhook_last_event,
+            last_delivery_id: stats.webhook_last_delivery_id,
+            deliveries_24h: stats.webhook_deliveries_24h,
+            app,
+            app_error,
+        },
+        polling: state.github_poller.status().await,
+        poll_deliveries: GitHubPollDeliveryStatusResponse {
+            last_received_at: stats.poll_last_received_at,
+            last_event: stats.poll_last_event,
+            deliveries_24h: stats.poll_deliveries_24h,
+        },
+    })
+    .into_response()
+}
+
+fn github_app_webhook_status_response(
+    status: donkeyspace_github::GitHubAppWebhookStatus,
+) -> GitHubAppWebhookStatusResponse {
+    let missing_events = REQUIRED_GITHUB_WEBHOOK_EVENTS
+        .iter()
+        .filter(|required| {
+            !status
+                .subscribed_events
+                .iter()
+                .any(|event| event == **required)
+        })
+        .map(|event| (*event).to_string())
+        .collect();
+    GitHubAppWebhookStatusResponse {
+        url: status.url,
+        content_type: status.content_type,
+        subscribed_events: status.subscribed_events,
+        missing_events,
+        deliveries: status.deliveries,
+    }
 }
 
 async fn api_github_poll_trigger(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -3288,15 +3401,16 @@ mod tests {
         GitHubComment, GitHubIssue, GitHubIssueWebhook, GitHubLabel, GitHubOwner, GitHubPollConfig,
         GitHubPollController, GitHubRepository, HumanApprovalAction, JobRecord, PolledRepository,
         authorize_engagement, can_retry_job, effective_configuration, engagement_gate,
-        extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
-        issue_number_from_managed_branch, parse_human_approval_command, parse_polled_repositories,
-        parse_repository_query, permission_rank, poll_backoff, polled_event_sender,
-        polled_repository_input, should_queue_reviewer, should_queue_triage,
-        webhook_installation_matches, webhook_repository_allowed,
+        extract_linked_issue_number, github_app_webhook_status_response,
+        github_poll_event_to_ingress, is_projected_work_item, issue_number_from_managed_branch,
+        parse_human_approval_command, parse_polled_repositories, parse_repository_query,
+        permission_rank, poll_backoff, polled_event_sender, polled_repository_input,
+        should_queue_reviewer, should_queue_triage, webhook_installation_matches,
+        webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
     use donkeyspace_core::{DeploymentMode, EngagementGate, EngagementSelector, Policy};
-    use donkeyspace_github::{GitHubAuthConfig, GitHubCredentialProvider};
+    use donkeyspace_github::{GitHubAppWebhookStatus, GitHubAuthConfig, GitHubCredentialProvider};
     use serde_json::json;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
@@ -3314,6 +3428,20 @@ mod tests {
             performed_via_github_app: None,
             body: "ordinary response".into(),
         }
+    }
+
+    #[test]
+    fn github_app_status_reports_required_missing_events() {
+        let response = github_app_webhook_status_response(GitHubAppWebhookStatus {
+            url: Some("https://hooks.example/webhooks/github".into()),
+            content_type: Some("json".into()),
+            subscribed_events: vec!["issues".into(), "push".into()],
+            deliveries: Vec::new(),
+        });
+        assert_eq!(
+            response.missing_events,
+            vec!["issue_comment", "pull_request"]
+        );
     }
 
     fn engagement_state(selectors: Vec<EngagementSelector>) -> AppState {
@@ -3343,6 +3471,7 @@ mod tests {
                 warnings: Vec::new(),
             },
             webhook_secret: None,
+            configured_ingress_mode: "disabled".into(),
             github_auth: None,
             pool: None,
             policy,

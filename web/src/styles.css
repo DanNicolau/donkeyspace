@@ -625,14 +625,17 @@ a {
 }
 
 .status-pill[data-status="blocked"],
-.status-pill[data-status="failed"] {
+.status-pill[data-status="failed"],
+.status-pill[data-status="misconfigured"],
+.status-pill[data-status="unavailable"] {
   background: #ffe2dd;
   color: #902f25;
 }
 
 .status-pill[data-status="pr_open"],
 .status-pill[data-status="completed"],
-.status-pill[data-status="published"] {
+.status-pill[data-status="published"],
+.status-pill[data-status="healthy"] {
   background: #dff4e6;
   color: #17653c;
 }
@@ -840,6 +843,7 @@ a {
 
 .timeline-panel,
 .polling-panel,
+.ingress-panel,
 .operations-list + .panel {
   margin-top: 16px;
 }
@@ -958,6 +962,81 @@ a {
   opacity: 0.6;
 }
 
+.ingress-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 18px;
+}
+
+.ingress-card {
+  background: #f8faf7;
+  border: 1px solid #e4e9e1;
+  border-radius: 10px;
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: 16px;
+}
+
+.ingress-card-heading {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.ingress-card h3 {
+  font-size: 16px;
+}
+
+.ingress-card dl {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.ingress-card dt {
+  color: #68736a;
+  font-size: 12px;
+}
+
+.ingress-card dd {
+  font-weight: 750;
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.ingress-card button {
+  background: #173b2f;
+  border: 0;
+  border-radius: 999px;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  justify-self: start;
+  padding: 10px 16px;
+}
+
+.ingress-card button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.ingress-warning {
+  background: #fff3d1;
+  border: 1px solid #efd58c;
+  border-radius: 8px;
+  color: #654800;
+  padding: 12px;
+}
+
+.ingress-warning p {
+  margin: 4px 0 0;
+}
+
 @media (max-width: 760px) {
   .topbar,
   .run-row,
@@ -1013,6 +1092,11 @@ a {
   }
 
   .detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ingress-grid,
+  .ingress-card dl {
     grid-template-columns: 1fr;
   }
 

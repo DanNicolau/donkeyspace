@@ -340,6 +340,17 @@ pub struct EngagementDecisionRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubIngressDeliveryStats {
+    pub webhook_last_received_at: Option<DateTime<Utc>>,
+    pub webhook_last_event: Option<String>,
+    pub webhook_last_delivery_id: Option<String>,
+    pub webhook_deliveries_24h: i64,
+    pub poll_last_received_at: Option<DateTime<Utc>>,
+    pub poll_last_event: Option<String>,
+    pub poll_deliveries_24h: i64,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ManagedPullRequestRecord {
     pub workflow_item_id: i64,
@@ -742,6 +753,65 @@ pub async fn webhook_delivery_exists(pool: &PgPool, delivery_id: &str) -> Result
         "SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = $1)",
     )
     .bind(delivery_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn github_ingress_delivery_stats(
+    pool: &PgPool,
+) -> Result<GitHubIngressDeliveryStats, DbError> {
+    Ok(sqlx::query_as::<_, GitHubIngressDeliveryStats>(
+        r#"
+        SELECT
+            (
+                SELECT received_at
+                FROM webhook_deliveries
+                WHERE delivery_id NOT LIKE 'github-poll:%'
+                ORDER BY received_at DESC
+                LIMIT 1
+            ) AS webhook_last_received_at,
+            (
+                SELECT event_name
+                FROM webhook_deliveries
+                WHERE delivery_id NOT LIKE 'github-poll:%'
+                ORDER BY received_at DESC
+                LIMIT 1
+            ) AS webhook_last_event,
+            (
+                SELECT delivery_id
+                FROM webhook_deliveries
+                WHERE delivery_id NOT LIKE 'github-poll:%'
+                ORDER BY received_at DESC
+                LIMIT 1
+            ) AS webhook_last_delivery_id,
+            (
+                SELECT COUNT(*)
+                FROM webhook_deliveries
+                WHERE delivery_id NOT LIKE 'github-poll:%'
+                  AND received_at >= now() - INTERVAL '24 hours'
+            ) AS webhook_deliveries_24h,
+            (
+                SELECT received_at
+                FROM webhook_deliveries
+                WHERE delivery_id LIKE 'github-poll:%'
+                ORDER BY received_at DESC
+                LIMIT 1
+            ) AS poll_last_received_at,
+            (
+                SELECT event_name
+                FROM webhook_deliveries
+                WHERE delivery_id LIKE 'github-poll:%'
+                ORDER BY received_at DESC
+                LIMIT 1
+            ) AS poll_last_event,
+            (
+                SELECT COUNT(*)
+                FROM webhook_deliveries
+                WHERE delivery_id LIKE 'github-poll:%'
+                  AND received_at >= now() - INTERVAL '24 hours'
+            ) AS poll_deliveries_24h
+        "#,
+    )
     .fetch_one(pool)
     .await?)
 }
