@@ -84,7 +84,7 @@ function WorkflowCard({ workflow }: { workflow: Workflow }) {
     <RunSummary summary={workflow.summary} tasks={workflow.tasks} compact />
     {active.length ? <div className="agent-strip"><strong>Running now</strong>{active.map((task) => <span key={task.job_id}>{task.task_display_name}{task.work_item ? ` / ${task.work_item}` : ""}</span>)}</div> : null}
     {workflow.pending_approval ? <div className="attention-box"><strong>Decision required</strong><p>{firstParagraph(workflow.pending_approval)}</p></div> : null}
-    <div className="workflow-result">{workflow.pull_request_url ? <a href={workflow.pull_request_url} target="_blank" rel="noreferrer">Pull request{workflow.pull_request_number ? ` #${workflow.pull_request_number}` : ""} · {workflow.pull_request_state ?? "open"}</a> : <span><strong>Why no PR:</strong> {workflow.no_pr_reason}</span>}<time title={new Date(workflow.updated_at).toLocaleString()}>{relativeTime(workflow.updated_at)}</time></div>
+    <div className="workflow-result">{workflow.pull_request_url ? <a href={workflow.pull_request_url} target="_blank" rel="noreferrer">Pull request{workflow.pull_request_number ? ` #${workflow.pull_request_number}` : ""} · {pullRequestStatus(workflow.pull_request_state)}</a> : <span><strong>Why no PR:</strong> {workflow.no_pr_reason}</span>}<time title={new Date(workflow.updated_at).toLocaleString()}>{relativeTime(workflow.updated_at)}</time></div>
   </article>;
 }
 
@@ -95,15 +95,39 @@ function WorkflowDetail({ owner, repo, number }: { owner: string; repo: string; 
   const workflow = workflowQuery.data;
   if (!workflow) return <div className="empty-state panel">{workflowQuery.isError ? "Workflow could not be loaded." : "Loading workflow…"}</div>;
   const events = [...(eventsQuery.data?.events ?? [])].reverse();
+  const retryJobId = workflow.coordinator_status === "failed" && workflow.outcome === "failed"
+    ? workflow.coordinator_job_id
+    : null;
+  const hasRetryableTask = workflow.tasks.some((task) => task.status === "failed" && task.outcome === "failed");
   return <><a className="back-link" href="/">← All issues</a><section className="detail-hero panel"><div><span className="eyebrow">{owner}/{repo} · Issue #{number}</span><h2>{workflow.issue_title}</h2><p>{summaryHeadline(workflow.summary, workflow.tasks)}</p></div><div className="detail-state"><StatusPill status={workflow.current_state ?? "unknown"} /><a href={workflow.issue_url} target="_blank" rel="noreferrer">Open on GitHub</a></div></section>
     <section className="panel run-summary-panel"><PanelHeading title="Execution summary" subtitle="Agent outcomes in the order they occurred." /><RunSummary summary={workflow.summary} tasks={workflow.tasks} /></section>
-    <section className="detail-grid"><section className="panel"><PanelHeading title="Current work" subtitle="Task state is independent per agent." /><div className="task-list">{workflow.tasks.map((task) => <TaskRow key={task.job_id} task={task} />)}{!workflow.tasks.length ? <div className="empty-state">Planning is the only active phase.</div> : null}</div></section>
-      <section className="panel"><PanelHeading title="Outcome" subtitle="Latest aggregate lifecycle result." /><div className="outcome-content"><dl><div><dt>Outcome</dt><dd>{workflow.outcome ?? "pending"}</dd></div><div><dt>Coordinator</dt><dd>{workflow.coordinator_status ?? "unknown"}</dd></div></dl>{workflow.pending_approval ? <div className="attention-box"><strong>Decision required</strong><pre>{workflow.pending_approval}</pre></div> : null}{workflow.pull_request_url ? <a className="primary-link" href={workflow.pull_request_url} target="_blank" rel="noreferrer">Open final pull request</a> : <p><strong>Why no PR:</strong> {workflow.no_pr_reason}</p>}</div></section>
+    <section className="detail-grid"><section className="panel"><PanelHeading title="Current work" subtitle="Task state is independent per agent." /><div className="task-list">{workflow.tasks.map((task) => <TaskRow key={task.job_id} retryJobId={retryJobId} task={task} />)}{!workflow.tasks.length ? <div className="empty-state">Planning is the only active phase.</div> : null}</div></section>
+      <section className="panel"><PanelHeading title="Outcome" subtitle="Latest aggregate lifecycle result." /><div className="outcome-content"><dl><div><dt>Outcome</dt><dd>{workflow.outcome ?? "pending"}</dd></div><div><dt>Coordinator</dt><dd>{workflow.coordinator_status ?? "unknown"}</dd></div>{workflow.pull_request_url ? <div><dt>Pull request</dt><dd>{pullRequestStatus(workflow.pull_request_state)}</dd></div> : null}</dl>{workflow.pending_approval ? <div className="attention-box"><strong>Decision required</strong><pre>{workflow.pending_approval}</pre></div> : null}{workflow.pull_request_url ? <a className="primary-link" href={workflow.pull_request_url} target="_blank" rel="noreferrer">{pullRequestAction(workflow.pull_request_state)}</a> : <p><strong>Why no PR:</strong> {workflow.no_pr_reason}</p>}{retryJobId && !hasRetryableTask ? <RetryButton jobId={retryJobId} label="Retry failed workflow" /> : null}</div></section>
     </section>
     <section className="panel timeline-panel"><div className="panel-header"><div><h2>Lifecycle timeline</h2><span>Triggers, agent waves, handoffs, decisions, artifacts, and end results.</span></div><label className="detail-toggle"><input type="checkbox" checked={showDetails} onChange={(event) => setShowDetails(event.target.checked)} /> Show scheduling details</label></div><div className="timeline">{events.map((event) => <TimelineRow event={event} key={event.id} />)}{!events.length ? <div className="empty-state">Timeline tracking began after this workflow was created, or no milestone has been recorded yet.</div> : null}</div></section>
   </>;
 }
-function TaskRow({ task }: { task: WorkflowTask }) { return <article className="task-row"><div><strong>{task.task_display_name}{task.work_item ? ` / ${task.work_item}` : ""}</strong><span>{task.role_display_name}</span><p>{task.summary ?? "Waiting for an agent result."}</p></div><div><StatusPill status={task.status} /><small>{task.outcome ?? "pending"}</small></div></article>; }
+function TaskRow({ task, retryJobId }: { task: WorkflowTask; retryJobId: string | null }) {
+  const canRetry = retryJobId !== null && task.status === "failed" && task.outcome === "failed";
+
+  return <article className="task-row"><div><strong>{task.task_display_name}{task.work_item ? ` / ${task.work_item}` : ""}</strong><span>{task.role_display_name}</span><p>{task.summary ?? "Waiting for an agent result."}</p></div><div><StatusPill status={task.status} /><small>{task.outcome ?? "pending"}</small>{canRetry ? <RetryButton jobId={retryJobId} label="Retry after failure" /> : null}</div></article>;
+}
+function RetryButton({ jobId, label }: { jobId: string; label: string }) {
+  const queryClient = useQueryClient();
+  const retry = useMutation({
+    mutationFn: () => json<Run>(`/api/runs/${jobId}/retry`, { method: "POST" }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["workflow"] }),
+        queryClient.invalidateQueries({ queryKey: ["workflow-events"] }),
+        queryClient.invalidateQueries({ queryKey: ["workflows"] }),
+        queryClient.invalidateQueries({ queryKey: ["runs"] }),
+      ]);
+    },
+  });
+
+  return <><button className="retry-button" disabled={retry.isPending} onClick={() => retry.mutate()} title="Queue a new lifecycle run after this failure" type="button">{retry.isPending ? "Retrying…" : label}</button>{retry.isError ? <p className="retry-status" role="status">{retry.error instanceof Error ? retry.error.message : "Failed to retry workflow"}</p> : null}</>;
+}
 function TimelineRow({ event }: { event: TimelineEvent }) {
   const label = event.task_display_name ?? event.role_display_name ?? humanize(event.event_type);
   return <article className="timeline-row" data-level={event.level}><div className="timeline-marker" /><time title={new Date(event.created_at).toLocaleString()}>{relativeTime(event.created_at)}</time><div><div className="timeline-heading"><strong>{label}{event.work_item ? ` / ${event.work_item}` : ""}</strong>{event.wave ? <span>Wave {event.wave}</span> : null}{["poll", "webhook"].includes(event.source) ? <span>{event.source}</span> : null}</div><ExpandableText text={event.summary} />{event.reason && event.reason !== event.summary ? <details><summary>Reason</summary><pre>{event.reason}</pre></details> : null}{event.handoff_target ? <p className="handoff">Handoff to {event.handoff_target}</p> : null}{event.links?.length ? <div className="event-links">{event.links.map((link) => <a key={link.url} href={link.url} target="_blank" rel="noreferrer">{link.label}</a>)}</div> : null}</div></article>;
@@ -215,6 +239,16 @@ function PageHeading({ title, subtitle, picker }: { title: string; subtitle: str
 function PanelHeading({ title, subtitle }: { title: string; subtitle: string }) { return <div className="panel-header"><div><h2>{title}</h2><span>{subtitle}</span></div></div>; }
 function StatusPill({ status }: { status: string }) { return <span className="status-pill" data-status={status}>{humanize(status)}</span>; }
 function humanize(value: string) { return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
+function pullRequestStatus(state: string | null) {
+  if (state === "merged") return "merged";
+  if (state === "closed") return "closed without merge";
+  return state ?? "open";
+}
+function pullRequestAction(state: string | null) {
+  if (state === "merged") return "View merged pull request";
+  if (state === "closed") return "View closed pull request";
+  return "Open final pull request";
+}
 function firstParagraph(value: string) { return value.split("\n\n")[0]; }
 function relativeTime(value: string) { const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(value)) / 1000)); if (seconds < 60) return `${seconds}s ago`; if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`; if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`; return `${Math.floor(seconds / 86400)}d ago`; }
 function elapsed(value: string | null | undefined, now: number) { return value ? duration(Math.max(0, now - Date.parse(value))) : "not yet"; }
