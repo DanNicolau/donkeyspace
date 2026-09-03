@@ -12,9 +12,10 @@ use donkeyspace_core::{
     Policy, WorkflowState, normalize_workflow_labels,
 };
 use donkeyspace_db::{
-    DbConfig, EngagementDecisionInput, JobRecord, LifecycleEventInput, PgPool, PullRequestInput,
-    RepositoryInput, WorkflowItemInput, acquire_job_lease, active_job_exists_for_workflow_item,
-    apply_migrations, connect, create_job, create_retry_job, get_job, get_workflow_by_issue,
+    DbConfig, EngagementDecisionInput, JobRecord, LifecycleEventInput, OutboundActionInput, PgPool,
+    PullRequestInput, RepositoryInput, WorkflowItemInput, acquire_job_lease,
+    active_job_exists_for_workflow_item, apply_migrations, connect, create_job,
+    create_outbound_action, create_retry_job, get_job, get_workflow_by_issue,
     get_workflow_item_by_issue_number, get_workflow_item_state, github_ingress_delivery_stats,
     github_managed_resource_exists, latest_workflow_job_input, list_agent_publications_for_run,
     list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
@@ -24,7 +25,8 @@ use donkeyspace_db::{
     pending_outbound_comment_exists, record_engagement_decision, record_lifecycle_event,
     record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
     resume_latest_paused_job, retry_agent_publication, reviewer_job_exists_for_pr_head,
-    upsert_pull_request, upsert_repository, upsert_workflow_item, webhook_delivery_exists,
+    update_workflow_item_state, upsert_pull_request, upsert_repository, upsert_workflow_item,
+    webhook_delivery_exists,
 };
 use donkeyspace_github::{
     GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider,
@@ -1561,6 +1563,10 @@ async fn workflow_summary(
     } else {
         Some("The workflow has not completed all required work yet.".into())
     };
+    let current_state = displayed_workflow_state(
+        workflow.current_state.as_deref(),
+        workflow.pull_request_state.as_deref(),
+    );
     Ok(WorkflowSummary {
         id: workflow.id,
         owner: workflow.owner.clone(),
@@ -1574,7 +1580,7 @@ async fn workflow_summary(
             workflow.owner, workflow.repository, workflow.issue_number
         ),
         provider_state: workflow.provider_state,
-        current_state: workflow.current_state,
+        current_state,
         current_labels: workflow.current_labels,
         coordinator_job_id: coordinator_id,
         coordinator_status: workflow.latest_job_status,
@@ -1589,6 +1595,17 @@ async fn workflow_summary(
         updated_at: workflow.updated_at,
         created_at: workflow.created_at,
     })
+}
+
+fn displayed_workflow_state(
+    current_state: Option<&str>,
+    pull_request_state: Option<&str>,
+) -> Option<String> {
+    match (current_state, pull_request_state) {
+        (Some("pr_open"), Some("merged")) => Some("pr_merged".into()),
+        (Some("pr_open"), Some("closed")) => Some("pr_closed".into()),
+        _ => current_state.map(Into::into),
+    }
 }
 
 fn first_paragraph(value: &str) -> String {
@@ -2545,6 +2562,8 @@ async fn persist_pull_request_webhook(
         None => None,
     };
 
+    let pull_request_state =
+        normalized_pull_request_state(&payload.pull_request.state, payload.pull_request.merged);
     upsert_pull_request(
         pool,
         &PullRequestInput {
@@ -2554,7 +2573,7 @@ async fn persist_pull_request_webhook(
             pr_number: payload.pull_request.number,
             title: payload.pull_request.title.clone(),
             html_url: payload.pull_request.html_url.clone(),
-            state: payload.pull_request.state.clone(),
+            state: pull_request_state.into(),
             head_ref: payload.pull_request.head.ref_name.clone(),
             head_sha: Some(payload.pull_request.head.sha.clone()),
             base_ref: payload.pull_request.base.ref_name.clone(),
@@ -2572,6 +2591,41 @@ async fn persist_pull_request_webhook(
         );
         return Ok(WebhookPersistOutcome::Ignored);
     };
+    let linked_issue_number = linked_issue_number
+        .expect("a matched pull request workflow item has a linked issue number");
+
+    if managed {
+        let workflow_state = match pull_request_state {
+            "open" => Some(WorkflowState::PrOpen.as_str()),
+            "merged" => Some("pr_merged"),
+            "closed" => Some("pr_closed"),
+            _ => None,
+        };
+        if let Some(workflow_state) = workflow_state
+            && workflow_item.current_state.as_deref() != Some(workflow_state)
+        {
+            update_workflow_item_state(pool, workflow_item.id, workflow_state).await?;
+            record_state_transition(
+                pool,
+                workflow_item.id,
+                None,
+                workflow_item.current_state.as_deref(),
+                workflow_state,
+                &format!("managed pull request is {pull_request_state}"),
+            )
+            .await?;
+        }
+        queue_pull_request_label_reconciliation(
+            pool,
+            policy,
+            workflow_item.id,
+            &payload.repository.owner.login,
+            &payload.repository.name,
+            linked_issue_number,
+            pull_request_state,
+        )
+        .await?;
+    }
 
     if policy.lifecycle.plugin.is_some()
         || !should_queue_reviewer(
@@ -3308,9 +3362,83 @@ struct GitHubPullRequest {
     html_url: String,
     state: String,
     #[serde(default)]
+    merged: bool,
+    #[serde(default)]
     draft: bool,
     head: GitHubPullRequestRef,
     base: GitHubPullRequestRef,
+}
+
+fn normalized_pull_request_state(state: &str, merged: bool) -> &str {
+    if merged { "merged" } else { state }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_pull_request_label_reconciliation(
+    pool: &PgPool,
+    policy: &Policy,
+    workflow_item_id: i64,
+    owner: &str,
+    repo: &str,
+    issue_number: i64,
+    pull_request_state: &str,
+) -> Result<(), donkeyspace_db::DbError> {
+    let target_label = (pull_request_state == "open")
+        .then(|| {
+            policy
+                .workflow
+                .state_labels
+                .get(WorkflowState::PrOpen.as_str())
+        })
+        .flatten();
+    let stale_labels = policy
+        .workflow
+        .state_labels
+        .values()
+        .filter(|label| Some(*label) != target_label)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !stale_labels.is_empty() {
+        create_outbound_action(
+            pool,
+            &OutboundActionInput {
+                workflow_item_id,
+                job_id: None,
+                provider: "github".into(),
+                action_type: "issue.remove_labels".into(),
+                payload: json!({
+                    "owner": owner,
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "labels": stale_labels,
+                }),
+            },
+        )
+        .await?;
+    }
+
+    if let Some(target_label) = target_label {
+        create_outbound_action(
+            pool,
+            &OutboundActionInput {
+                workflow_item_id,
+                job_id: None,
+                provider: "github".into(),
+                action_type: "issue.add_label".into(),
+                payload: json!({
+                    "owner": owner,
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "label": target_label,
+                    "state": WorkflowState::PrOpen.as_str(),
+                }),
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3400,13 +3528,13 @@ mod tests {
         EffectiveGitHubConfiguration, FacadeResponse, GitHubActor, GitHubAppIdentity,
         GitHubComment, GitHubIssue, GitHubIssueWebhook, GitHubLabel, GitHubOwner, GitHubPollConfig,
         GitHubPollController, GitHubRepository, HumanApprovalAction, JobRecord, PolledRepository,
-        authorize_engagement, can_retry_job, effective_configuration, engagement_gate,
-        extract_linked_issue_number, github_app_webhook_status_response,
+        authorize_engagement, can_retry_job, displayed_workflow_state, effective_configuration,
+        engagement_gate, extract_linked_issue_number, github_app_webhook_status_response,
         github_poll_event_to_ingress, is_projected_work_item, issue_number_from_managed_branch,
-        parse_human_approval_command, parse_polled_repositories, parse_repository_query,
-        permission_rank, poll_backoff, polled_event_sender, polled_repository_input,
-        should_queue_reviewer, should_queue_triage, webhook_installation_matches,
-        webhook_repository_allowed,
+        normalized_pull_request_state, parse_human_approval_command, parse_polled_repositories,
+        parse_repository_query, permission_rank, poll_backoff, polled_event_sender,
+        polled_repository_input, should_queue_reviewer, should_queue_triage,
+        webhook_installation_matches, webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
     use donkeyspace_core::{DeploymentMode, EngagementGate, EngagementSelector, Policy};
@@ -3428,6 +3556,33 @@ mod tests {
             performed_via_github_app: None,
             body: "ordinary response".into(),
         }
+    }
+
+    #[test]
+    fn merged_pull_requests_keep_their_terminal_disposition() {
+        assert_eq!(normalized_pull_request_state("closed", true), "merged");
+        assert_eq!(normalized_pull_request_state("closed", false), "closed");
+        assert_eq!(normalized_pull_request_state("open", false), "open");
+    }
+
+    #[test]
+    fn terminal_pull_request_disposition_replaces_pr_open_for_display() {
+        assert_eq!(
+            displayed_workflow_state(Some("pr_open"), Some("merged")).as_deref(),
+            Some("pr_merged")
+        );
+        assert_eq!(
+            displayed_workflow_state(Some("pr_open"), Some("closed")).as_deref(),
+            Some("pr_closed")
+        );
+        assert_eq!(
+            displayed_workflow_state(Some("needs_human"), Some("open")).as_deref(),
+            Some("needs_human")
+        );
+        assert_eq!(
+            displayed_workflow_state(Some("in_progress"), Some("closed")).as_deref(),
+            Some("in_progress")
+        );
     }
 
     #[test]
