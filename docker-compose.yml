@@ -20,6 +20,7 @@ services:
     environment: &github-environment
       DONKEYSPACE_BIND_ADDR: 0.0.0.0:8080
       DONKEYSPACE_DATABASE_URL: postgres://donkeyspace:donkeyspace@postgres:5432/donkeyspace
+      DONKEYSPACE_DEPLOYMENT_MODE: ${DONKEYSPACE_DEPLOYMENT_MODE:?Set DONKEYSPACE_DEPLOYMENT_MODE=minimal for an intentional base deployment, or start configured instances with donkeyspace up}
       DONKEYSPACE_POLICY_PATH: /run/donkeyspace/policy.yml
       DONKEYSPACE_GITHUB_AUTH_MODE: ${DONKEYSPACE_GITHUB_AUTH_MODE:-}
       DONKEYSPACE_GITHUB_APP_ID: ${DONKEYSPACE_GITHUB_APP_ID:-}
@@ -39,6 +40,11 @@ services:
     secrets:
       - github_private_key
       - github_webhook_secret
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/readyz').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     depends_on:
       postgres:
         condition: service_healthy
@@ -76,6 +82,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      api:
+        condition: service_healthy
 
   web:
     build:
@@ -84,7 +92,7 @@ services:
       - "0.0.0.0:${DONKEYSPACE_WEB_PORT:-5173}:80"
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
 
 secrets:
   github_private_key:

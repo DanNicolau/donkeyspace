@@ -1,8 +1,8 @@
 use clap::Parser;
 use donkeyspace_core::policy::RequiredCommand;
 use donkeyspace_core::{
-    Confidence, Facade, Outcome, PluginManifest, Policy, Risk, RunResult, TestResult, TestStatus,
-    WorkflowState, triage_github_issue_actions, workflow_state_for_outcome,
+    Confidence, DeploymentMode, Facade, Outcome, PluginManifest, Policy, Risk, RunResult,
+    TestResult, TestStatus, WorkflowState, triage_github_issue_actions, workflow_state_for_outcome,
 };
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, LifecycleEventInput, OutboundActionInput,
@@ -163,7 +163,40 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let args = Args::parse();
+    let deployment_mode = DeploymentMode::from_environment()?;
+    if deployment_mode == DeploymentMode::Generated
+        && env::var("DONKEYSPACE_POLICY_PATH")
+            .ok()
+            .is_none_or(|path| path.trim().is_empty())
+    {
+        return Err("generated deployment mode requires DONKEYSPACE_POLICY_PATH".into());
+    }
     let policy = load_policy()?;
+    if deployment_mode == DeploymentMode::Minimal
+        && (policy.lifecycle.plugin.is_some()
+            || policy.agents.developer.plugin.is_some()
+            || [
+                "DONKEYSPACE_GITHUB_AUTH_MODE",
+                "DONKEYSPACE_GITHUB_APP_ID",
+                "DONKEYSPACE_GITHUB_INSTALLATION_ID",
+                "DONKEYSPACE_GITHUB_TOKEN",
+                "DONKEYSPACE_GITHUB_REPOSITORIES",
+                "DONKEYSPACE_GITHUB_POLL_REPOSITORIES",
+                "DONKEYSPACE_WEBHOOK_SECRET",
+                "DONKEYSPACE_WEBHOOK_SECRET_FILE",
+            ]
+            .iter()
+            .any(|name| {
+                env::var(name)
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty())
+            }))
+    {
+        return Err(
+            "minimal deployment mode cannot enable GitHub or plugin configuration; use the generated deployment entry point"
+                .into(),
+        );
+    }
     let _ = ACTIVE_FACADE.set(policy.facade.resolve());
     let _ = ACTIVE_DASHBOARD_PUBLIC_URL.set(policy.dashboard.public_url.clone());
     let _ = lifecycle_start_role(&policy)?;
@@ -206,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.repo_context_max_files,
     );
 
-    tracing::info!("donkeyspace worker started");
+    tracing::info!(deployment_mode = %deployment_mode, "donkeyspace worker started");
 
     let legacy_pat = non_empty_string(args.github_token.clone());
     let github_auth = match (GitHubCredentialProvider::from_env()?, legacy_pat) {
