@@ -27,6 +27,7 @@ enum Command {
     Up,
     Down,
     Status,
+    ComposeConfig,
     Plugin(PluginArgs),
     Reset(ResetArgs),
 }
@@ -431,6 +432,7 @@ async fn run() -> Result<(), SetupError> {
         Command::Up => instance.up()?,
         Command::Down => instance.down()?,
         Command::Status => instance.status()?,
+        Command::ComposeConfig => instance.compose_config()?,
         Command::Plugin(args) => match args.command {
             PluginCommand::List => {
                 let config = instance.config().ok_or_else(|| {
@@ -596,5 +598,11 @@ mod tests {
             panic!("expected GitHub access command");
         };
         assert!(matches!(args.scope, GitHubAccessScopeArg::Approvers));
+    }
+
+    #[test]
+    fn parses_compose_config_command() {
+        let cli = Cli::try_parse_from(["donkeyspace", "compose-config"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::ComposeConfig)));
     }
 }

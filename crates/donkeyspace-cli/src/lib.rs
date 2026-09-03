@@ -1269,6 +1269,18 @@ impl Instance {
         self.print_endpoints()
     }
 
+    pub fn compose_config(&self) -> Result<(), SetupError> {
+        let mut command = self.compose_command(&["config"])?;
+        for name in [
+            "DONKEYSPACE_GITHUB_TOKEN",
+            "DONKEYSPACE_LLM_API_KEY",
+            "OPENROUTER_API_KEY",
+        ] {
+            command.env(name, "[redacted]");
+        }
+        run_status(&mut command)
+    }
+
     pub fn deployment_status(&self) -> Result<DeploymentStatus, SetupError> {
         let mut command = self.compose_command(&["ps", "--format", "json"])?;
         let output = command.output()?;
@@ -1423,6 +1435,7 @@ impl Instance {
 
     fn write_compose_env(&self, config: &InstanceConfig) -> Result<(), SetupError> {
         let mut lines = vec![
+            "DONKEYSPACE_DEPLOYMENT_MODE=generated".into(),
             format!("DONKEYSPACE_API_PORT={}", config.api_port),
             format!("DONKEYSPACE_WEB_PORT={}", config.web_port),
             format!(
@@ -2563,6 +2576,7 @@ mod tests {
             .write_compose_env(instance.config().unwrap())
             .unwrap();
         let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
+        assert!(environment.contains("DONKEYSPACE_DEPLOYMENT_MODE=generated\n"));
         assert!(environment.contains("DONKEYSPACE_API_PORT=18080\n"));
         assert!(environment.contains("DONKEYSPACE_WEB_PORT=15173\n"));
         assert!(environment.contains("DONKEYSPACE_POLICY_SOURCE="));
