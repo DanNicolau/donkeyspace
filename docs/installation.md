@@ -49,8 +49,14 @@ donkeyspace connect github --repositories OWNER/REPOSITORY
 donkeyspace configure github-access --repository OWNER/REPOSITORY add --user GITHUB_LOGIN
 donkeyspace connect codex --method chatgpt
 donkeyspace doctor
+donkeyspace compose-config
 donkeyspace up
 ```
+
+`donkeyspace compose-config` prints the fully resolved Compose model used by
+the instance. Credential values are replaced before Compose is invoked. Use it
+to verify the policy mount, plugin overlay, facade environment, ingress mode,
+repository scope, ports, and service dependencies before startup.
 
 First-run automation can select stable host ports explicitly:
 
@@ -75,6 +81,31 @@ repository access, secret permissions, and `codex login status`.
 
 `down` preserves PostgreSQL and Codex/workspace volumes. Deletion requires the
 explicit pair `reset --delete-data --confirm`.
+
+## Deployment entry points
+
+`donkeyspace up` is the configured entry point. It regenerates the private
+effective policy, Compose environment, and active-plugin overlay on every run,
+then identifies the runtime as `generated`.
+
+The checked-in `docker-compose.yml` is also a supported minimal local entry
+point, but it must be selected explicitly:
+
+```sh
+DONKEYSPACE_DEPLOYMENT_MODE=minimal docker compose up -d --build
+```
+
+Minimal mode rejects GitHub credentials, repository ingress, and plugin policy.
+This prevents a plain `docker compose up` from silently replacing an existing
+configured stack with healthy-looking containers that cannot receive work. To
+maintain a complete Compose environment directly, set the mode to `generated`
+and provide all selected feature inputs; startup rejects inconsistent GitHub,
+ingress, repository, policy, or plugin configuration.
+
+The API reports the redacted effective mode and capabilities at
+`/api/configuration`; `/healthz` and `/readyz` include the mode and enabled
+capabilities. The Operations dashboard displays the same information and keeps
+a prominent warning visible for minimal or GitHub-disconnected deployments.
 
 Bare-command TUI startup requires an interactive stdin and stdout. Automation
 must use an explicit subcommand; this prevents terminal control sequences from
