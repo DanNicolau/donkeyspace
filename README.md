@@ -64,6 +64,7 @@ cargo run -p donkeyspace-cli -- configure github-access \
   --repository OWNER/REPOSITORY --scope approvers add --user APPROVER_LOGIN
 cargo run -p donkeyspace-cli -- connect codex
 cargo run -p donkeyspace-cli -- doctor
+cargo run -p donkeyspace-cli -- compose-config
 cargo run -p donkeyspace-cli -- up
 ```
 
@@ -189,7 +190,8 @@ DONKEYSPACE_REPO_CONTEXT_MAX_FILES=12
 
 Useful local endpoints:
 
-- `GET /healthz`
+- `GET /healthz` and `GET /readyz`
+- `GET /api/configuration` (redacted effective configuration)
 - Dashboard: `http://localhost:5173` by default; `donkeyspace status` prints the configured URL
 - `GET /api/runs`
 - `GET /api/outbound-actions`
