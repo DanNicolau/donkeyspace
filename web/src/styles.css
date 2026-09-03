@@ -766,6 +766,44 @@ a {
   overflow-wrap: anywhere;
 }
 
+.configuration-warning {
+  align-items: center;
+  background: #fff3d6;
+  border: 1px solid #e7c976;
+  border-radius: 12px;
+  color: #674d0d;
+  display: flex;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 12px 16px;
+}
+
+.configuration-warning span {
+  color: #796226;
+}
+
+.configuration-panel {
+  margin-bottom: 16px;
+}
+
+.configuration-panel dl {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  padding: 18px;
+}
+
+.configuration-panel dt {
+  color: #68736a;
+  font-size: 12px;
+}
+
+.configuration-panel dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
 .outcome-content {
   display: grid;
   gap: 14px;

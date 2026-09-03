@@ -10,6 +10,15 @@ type EventPage = { events: TimelineEvent[]; next_before_id: number | null };
 type Run = { id: string; role: string; status: string; result: { outcome?: string; summary?: string } | null; input?: { issue?: { number?: number; title?: string }; repository?: { full_name?: string } }; updated_at: string };
 type OutboundAction = { id: number; action_type: string; status: string; last_error: string | null; payload: { owner?: string; repo?: string; issue_number?: number }; created_at: string };
 type PollStatus = { enabled: boolean; running: boolean; pending_manual: boolean; configured_interval_seconds: number; last_completed_at: string | null; next_poll_at: string | null };
+type EffectiveConfiguration = {
+  deployment_mode: "generated" | "minimal";
+  policy_source: string;
+  facade: Facade;
+  github: { auth_mode: string; ingress_mode: string; repositories: string[] };
+  plugin: { id: string; flow: string } | null;
+  capabilities: string[];
+  warnings: string[];
+};
 type SummaryStep = { role: string | null; text: string };
 
 const storageKey = "donkeyspace.dashboard.repository";
@@ -25,6 +34,7 @@ const repositoryQuery = (repository: string) => repository ? `?repository=${enco
 
 export function App() {
   const facadeQuery = useQuery({ queryKey: ["facade"], queryFn: () => json<Facade>("/api/facade"), staleTime: Infinity });
+  const configurationQuery = useQuery({ queryKey: ["configuration"], queryFn: () => json<EffectiveConfiguration>("/api/configuration"), staleTime: 30_000 });
   const facade = facadeQuery.data ?? { display_name: "Agent Platform", tagline: "Agentic repository workflow", issue_command: "", branch_prefix: "agent" };
   useEffect(() => { document.title = facade.display_name; }, [facade.display_name]);
   const path = window.location.pathname.replace(/\/$/, "") || "/";
@@ -34,6 +44,7 @@ export function App() {
     <header className="topbar"><div><h1>{facade.display_name}</h1><p>{facade.tagline}</p></div>
       <nav className="primary-nav" aria-label="Primary navigation"><a aria-current={page !== "operations" ? "page" : undefined} href="/">Issues</a><a aria-current={page === "operations" ? "page" : undefined} href="/operations">Operations</a><a href="/healthz">API health</a></nav>
     </header>
+    {configurationQuery.data?.warnings.map((warning) => <div className="configuration-warning" role="status" key={warning}><strong>{humanize(configurationQuery.data.deployment_mode)} deployment</strong><span>{warning}</span></div>)}
     {page === "operations" ? <OperationsPage /> : detail ? <WorkflowDetail owner={decodeURIComponent(detail[1])} repo={decodeURIComponent(detail[2])} number={Number(detail[3])} /> : <IssuesPage />}
   </main>;
 }
@@ -161,10 +172,16 @@ function OperationsPage() {
   const runs = useQuery({ queryKey: ["runs", repository], queryFn: () => json<Run[]>(`/api/runs${repositoryQuery(repository)}`), refetchInterval: 10_000 });
   const actions = useQuery({ queryKey: ["outbound-actions", repository], queryFn: () => json<OutboundAction[]>(`/api/outbound-actions${repositoryQuery(repository)}`), refetchInterval: 10_000 });
   const poll = useQuery({ queryKey: ["poll-status"], queryFn: () => json<PollStatus>("/api/github-poll/status"), refetchInterval: 5_000 });
-  return <><PageHeading title="Operations" subtitle="Polling controls, raw jobs, and GitHub delivery diagnostics." picker={<RepositoryPicker value={repository} onChange={setRepository} />} /><PollingPanel status={poll.data} />
+  const configuration = useQuery({ queryKey: ["configuration"], queryFn: () => json<EffectiveConfiguration>("/api/configuration"), staleTime: 30_000 });
+  return <><PageHeading title="Operations" subtitle="Polling controls, raw jobs, and GitHub delivery diagnostics." picker={<RepositoryPicker value={repository} onChange={setRepository} />} /><ConfigurationPanel configuration={configuration.data} /><PollingPanel status={poll.data} />
     <section className="panel"><PanelHeading title="Raw jobs" subtitle={repository || "All repositories"} /><div className="operations-list">{(runs.data ?? []).map((run) => <article key={run.id}><div><strong>{run.input?.issue?.title ?? "Untitled issue"}</strong><code>{run.id}</code><p>{run.result?.summary ?? `Issue #${run.input?.issue?.number ?? "?"}`}</p></div><div><StatusPill status={run.status} /><small>{run.role} · {run.result?.outcome ?? "pending"}</small></div></article>)}</div></section>
     <section className="panel"><PanelHeading title="GitHub action outbox" subtitle="Pending and completed writes" /><div className="operations-list">{(actions.data ?? []).map((action) => <article key={action.id}><div><strong>{action.action_type}</strong><p>{action.last_error ?? `${action.payload.owner ?? "?"}/${action.payload.repo ?? "?"} #${action.payload.issue_number ?? "?"}`}</p></div><StatusPill status={action.status} /></article>)}</div></section>
   </>;
+}
+function ConfigurationPanel({ configuration }: { configuration?: EffectiveConfiguration }) {
+  return <section className="panel configuration-panel"><PanelHeading title="Effective configuration" subtitle={configuration ? `${humanize(configuration.deployment_mode)} deployment` : "Loading configuration…"} />
+    <dl><div><dt>Policy</dt><dd>{configuration?.policy_source ?? "—"}</dd></div><div><dt>GitHub auth</dt><dd>{humanize(configuration?.github.auth_mode ?? "unknown")}</dd></div><div><dt>Ingress</dt><dd>{humanize(configuration?.github.ingress_mode ?? "unknown")}</dd></div><div><dt>Repositories</dt><dd>{configuration?.github.repositories.join(", ") || "None"}</dd></div><div><dt>Plugin</dt><dd>{configuration?.plugin ? `${configuration.plugin.id}:${configuration.plugin.flow}` : "Disabled"}</dd></div><div><dt>Capabilities</dt><dd>{configuration?.capabilities.map(humanize).join(", ") ?? "—"}</dd></div></dl>
+  </section>;
 }
 function PollingPanel({ status }: { status?: PollStatus }) {
   const queryClient = useQueryClient(); const trigger = useMutation({ mutationFn: () => json<unknown>("/api/github-poll/trigger", { method: "POST" }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["poll-status"] }) }); const [now, setNow] = useState(Date.now());
