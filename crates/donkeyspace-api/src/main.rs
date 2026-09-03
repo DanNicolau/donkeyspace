@@ -8,8 +8,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use donkeyspace_core::{
-    AgentRole, EngagementGate, EngagementSelector, LabelState, PluginManifest, Policy,
-    WorkflowState, normalize_workflow_labels,
+    AgentRole, DeploymentMode, EngagementGate, EngagementSelector, LabelState, PluginManifest,
+    Policy, WorkflowState, normalize_workflow_labels,
 };
 use donkeyspace_db::{
     DbConfig, EngagementDecisionInput, JobRecord, LifecycleEventInput, PgPool, PullRequestInput,
@@ -26,7 +26,9 @@ use donkeyspace_db::{
     retry_agent_publication, reviewer_job_exists_for_pr_head, upsert_pull_request,
     upsert_repository, upsert_workflow_item, webhook_delivery_exists,
 };
-use donkeyspace_github::{GitHubClient, GitHubClientError, GitHubCredentialProvider};
+use donkeyspace_github::{
+    GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -43,6 +45,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 struct AppState {
+    configuration: EffectiveConfigurationResponse,
     webhook_secret: Option<String>,
     github_auth: Option<GitHubCredentialProvider>,
     pool: Option<PgPool>,
@@ -53,18 +56,54 @@ struct AppState {
     github_poller: GitHubPollController,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct HealthResponse {
     status: &'static str,
     service: &'static str,
+    deployment_mode: DeploymentMode,
+    capabilities: Vec<String>,
+    warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct FacadeResponse {
     display_name: String,
     tagline: String,
     issue_command: String,
     branch_prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EffectiveConfigurationResponse {
+    deployment_mode: DeploymentMode,
+    policy_source: String,
+    facade: FacadeResponse,
+    github: EffectiveGitHubConfiguration,
+    plugin: Option<EffectivePluginConfiguration>,
+    capabilities: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EffectiveGitHubConfiguration {
+    auth_mode: &'static str,
+    ingress_mode: String,
+    repositories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EffectivePluginConfiguration {
+    id: String,
+    flow: String,
+}
+
+struct EffectiveConfigurationInput<'a> {
+    policy_source: &'a str,
+    github_auth: Option<&'a GitHubCredentialProvider>,
+    ingress_mode: &'a str,
+    configured_repositories: &'a [PolledRepository],
+    polling_repositories: &'a [PolledRepository],
+    webhook_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +224,7 @@ enum HumanApprovalAction {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
+    let deployment_mode = DeploymentMode::from_environment()?;
     let policy = load_policy()?;
     let _ = lifecycle_start_role(&policy)?;
     let database_url = env::var("DONKEYSPACE_DATABASE_URL").ok();
@@ -209,11 +249,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &env::var("DONKEYSPACE_GITHUB_REPOSITORIES").unwrap_or_default(),
     )?;
     let github_poller = GitHubPollController::new(GitHubPollConfig::from_env()?);
+    let webhook_secret = load_optional_secret(
+        "DONKEYSPACE_WEBHOOK_SECRET",
+        "DONKEYSPACE_WEBHOOK_SECRET_FILE",
+    )?;
+    let configured_ingress_mode = configured_ingress_mode(
+        !github_poller.config.repositories.is_empty(),
+        webhook_secret.is_some(),
+    )?;
+    let policy_source = env::var("DONKEYSPACE_POLICY_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("DONKEYSPACE_POLICY_PATH must name the active policy file")?;
+    let configuration = effective_configuration(
+        deployment_mode,
+        &policy,
+        EffectiveConfigurationInput {
+            policy_source: &policy_source,
+            github_auth: github_auth.as_ref(),
+            ingress_mode: &configured_ingress_mode,
+            configured_repositories: &configured_repositories,
+            polling_repositories: &github_poller.config.repositories,
+            webhook_enabled: webhook_secret.is_some(),
+        },
+    )?;
+    tracing::info!(
+        deployment_mode = %configuration.deployment_mode,
+        github_auth = configuration.github.auth_mode,
+        github_ingress = %configuration.github.ingress_mode,
+        repositories = configuration.github.repositories.len(),
+        plugin = configuration.plugin.as_ref().map(|plugin| plugin.id.as_str()).unwrap_or("disabled"),
+        "effective runtime configuration validated"
+    );
     let state = Arc::new(AppState {
-        webhook_secret: load_optional_secret(
-            "DONKEYSPACE_WEBHOOK_SECRET",
-            "DONKEYSPACE_WEBHOOK_SECRET_FILE",
-        )?,
+        configuration,
+        webhook_secret,
         github_auth,
         pool,
         policy,
@@ -227,6 +297,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(healthz))
+        .route("/api/configuration", get(api_configuration))
         .route("/api/facade", get(api_facade))
         .route("/api/repositories", get(api_repositories))
         .route("/api/runs", get(api_runs))
@@ -871,11 +943,169 @@ fn github_identities_match(left: &Value, right: &Value) -> bool {
     }
 }
 
-async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        service: "donkeyspace-api",
+fn configured_ingress_mode(polling_enabled: bool, webhook_enabled: bool) -> Result<String, String> {
+    match env::var("DONKEYSPACE_GITHUB_INGRESS_MODE") {
+        Ok(value)
+            if matches!(
+                value.as_str(),
+                "disabled" | "polling" | "webhook" | "hybrid"
+            ) =>
+        {
+            Ok(value)
+        }
+        Ok(value) if !value.trim().is_empty() => Err(format!(
+            "DONKEYSPACE_GITHUB_INGRESS_MODE must be `disabled`, `polling`, `webhook`, or `hybrid`, got `{value}`"
+        )),
+        _ if polling_enabled && webhook_enabled => Ok("hybrid".into()),
+        _ if polling_enabled => Ok("polling".into()),
+        _ if webhook_enabled => Ok("webhook".into()),
+        _ => Ok("disabled".into()),
+    }
+}
+
+fn effective_configuration(
+    deployment_mode: DeploymentMode,
+    policy: &Policy,
+    input: EffectiveConfigurationInput<'_>,
+) -> Result<EffectiveConfigurationResponse, String> {
+    let mut repositories = input
+        .configured_repositories
+        .iter()
+        .map(PolledRepository::full_name)
+        .collect::<Vec<_>>();
+    repositories.sort_unstable_by_key(|repository| repository.to_ascii_lowercase());
+    repositories.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let mut polled = input
+        .polling_repositories
+        .iter()
+        .map(PolledRepository::full_name)
+        .collect::<Vec<_>>();
+    polled.sort_unstable_by_key(|repository| repository.to_ascii_lowercase());
+    polled.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+    let plugin_selection = policy.lifecycle.plugin.as_ref().or(policy
+        .agents
+        .developer
+        .plugin
+        .as_ref());
+    if deployment_mode == DeploymentMode::Minimal
+        && (input.github_auth.is_some()
+            || input.ingress_mode != "disabled"
+            || !repositories.is_empty()
+            || !polled.is_empty()
+            || input.webhook_enabled
+            || plugin_selection.is_some())
+    {
+        return Err(
+            "minimal deployment mode cannot enable GitHub or plugin configuration; use the generated deployment entry point"
+                .into(),
+        );
+    }
+
+    if input.github_auth.is_none()
+        && (input.ingress_mode != "disabled" || !repositories.is_empty() || !polled.is_empty())
+    {
+        return Err(
+            "GitHub ingress or repositories were selected without GitHub authentication".into(),
+        );
+    }
+    if input.github_auth.is_some() && repositories.is_empty() {
+        return Err(
+            "GitHub authentication is configured but DONKEYSPACE_GITHUB_REPOSITORIES is empty"
+                .into(),
+        );
+    }
+    if input.github_auth.is_some() && input.ingress_mode == "disabled" {
+        return Err("GitHub authentication is configured but GitHub ingress is disabled".into());
+    }
+    if matches!(input.ingress_mode, "polling" | "hybrid") && polled != repositories {
+        return Err(
+            "polling ingress requires DONKEYSPACE_GITHUB_POLL_REPOSITORIES to match DONKEYSPACE_GITHUB_REPOSITORIES"
+                .into(),
+        );
+    }
+    if input.ingress_mode == "webhook" && !polled.is_empty() {
+        return Err("webhook ingress cannot configure polling repositories".into());
+    }
+    if matches!(input.ingress_mode, "webhook" | "hybrid") && !input.webhook_enabled {
+        return Err("webhook ingress requires a configured webhook secret".into());
+    }
+
+    let auth_mode = match input.github_auth.map(GitHubCredentialProvider::mode) {
+        Some(GitHubAuthMode::App) => "app",
+        Some(GitHubAuthMode::Pat) => "pat",
+        None => "disabled",
+    };
+    let plugin = plugin_selection
+        .map(|selection| {
+            let manifest = PluginManifest::from_path(&selection.manifest_path)
+                .map_err(|error| format!("configured plugin manifest is unavailable: {error}"))?;
+            Ok::<_, String>(EffectivePluginConfiguration {
+                id: manifest.id,
+                flow: selection.flow.clone(),
+            })
+        })
+        .transpose()?;
+    let mut capabilities = vec!["api".into(), "dashboard".into()];
+    if input.github_auth.is_some() {
+        capabilities.push("github".into());
+    }
+    if input.ingress_mode == "polling" || input.ingress_mode == "hybrid" {
+        capabilities.push("github_polling".into());
+    }
+    if input.ingress_mode == "webhook" || input.ingress_mode == "hybrid" {
+        capabilities.push("github_webhooks".into());
+    }
+    if plugin.is_some() {
+        capabilities.push("plugin".into());
+    }
+    let warnings = if deployment_mode == DeploymentMode::Minimal {
+        vec!["Intentional minimal mode: GitHub ingress and plugins are disabled.".into()]
+    } else if input.github_auth.is_none() {
+        vec!["GitHub is not connected; repository automation is disabled.".into()]
+    } else {
+        Vec::new()
+    };
+    let facade = policy.facade.resolve();
+    let issue_command = facade.issue_command();
+    Ok(EffectiveConfigurationResponse {
+        deployment_mode,
+        policy_source: input.policy_source.into(),
+        facade: FacadeResponse {
+            display_name: facade.display_name,
+            tagline: facade.tagline,
+            issue_command,
+            branch_prefix: facade.branch_prefix,
+        },
+        github: EffectiveGitHubConfiguration {
+            auth_mode,
+            ingress_mode: input.ingress_mode.into(),
+            repositories,
+        },
+        plugin,
+        capabilities,
+        warnings,
     })
+}
+
+async fn healthz(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: if state.configuration.warnings.is_empty() {
+            "ok"
+        } else {
+            "degraded"
+        },
+        service: "donkeyspace-api",
+        deployment_mode: state.configuration.deployment_mode,
+        capabilities: state.configuration.capabilities.clone(),
+        warnings: state.configuration.warnings.clone(),
+    })
+}
+
+async fn api_configuration(
+    State(state): State<Arc<AppState>>,
+) -> Json<EffectiveConfigurationResponse> {
+    Json(state.configuration.clone())
 }
 
 async fn api_facade(State(state): State<Arc<AppState>>) -> Json<FacadeResponse> {
@@ -3053,17 +3283,20 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, GitHubActor, GitHubAppIdentity, GitHubComment, GitHubIssue, GitHubIssueWebhook,
-        GitHubLabel, GitHubOwner, GitHubPollConfig, GitHubPollController, GitHubRepository,
-        HumanApprovalAction, JobRecord, PolledRepository, authorize_engagement, can_retry_job,
-        engagement_gate, extract_linked_issue_number, github_poll_event_to_ingress,
-        is_projected_work_item, issue_number_from_managed_branch, parse_human_approval_command,
-        parse_polled_repositories, parse_repository_query, permission_rank, poll_backoff,
-        polled_event_sender, polled_repository_input, should_queue_reviewer, should_queue_triage,
+        AppState, EffectiveConfigurationInput, EffectiveConfigurationResponse,
+        EffectiveGitHubConfiguration, FacadeResponse, GitHubActor, GitHubAppIdentity,
+        GitHubComment, GitHubIssue, GitHubIssueWebhook, GitHubLabel, GitHubOwner, GitHubPollConfig,
+        GitHubPollController, GitHubRepository, HumanApprovalAction, JobRecord, PolledRepository,
+        authorize_engagement, can_retry_job, effective_configuration, engagement_gate,
+        extract_linked_issue_number, github_poll_event_to_ingress, is_projected_work_item,
+        issue_number_from_managed_branch, parse_human_approval_command, parse_polled_repositories,
+        parse_repository_query, permission_rank, poll_backoff, polled_event_sender,
+        polled_repository_input, should_queue_reviewer, should_queue_triage,
         webhook_installation_matches, webhook_repository_allowed,
     };
     use chrono::{DateTime, Utc};
-    use donkeyspace_core::{EngagementGate, EngagementSelector, Policy};
+    use donkeyspace_core::{DeploymentMode, EngagementGate, EngagementSelector, Policy};
+    use donkeyspace_github::{GitHubAuthConfig, GitHubCredentialProvider};
     use serde_json::json;
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
@@ -3088,7 +3321,27 @@ mod tests {
             Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
         policy.workflow.engagement.default.allow = selectors;
         policy.workflow.engagement.initial = None;
+        let facade = policy.facade.resolve();
+        let issue_command = facade.issue_command();
         AppState {
+            configuration: EffectiveConfigurationResponse {
+                deployment_mode: DeploymentMode::Minimal,
+                policy_source: "/policy.yml".into(),
+                facade: FacadeResponse {
+                    display_name: facade.display_name,
+                    tagline: facade.tagline,
+                    issue_command,
+                    branch_prefix: facade.branch_prefix,
+                },
+                github: EffectiveGitHubConfiguration {
+                    auth_mode: "disabled",
+                    ingress_mode: "disabled".into(),
+                    repositories: Vec::new(),
+                },
+                plugin: None,
+                capabilities: vec!["api".into(), "dashboard".into()],
+                warnings: Vec::new(),
+            },
             webhook_secret: None,
             github_auth: None,
             pool: None,
@@ -3102,6 +3355,114 @@ mod tests {
                 max_pages: 2,
             }),
         }
+    }
+
+    #[test]
+    fn minimal_configuration_is_explicit_and_redacted() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let configuration = effective_configuration(
+            DeploymentMode::Minimal,
+            &policy,
+            EffectiveConfigurationInput {
+                policy_source: "/run/donkeyspace/policy.yml",
+                github_auth: None,
+                ingress_mode: "disabled",
+                configured_repositories: &[],
+                polling_repositories: &[],
+                webhook_enabled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(configuration.deployment_mode, DeploymentMode::Minimal);
+        assert_eq!(configuration.github.auth_mode, "disabled");
+        assert_eq!(configuration.capabilities, ["api", "dashboard"]);
+        assert_eq!(configuration.warnings.len(), 1);
+    }
+
+    #[test]
+    fn rejects_ingress_without_authentication() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let repositories = vec![PolledRepository {
+            owner: "acme".into(),
+            name: "rtl".into(),
+        }];
+        let error = effective_configuration(
+            DeploymentMode::Generated,
+            &policy,
+            EffectiveConfigurationInput {
+                policy_source: "/run/donkeyspace/policy.yml",
+                github_auth: None,
+                ingress_mode: "polling",
+                configured_repositories: &repositories,
+                polling_repositories: &repositories,
+                webhook_enabled: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("without GitHub authentication"));
+    }
+
+    #[tokio::test]
+    async fn reports_valid_generated_configuration_without_exposing_credentials() {
+        let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        let repositories = vec![PolledRepository {
+            owner: "acme".into(),
+            name: "rtl".into(),
+        }];
+        let auth = GitHubCredentialProvider::new(GitHubAuthConfig::Pat {
+            token: "super-secret-token".into(),
+        })
+        .unwrap();
+        let configuration = effective_configuration(
+            DeploymentMode::Generated,
+            &policy,
+            EffectiveConfigurationInput {
+                policy_source: "/run/donkeyspace/policy.yml",
+                github_auth: Some(&auth),
+                ingress_mode: "polling",
+                configured_repositories: &repositories,
+                polling_repositories: &repositories,
+                webhook_enabled: false,
+            },
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&configuration).unwrap();
+        assert_eq!(configuration.github.auth_mode, "pat");
+        assert_eq!(configuration.github.repositories, ["acme/rtl"]);
+        assert!(
+            configuration
+                .capabilities
+                .contains(&"github_polling".into())
+        );
+        assert!(!encoded.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn rejects_missing_selected_plugin_manifest() {
+        let mut policy =
+            Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
+        policy.lifecycle.plugin = Some(donkeyspace_core::PluginFlowSelection {
+            manifest_path: "/missing/plugin/donkeyspace-plugin.yml".into(),
+            flow: "implementation".into(),
+            max_handoffs_per_edge: None,
+            environment: Default::default(),
+            parameters: Default::default(),
+            task_access_overrides: Default::default(),
+        });
+        let error = effective_configuration(
+            DeploymentMode::Generated,
+            &policy,
+            EffectiveConfigurationInput {
+                policy_source: "/run/donkeyspace/policy.yml",
+                github_auth: None,
+                ingress_mode: "disabled",
+                configured_repositories: &[],
+                polling_repositories: &[],
+                webhook_enabled: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("configured plugin manifest is unavailable"));
     }
 
     fn engagement_payload(sender: GitHubActor) -> GitHubIssueWebhook {
