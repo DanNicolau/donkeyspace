@@ -3,9 +3,10 @@ use donkeyspace_db::{
     AgentPublicationInput, AgentPublicationRecord, LifecycleEventInput, OutboundActionInput,
     OutboundActionRecord, PgPool, get_workflow_by_issue, list_agent_publications_for_run,
     list_jobs_for_workflow_item, list_lifecycle_events, mark_agent_publication_failed,
-    mark_agent_publication_published, record_lifecycle_event, upsert_agent_publication,
-    upsert_pending_outbound_action,
+    mark_agent_publication_published, record_lifecycle_event, update_workflow_item_state,
+    upsert_agent_publication, upsert_pending_outbound_action,
 };
+use donkeyspace_github::{branch_url, commit_url, compare_url, file_url};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, env, fs, io::Read, path::Path, process::Stdio};
@@ -61,12 +62,19 @@ pub async fn publish_checkpoint(
     repo_path: &Path,
     commit_title: &str,
 ) -> Result<AgentPublicationRecord, Box<dyn std::error::Error>> {
+    if let Some(workflow_item_id) = context.workflow_item_id {
+        update_workflow_item_state(context.pool, workflow_item_id, "publishing").await?;
+    }
     let branch = issue_branch_name(
         &active_facade().branch_prefix,
         context.issue_number,
         context.coordinator_job_id,
     );
     configure_git_author(repo_path).await?;
+    let base_sha = git(repo_path, &["rev-parse", "HEAD"], None, None)
+        .await?
+        .trim()
+        .to_string();
     let current = git(repo_path, &["branch", "--show-current"], None, None).await?;
     if current.trim() != branch {
         git(repo_path, &["checkout", "-b", &branch], None, None).await?;
@@ -79,6 +87,8 @@ pub async fn publish_checkpoint(
         .await?
         .trim()
         .to_string();
+    let changed_files = changed_files(repo_path, &base_sha, &sha).await?;
+    let zero_diff = base_sha == sha;
     let record = upsert_agent_publication(
         context.pool,
         &AgentPublicationInput {
@@ -87,8 +97,14 @@ pub async fn publish_checkpoint(
             workflow_item_id: context.workflow_item_id,
             kind: "checkpoint".into(),
             branch_name: branch.clone(),
-            commit_sha: sha,
+            commit_sha: sha.clone(),
+            base_sha: Some(base_sha.clone()),
             html_url: branch_url(context.owner, context.repo, &branch),
+            commit_url: Some(commit_url(context.owner, context.repo, &sha)),
+            compare_url: compare_url(context.owner, context.repo, &base_sha, &sha),
+            changed_files: json!(changed_files),
+            task_scopes: json!([]),
+            zero_diff,
             local_repo_path: repo_path.display().to_string(),
             task: None,
             work_item: None,
@@ -104,6 +120,9 @@ pub async fn publish_checkpoint(
     )
     .await?;
     push_publication(context, &record).await?;
+    if let Some(workflow_item_id) = context.workflow_item_id {
+        update_workflow_item_state(context.pool, workflow_item_id, "in_progress").await?;
+    }
     record_publication_event(context, &record).await?;
     queue_status_comment(context, None).await?;
     Ok(record)
@@ -143,6 +162,10 @@ pub async fn publish_attempt(
         }
     }
     configure_git_author(&local_repo).await?;
+    let base_sha = git(&local_repo, &["rev-parse", "HEAD"], None, None)
+        .await?
+        .trim()
+        .to_string();
     for root in attempt.write_roots {
         sync_root(
             &attempt.task_root.join("repo").join(root),
@@ -237,6 +260,7 @@ pub async fn publish_attempt(
         .await?
         .trim()
         .to_string();
+    let changed_files = changed_files(&local_repo, &base_sha, &sha).await?;
     let record = upsert_agent_publication(
         context.pool,
         &AgentPublicationInput {
@@ -245,8 +269,18 @@ pub async fn publish_attempt(
             workflow_item_id: context.workflow_item_id,
             kind: kind.into(),
             branch_name: branch.clone(),
-            commit_sha: sha,
+            commit_sha: sha.clone(),
+            base_sha: Some(base_sha.clone()),
             html_url: branch_url(context.owner, context.repo, &branch),
+            commit_url: Some(commit_url(context.owner, context.repo, &sha)),
+            compare_url: compare_url(context.owner, context.repo, &base_sha, &sha),
+            changed_files: json!(changed_files),
+            task_scopes: json!([{
+                "task": attempt.task,
+                "work_item": attempt.work_item,
+                "files": changed_files,
+            }]),
+            zero_diff: base_sha == sha,
             local_repo_path: local_repo.display().to_string(),
             task: Some(attempt.task.into()),
             work_item: attempt.work_item.map(Into::into),
@@ -311,11 +345,7 @@ async fn record_publication_event(
             ),
             reason: None,
             handoff_target: None,
-            links: json!([{
-                "kind": "branch",
-                "label": publication.branch_name,
-                "url": publication.html_url,
-            }]),
+            links: publication_links(publication),
         },
     )
     .await?;
@@ -411,10 +441,14 @@ async fn queue_status_comment(
         lines.push(format!("| {} | {} | {} |", label, job.status, outcome));
     }
     let coordinator = jobs.iter().find(|job| job.id == context.coordinator_job_id);
-    let pending_approval = coordinator
-        .and_then(|job| job.result.as_ref())
-        .and_then(|result| result.get("human_review_reason"))
-        .and_then(Value::as_str);
+    let pending_approval = (workflow.current_state.as_deref() == Some("needs_human"))
+        .then(|| {
+            coordinator
+                .and_then(|job| job.result.as_ref())
+                .and_then(|result| result.get("human_review_reason"))
+                .and_then(Value::as_str)
+        })
+        .flatten();
     if let Some(reason) = pending_approval {
         lines.extend([
             String::new(),
@@ -422,6 +456,42 @@ async fn queue_status_comment(
             String::new(),
             reason.into(),
         ]);
+        if let Some(checkpoint) = publications
+            .iter()
+            .filter(|publication| {
+                publication.kind == "checkpoint" && publication.status == "published"
+            })
+            .max_by_key(|publication| publication.id)
+        {
+            lines.push(String::new());
+            lines.push(format!(
+                "Exact proposed checkpoint: [`{}`]({})",
+                short_sha(&checkpoint.commit_sha),
+                checkpoint
+                    .commit_url
+                    .as_deref()
+                    .unwrap_or(&checkpoint.html_url)
+            ));
+            if let Some(compare_url) = &checkpoint.compare_url {
+                lines.push(format!("[Review the checkpoint diff]({compare_url})"));
+            } else if checkpoint.zero_diff {
+                lines.push("This checkpoint has no file changes.".into());
+            }
+            if let Some(files) = checkpoint.changed_files.as_array()
+                && !files.is_empty()
+            {
+                lines.push("<details><summary>Changed files</summary>".into());
+                lines.push(String::new());
+                for path in files.iter().filter_map(Value::as_str).take(50) {
+                    lines.push(format!(
+                        "- [`{path}`]({})",
+                        file_url(context.owner, context.repo, &checkpoint.commit_sha, path)
+                    ));
+                }
+                lines.push(String::new());
+                lines.push("</details>".into());
+            }
+        }
     }
     lines.extend([
         String::new(),
@@ -481,8 +551,18 @@ async fn queue_status_comment(
         for publication in &publications {
             let task = publication.task.as_deref().unwrap_or("workspace");
             lines.push(format!(
-                "- {} `{task}`: [{}]({})",
-                publication.kind, publication.branch_name, publication.html_url
+                "- {} `{task}`: [commit `{}`]({}){}",
+                publication.kind,
+                short_sha(&publication.commit_sha),
+                publication
+                    .commit_url
+                    .as_deref()
+                    .unwrap_or(&publication.html_url),
+                publication
+                    .compare_url
+                    .as_ref()
+                    .map(|url| format!(" · [diff]({url})"))
+                    .unwrap_or_default(),
             ));
         }
     }
@@ -688,8 +768,51 @@ fn publication_kind(outcome: Option<Outcome>) -> &'static str {
     }
 }
 
-fn branch_url(owner: &str, repo: &str, branch: &str) -> String {
-    format!("https://github.com/{owner}/{repo}/tree/{branch}")
+fn publication_links(publication: &AgentPublicationRecord) -> Value {
+    let mut links = vec![json!({
+        "kind": "branch", "label": publication.branch_name, "url": publication.html_url,
+    })];
+    if let Some(url) = &publication.commit_url {
+        links.push(
+            json!({"kind": "commit", "label": short_sha(&publication.commit_sha), "url": url}),
+        );
+    }
+    if let Some(url) = &publication.compare_url {
+        links.push(json!({"kind": "compare", "label": "checkpoint diff", "url": url}));
+    }
+    let owner = publication.metadata.get("owner").and_then(Value::as_str);
+    let repo = publication.metadata.get("repo").and_then(Value::as_str);
+    if let (Some(owner), Some(repo), Some(files)) =
+        (owner, repo, publication.changed_files.as_array())
+    {
+        links.extend(files.iter().filter_map(Value::as_str).take(50).map(|path| {
+            json!({
+                "kind": "file", "label": path,
+                "url": file_url(owner, repo, &publication.commit_sha, path),
+            })
+        }));
+    }
+    Value::Array(links)
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..sha.len().min(8)).unwrap_or(sha)
+}
+
+async fn changed_files(
+    repo: &Path,
+    base: &str,
+    head: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if base == head {
+        return Ok(Vec::new());
+    }
+    Ok(git(repo, &["diff", "--name-only", base, head], None, None)
+        .await?
+        .lines()
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn short_uuid(id: Uuid) -> String {

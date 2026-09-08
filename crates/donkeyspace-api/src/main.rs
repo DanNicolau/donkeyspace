@@ -18,18 +18,19 @@ use donkeyspace_db::{
     create_outbound_action, create_retry_job, get_job, get_workflow_by_issue,
     get_workflow_item_by_issue_number, get_workflow_item_state, github_ingress_delivery_stats,
     github_managed_resource_exists, latest_workflow_job_input, list_agent_publications_for_run,
-    list_job_command_results, list_job_outbound_actions, list_job_transitions, list_jobs,
-    list_jobs_for_repository, list_jobs_for_workflow_item, list_lifecycle_events,
-    list_open_managed_pull_requests_for_base, list_recent_engagement_decisions,
+    list_approval_requests_for_run, list_job_command_results, list_job_outbound_actions,
+    list_job_transitions, list_jobs, list_jobs_for_repository, list_jobs_for_workflow_item,
+    list_lifecycle_events, list_open_managed_pull_requests_for_base,
+    list_projected_work_items_for_run, list_recent_engagement_decisions,
     list_recent_outbound_actions, list_recent_outbound_actions_for_repository, list_workflows,
     pending_outbound_comment_exists, record_engagement_decision, record_lifecycle_event,
     record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
-    resume_latest_paused_job, retry_agent_publication, reviewer_job_exists_for_pr_head,
-    update_workflow_item_state, upsert_pull_request, upsert_repository, upsert_workflow_item,
-    webhook_delivery_exists,
+    requeue_failed_job, resume_latest_paused_job, retry_agent_publication,
+    retry_projected_work_items, reviewer_job_exists_for_pr_head, update_workflow_item_state,
+    upsert_pull_request, upsert_repository, upsert_workflow_item, webhook_delivery_exists,
 };
 use donkeyspace_github::{
-    GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider,
+    GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider, file_url,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -352,6 +353,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/workflows/{owner}/{repo}/issues/{number}/events",
             get(api_workflow_events),
+        )
+        .route(
+            "/api/workflows/{owner}/{repo}/issues/{number}/sync/retry",
+            post(api_retry_workflow_sync),
         )
         .route("/api/outbound-actions", get(api_outbound_actions))
         .route("/api/engagement-decisions", get(api_engagement_decisions))
@@ -1444,20 +1449,28 @@ async fn workflow_summary(
 ) -> Result<WorkflowSummary, donkeyspace_db::DbError> {
     let jobs = list_jobs_for_workflow_item(pool, workflow.id).await?;
     let coordinator_id = workflow.latest_job_id;
-    let publication_pr_url = if let Some(coordinator_id) = coordinator_id {
-        list_agent_publications_for_run(pool, coordinator_id, None)
-            .await?
-            .into_iter()
-            .find_map(|publication| {
-                publication
-                    .metadata
-                    .get("pull_request_url")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+    let publications = if let Some(coordinator_id) = coordinator_id {
+        list_agent_publications_for_run(pool, coordinator_id, None).await?
     } else {
-        None
+        Vec::new()
     };
+    let projected_work_items = if let Some(coordinator_id) = coordinator_id {
+        list_projected_work_items_for_run(pool, coordinator_id).await?
+    } else {
+        Vec::new()
+    };
+    let approval_requests = if let Some(coordinator_id) = coordinator_id {
+        list_approval_requests_for_run(pool, coordinator_id).await?
+    } else {
+        Vec::new()
+    };
+    let publication_pr_url = publications.iter().find_map(|publication| {
+        publication
+            .metadata
+            .get("pull_request_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
     let pull_request_url = workflow.pull_request_url.clone().or(publication_pr_url);
     let mut latest = BTreeMap::<(String, String), &JobRecord>::new();
     for job in &jobs {
@@ -1532,16 +1545,161 @@ async fn workflow_summary(
             updated_at: job.updated_at,
         })
         .collect::<Vec<_>>();
-    let pending_approval: Option<String> = jobs
+    let pending_approval: Option<String> = (workflow.current_state.as_deref()
+        == Some("needs_human"))
+    .then(|| {
+        jobs.iter()
+            .filter(|job| Some(job.id) == coordinator_id)
+            .filter_map(|job| job.result.as_ref())
+            .find_map(|result| {
+                result
+                    .get("human_review_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    })
+    .flatten();
+    let publication = publications
         .iter()
-        .filter(|job| Some(job.id) == coordinator_id)
-        .filter_map(|job| job.result.as_ref())
-        .find_map(|result| {
-            result
-                .get("human_review_reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
+        .filter(|publication| publication.kind == "checkpoint" && publication.status == "published")
+        .max_by_key(|publication| publication.id);
+    let failed = publications
+        .iter()
+        .filter(|publication| publication.status == "failed")
+        .collect::<Vec<_>>();
+    let pending = publications
+        .iter()
+        .filter(|publication| publication.status == "pending")
+        .count();
+    let projection_failed = projected_work_items
+        .iter()
+        .find(|item| item.sync_status == "failed");
+    let projection_pending = projected_work_items
+        .iter()
+        .filter(|item| item.sync_status == "pending")
+        .count();
+    let approval_sync_missing = pending_approval.is_some() && publication.is_none();
+    let sync_ready = failed.is_empty()
+        && projection_failed.is_none()
+        && pending + projection_pending == 0
+        && !approval_sync_missing;
+    let pending_approval = pending_approval.filter(|_| sync_ready);
+    let approvals = pending_approval.as_ref().map_or_else(Vec::new, |reason| {
+        let durable = approval_requests
+            .iter()
+            .filter(|request| request.state == "pending")
+            .map(|request| {
+                let proposed = request
+                    .proposed_publication_id
+                    .and_then(|id| publications.iter().find(|publication| publication.id == id));
+                let accepted = request
+                    .accepted_publication_id
+                    .and_then(|id| publications.iter().find(|publication| publication.id == id));
+                ApprovalSummary {
+                    target_task: request.target_task.clone(),
+                    target_work_item: request.target_work_item.clone(),
+                    purpose: request.purpose.clone(),
+                    trigger: request.trigger.clone(),
+                    approval_subject: request.approval_subject.clone(),
+                    result_summary: request.result_summary.clone(),
+                    changed_files: proposed.map_or_else(Vec::new, |publication| {
+                        approval_files(&workflow, publication)
+                    }),
+                    proposed_publication: proposed.map(PublicationSummary::from),
+                    accepted_publication: accepted.map(PublicationSummary::from),
+                    projected_issues: request
+                        .projected_issues
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|issue| {
+                            Some(ApprovalIssue {
+                                number: issue.get("number")?.as_i64()?,
+                                work_item: issue.get("work_item")?.as_str()?.into(),
+                                url: format!(
+                                    "https://github.com/{}/{}/issues/{}",
+                                    workflow.owner,
+                                    workflow.repository,
+                                    issue.get("number")?.as_i64()?
+                                ),
+                            })
+                        })
+                        .collect(),
+                    downstream_tasks: request
+                        .downstream_tasks
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(Into::into)
+                        .collect(),
+                    state: request.state.clone(),
+                    approve_command: approval_command(reason, "approve"),
+                    revise_command: approval_command(reason, "revise"),
+                }
+            })
+            .collect::<Vec<_>>();
+        if !durable.is_empty() {
+            return durable;
+        }
+        vec![ApprovalSummary {
+            target_task: "workflow".into(),
+            target_work_item: None,
+            purpose: "accept_result".into(),
+            trigger: "required".into(),
+            approval_subject: first_paragraph(reason),
+            result_summary: workflow.latest_summary.clone().unwrap_or_default(),
+            changed_files: publication.map_or_else(Vec::new, |publication| {
+                approval_files(&workflow, publication)
+            }),
+            proposed_publication: publication.map(PublicationSummary::from),
+            accepted_publication: None,
+            projected_issues: projected_work_items
+                .iter()
+                .filter_map(|item| {
+                    item.issue_number.map(|number| ApprovalIssue {
+                        number,
+                        work_item: item.work_item.clone(),
+                        url: format!(
+                            "https://github.com/{}/{}/issues/{number}",
+                            workflow.owner, workflow.repository
+                        ),
+                    })
+                })
+                .collect(),
+            downstream_tasks: tasks
+                .iter()
+                .filter(|task| task.status == "waiting")
+                .map(|task| task.task.clone())
+                .collect(),
+            state: "pending".into(),
+            approve_command: approval_command(reason, "approve"),
+            revise_command: approval_command(reason, "revise"),
+        }]
+    });
+    let external_sync = ExternalSyncSummary {
+        status: if !failed.is_empty()
+            || projection_failed.is_some()
+            || (projection_pending > 0 && workflow.latest_job_status.as_deref() == Some("failed"))
+            || approval_sync_missing
+        {
+            "failed"
+        } else if pending + projection_pending > 0 {
+            "publishing"
+        } else {
+            "synchronized"
+        }
+        .into(),
+        pending_operations: pending + projection_pending,
+        last_error: failed
+            .last()
+            .and_then(|publication| publication.last_error.clone())
+            .or_else(|| projection_failed.and_then(|item| item.last_error.clone()))
+            .or_else(|| {
+                approval_sync_missing
+                    .then(|| "The durable approval workspace has no published checkpoint.".into())
+            }),
+    };
     let no_pr_reason = if pull_request_url.is_some() {
         None
     } else if let Some(reason) = &pending_approval {
@@ -1587,6 +1745,8 @@ async fn workflow_summary(
         outcome: workflow.latest_outcome,
         summary: workflow.latest_summary,
         pending_approval,
+        approvals,
+        external_sync,
         tasks,
         pull_request_number: workflow.pull_request_number,
         pull_request_url,
@@ -1918,6 +2078,113 @@ async fn api_retry_publication(
                 .into_response()
         }
     }
+}
+
+async fn api_retry_workflow_sync(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.pool else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new("database is not configured")),
+        )
+            .into_response();
+    };
+    if !state.policy.dashboard.allow_retry {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new(
+                "synchronization retries are disabled by policy",
+            )),
+        )
+            .into_response();
+    }
+    let workflow = match get_workflow_by_issue(pool, &owner, &repo, number).await {
+        Ok(Some(workflow)) => workflow,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new("workflow not found")),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve workflow synchronization");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to resolve workflow synchronization")),
+            )
+                .into_response();
+        }
+    };
+    let Some(coordinator_id) = workflow.latest_job_id else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiError::new("workflow has no synchronization run")),
+        )
+            .into_response();
+    };
+    let publications = match list_agent_publications_for_run(pool, coordinator_id, None).await {
+        Ok(publications) => publications,
+        Err(error) => {
+            tracing::error!(%error, "failed to list workflow publications");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to list workflow synchronization")),
+            )
+                .into_response();
+        }
+    };
+    let mut retried = 0usize;
+    for publication in publications
+        .iter()
+        .filter(|publication| publication.status == "failed")
+    {
+        match retry_agent_publication(pool, publication.id).await {
+            Ok(true) => retried += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(%error, publication_id = publication.id, "failed to reset workflow publication");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::new("failed to retry workflow synchronization")),
+                )
+                    .into_response();
+            }
+        }
+    }
+    match retry_projected_work_items(pool, coordinator_id).await {
+        Ok(count) => retried += count as usize,
+        Err(error) => {
+            tracing::error!(%error, "failed to reset projected work items");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("failed to retry workflow synchronization")),
+            )
+                .into_response();
+        }
+    }
+    if retried == 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiError::new(
+                "workflow has no failed synchronization operations",
+            )),
+        )
+            .into_response();
+    }
+    if let Err(error) = requeue_failed_job(pool, coordinator_id).await {
+        tracing::error!(%error, "failed to requeue synchronization coordinator");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new(
+                "synchronization was reset but the coordinator could not be requeued",
+            )),
+        )
+            .into_response();
+    }
+    (StatusCode::ACCEPTED, Json(json!({"retried": retried}))).into_response()
 }
 
 async fn github_webhook(
@@ -3493,6 +3760,8 @@ struct WorkflowSummary {
     outcome: Option<String>,
     summary: Option<String>,
     pending_approval: Option<String>,
+    approvals: Vec<ApprovalSummary>,
+    external_sync: ExternalSyncSummary,
     tasks: Vec<WorkflowTaskSummary>,
     pull_request_number: Option<i64>,
     pull_request_url: Option<String>,
@@ -3500,6 +3769,95 @@ struct WorkflowSummary {
     no_pr_reason: Option<String>,
     updated_at: DateTime<Utc>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalSummary {
+    target_task: String,
+    target_work_item: Option<String>,
+    purpose: String,
+    trigger: String,
+    approval_subject: String,
+    result_summary: String,
+    changed_files: Vec<ApprovalFile>,
+    proposed_publication: Option<PublicationSummary>,
+    accepted_publication: Option<PublicationSummary>,
+    projected_issues: Vec<ApprovalIssue>,
+    downstream_tasks: Vec<String>,
+    state: String,
+    approve_command: Option<String>,
+    revise_command: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalFile {
+    path: String,
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalIssue {
+    number: i64,
+    work_item: String,
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicationSummary {
+    id: i64,
+    commit_sha: String,
+    commit_url: Option<String>,
+    compare_url: Option<String>,
+    zero_diff: bool,
+}
+
+impl From<&donkeyspace_db::AgentPublicationRecord> for PublicationSummary {
+    fn from(publication: &donkeyspace_db::AgentPublicationRecord) -> Self {
+        Self {
+            id: publication.id,
+            commit_sha: publication.commit_sha.clone(),
+            commit_url: publication.commit_url.clone(),
+            compare_url: publication.compare_url.clone(),
+            zero_diff: publication.zero_diff,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalSyncSummary {
+    status: String,
+    pending_operations: usize,
+    last_error: Option<String>,
+}
+
+fn approval_command(reason: &str, verb: &str) -> Option<String> {
+    reason.lines().find_map(|line| {
+        let command = line.trim().trim_matches('`');
+        (command.starts_with('/') && command.split_whitespace().nth(1) == Some(verb))
+            .then(|| command.to_string())
+    })
+}
+
+fn approval_files(
+    workflow: &donkeyspace_db::WorkflowOverviewRecord,
+    publication: &donkeyspace_db::AgentPublicationRecord,
+) -> Vec<ApprovalFile> {
+    publication
+        .changed_files
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|path| ApprovalFile {
+            path: path.into(),
+            url: file_url(
+                &workflow.owner,
+                &workflow.repository,
+                &publication.commit_sha,
+                path,
+            ),
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]

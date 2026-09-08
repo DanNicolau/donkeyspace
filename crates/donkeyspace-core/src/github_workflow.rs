@@ -154,7 +154,7 @@ fn workflow_label_text(state: WorkflowState) -> &'static str {
     match state {
         WorkflowState::NeedsInfo => "ai:needs-info",
         WorkflowState::Ready => "ai:ready",
-        WorkflowState::InProgress => "ai:in-progress",
+        WorkflowState::InProgress | WorkflowState::Publishing => "ai:in-progress",
         WorkflowState::PrOpen => "ai:pr-open",
         WorkflowState::NeedsHuman => "ai:needs-human",
         WorkflowState::Blocked => "ai:blocked",

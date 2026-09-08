@@ -53,6 +53,11 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
     sqlx::raw_sql(include_str!("../../../migrations/0001_init.sql"))
         .execute(&mut *transaction)
         .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0002_reviewable_checkpoints.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -284,7 +289,13 @@ pub struct AgentPublicationInput {
     pub kind: String,
     pub branch_name: String,
     pub commit_sha: String,
+    pub base_sha: Option<String>,
     pub html_url: String,
+    pub commit_url: Option<String>,
+    pub compare_url: Option<String>,
+    pub changed_files: Value,
+    pub task_scopes: Value,
+    pub zero_diff: bool,
     pub local_repo_path: String,
     pub task: Option<String>,
     pub work_item: Option<String>,
@@ -302,7 +313,13 @@ pub struct AgentPublicationRecord {
     pub kind: String,
     pub branch_name: String,
     pub commit_sha: String,
+    pub base_sha: Option<String>,
     pub html_url: String,
+    pub commit_url: Option<String>,
+    pub compare_url: Option<String>,
+    pub changed_files: Value,
+    pub task_scopes: Value,
+    pub zero_diff: bool,
     #[serde(skip_serializing)]
     pub local_repo_path: String,
     pub task: Option<String>,
@@ -311,9 +328,84 @@ pub struct AgentPublicationRecord {
     pub outcome: Option<String>,
     pub status: String,
     pub last_error: Option<String>,
+    pub retry_count: i32,
+    pub next_attempt_at: DateTime<Utc>,
     pub metadata: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectedWorkItemInput {
+    pub workflow_item_id: i64,
+    pub coordinator_job_id: Uuid,
+    pub work_item: String,
+    pub spec_path: String,
+    pub body_digest: String,
+    pub managed_dependencies: Value,
+    pub proposed_publication_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ProjectedWorkItemRecord {
+    pub id: i64,
+    pub workflow_item_id: i64,
+    pub coordinator_job_id: Uuid,
+    pub work_item: String,
+    pub issue_id: Option<String>,
+    pub issue_number: Option<i64>,
+    pub spec_path: String,
+    pub body_digest: String,
+    pub managed_dependencies: Value,
+    pub accepted_publication_id: Option<i64>,
+    pub proposed_publication_id: Option<i64>,
+    pub sync_status: String,
+    pub desired_revision: i64,
+    pub applied_revision: i64,
+    pub retry_count: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub accepted: bool,
+    pub proposed_removal: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ApprovalRequestRecord {
+    pub id: i64,
+    pub workflow_item_id: i64,
+    pub coordinator_job_id: Uuid,
+    pub target_task: String,
+    pub target_work_item: Option<String>,
+    pub purpose: String,
+    pub trigger: String,
+    pub approval_subject: String,
+    pub result_summary: String,
+    pub changed_files: Value,
+    pub proposed_publication_id: Option<i64>,
+    pub accepted_publication_id: Option<i64>,
+    pub projected_issues: Value,
+    pub downstream_tasks: Value,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalRequestInput {
+    pub workflow_item_id: i64,
+    pub coordinator_job_id: Uuid,
+    pub target_task: String,
+    pub target_work_item: Option<String>,
+    pub purpose: String,
+    pub trigger: String,
+    pub approval_subject: String,
+    pub result_summary: String,
+    pub changed_files: Value,
+    pub proposed_publication_id: Option<i64>,
+    pub projected_issues: Value,
+    pub downstream_tasks: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1048,6 +1140,33 @@ pub async fn create_retry_job(
     create_job_with_retry_of(pool, workflow_item_id, Some(retry_of_job_id), role, input).await
 }
 
+pub async fn supersede_job(pool: &PgPool, id: Uuid, reason: &str) -> Result<bool, DbError> {
+    Ok(sqlx::query(
+        r#"
+        UPDATE jobs SET status = 'superseded', lease_owner = NULL, lease_expires_at = NULL,
+            result = jsonb_build_object('outcome', 'superseded', 'summary', $2), updated_at = now()
+        WHERE id = $1 AND status IN ('waiting', 'queued')
+        "#,
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+pub async fn requeue_failed_job(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
+    Ok(sqlx::query(
+        "UPDATE jobs SET status = 'queued', result = NULL, updated_at = now() WHERE id = $1 AND status = 'failed'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
 async fn create_job_with_retry_of(
     pool: &PgPool,
     workflow_item_id: Option<i64>,
@@ -1337,21 +1456,18 @@ pub async fn upsert_agent_publication(
         r#"
         INSERT INTO agent_publications (
             coordinator_job_id, job_id, workflow_item_id, kind, branch_name,
-            commit_sha, html_url, local_repo_path, task, work_item, attempt, outcome, metadata
+            commit_sha, base_sha, html_url, commit_url, compare_url, changed_files,
+            task_scopes, zero_diff, local_repo_path, task, work_item, attempt, outcome, metadata
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        ON CONFLICT (coordinator_job_id, branch_name) DO UPDATE SET
-            job_id = EXCLUDED.job_id,
-            workflow_item_id = EXCLUDED.workflow_item_id,
-            commit_sha = EXCLUDED.commit_sha,
-            html_url = EXCLUDED.html_url,
-            local_repo_path = EXCLUDED.local_repo_path,
-            task = EXCLUDED.task,
-            work_item = EXCLUDED.work_item,
-            attempt = EXCLUDED.attempt,
-            outcome = EXCLUDED.outcome,
-            metadata = EXCLUDED.metadata,
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        ON CONFLICT (coordinator_job_id, branch_name, commit_sha) DO UPDATE SET
+            -- Publication provenance is immutable. A later idempotent call can
+            -- observe the same branch at the already-published SHA, producing a
+            -- zero-length comparison that must not replace the original base,
+            -- diff, files, scopes, or attribution.
             status = 'pending',
+            retry_count = 0,
+            next_attempt_at = now(),
             last_error = NULL,
             updated_at = now()
         RETURNING *
@@ -1363,7 +1479,13 @@ pub async fn upsert_agent_publication(
     .bind(&input.kind)
     .bind(&input.branch_name)
     .bind(&input.commit_sha)
+    .bind(&input.base_sha)
     .bind(&input.html_url)
+    .bind(&input.commit_url)
+    .bind(&input.compare_url)
+    .bind(&input.changed_files)
+    .bind(&input.task_scopes)
+    .bind(input.zero_diff)
     .bind(&input.local_repo_path)
     .bind(&input.task)
     .bind(&input.work_item)
@@ -1372,6 +1494,162 @@ pub async fn upsert_agent_publication(
     .bind(&input.metadata)
     .fetch_one(pool)
     .await?)
+}
+
+pub async fn upsert_projected_work_item(
+    pool: &PgPool,
+    input: &ProjectedWorkItemInput,
+) -> Result<ProjectedWorkItemRecord, DbError> {
+    Ok(sqlx::query_as::<_, ProjectedWorkItemRecord>(
+        r#"
+        INSERT INTO projected_work_items (
+            workflow_item_id, coordinator_job_id, work_item, spec_path, body_digest,
+            managed_dependencies, proposed_publication_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (coordinator_job_id, work_item) DO UPDATE SET
+            spec_path = EXCLUDED.spec_path,
+            body_digest = EXCLUDED.body_digest,
+            managed_dependencies = EXCLUDED.managed_dependencies,
+            proposed_publication_id = EXCLUDED.proposed_publication_id,
+            desired_revision = projected_work_items.desired_revision + 1,
+            sync_status = 'pending', next_attempt_at = now(), last_error = NULL,
+            proposed_removal = false, updated_at = now()
+        RETURNING *
+        "#,
+    )
+    .bind(input.workflow_item_id)
+    .bind(input.coordinator_job_id)
+    .bind(&input.work_item)
+    .bind(&input.spec_path)
+    .bind(&input.body_digest)
+    .bind(&input.managed_dependencies)
+    .bind(input.proposed_publication_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn mark_projected_work_item_applied(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+    work_item: &str,
+    issue_id: Option<&str>,
+    issue_number: i64,
+    accepted: bool,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"
+        UPDATE projected_work_items SET issue_id = COALESCE($3, issue_id), issue_number = $4,
+            applied_revision = desired_revision, sync_status = 'applied', accepted = accepted OR $5,
+            accepted_publication_id = CASE WHEN $5 THEN proposed_publication_id ELSE accepted_publication_id END,
+            retry_count = 0, last_error = NULL, updated_at = now()
+        WHERE coordinator_job_id = $1 AND work_item = $2
+        "#,
+    )
+    .bind(coordinator_job_id)
+    .bind(work_item)
+    .bind(issue_id)
+    .bind(issue_number)
+    .bind(accepted)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_projected_work_items_for_run(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+) -> Result<Vec<ProjectedWorkItemRecord>, DbError> {
+    Ok(sqlx::query_as::<_, ProjectedWorkItemRecord>(
+        "SELECT * FROM projected_work_items WHERE coordinator_job_id = $1 ORDER BY work_item",
+    )
+    .bind(coordinator_job_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn retry_projected_work_items(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+) -> Result<u64, DbError> {
+    Ok(sqlx::query(
+        r#"UPDATE projected_work_items SET sync_status = 'pending', retry_count = 0,
+               next_attempt_at = now(), last_error = NULL, updated_at = now()
+           WHERE coordinator_job_id = $1 AND sync_status <> 'applied'"#,
+    )
+    .bind(coordinator_job_id)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+pub async fn upsert_approval_request(
+    pool: &PgPool,
+    input: &ApprovalRequestInput,
+) -> Result<ApprovalRequestRecord, DbError> {
+    Ok(sqlx::query_as::<_, ApprovalRequestRecord>(
+        r#"
+        WITH superseded AS (
+            UPDATE approval_requests SET state = 'superseded', updated_at = now()
+            WHERE coordinator_job_id = $2 AND target_task = $3
+              AND target_work_item IS NOT DISTINCT FROM $4 AND state = 'pending'
+        )
+        INSERT INTO approval_requests (
+            workflow_item_id, coordinator_job_id, target_task, target_work_item, purpose,
+            trigger, approval_subject, result_summary, changed_files,
+            proposed_publication_id, projected_issues, downstream_tasks
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        RETURNING *
+        "#,
+    )
+    .bind(input.workflow_item_id)
+    .bind(input.coordinator_job_id)
+    .bind(&input.target_task)
+    .bind(&input.target_work_item)
+    .bind(&input.purpose)
+    .bind(&input.trigger)
+    .bind(&input.approval_subject)
+    .bind(&input.result_summary)
+    .bind(&input.changed_files)
+    .bind(input.proposed_publication_id)
+    .bind(&input.projected_issues)
+    .bind(&input.downstream_tasks)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn list_approval_requests_for_run(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+) -> Result<Vec<ApprovalRequestRecord>, DbError> {
+    Ok(sqlx::query_as::<_, ApprovalRequestRecord>(
+        "SELECT * FROM approval_requests WHERE coordinator_job_id = $1 ORDER BY created_at, id",
+    )
+    .bind(coordinator_job_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn transition_approval_request(
+    pool: &PgPool,
+    coordinator_job_id: Uuid,
+    target_task: &str,
+    target_work_item: Option<&str>,
+    state: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"UPDATE approval_requests SET state = $4,
+               accepted_publication_id = CASE WHEN $4 = 'approved' THEN proposed_publication_id ELSE accepted_publication_id END,
+               updated_at = now()
+           WHERE coordinator_job_id = $1 AND target_task = $2
+             AND target_work_item IS NOT DISTINCT FROM $3 AND state = 'pending'"#,
+    )
+    .bind(coordinator_job_id)
+    .bind(target_task)
+    .bind(target_work_item)
+    .bind(state)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_agent_publications_for_run(
@@ -1412,7 +1690,7 @@ pub async fn list_pending_agent_publications(
     Ok(sqlx::query_as::<_, AgentPublicationRecord>(
         r#"
         SELECT * FROM agent_publications
-        WHERE status = 'pending'
+        WHERE status = 'pending' AND next_attempt_at <= now()
         ORDER BY created_at ASC
         LIMIT $1
         "#,
@@ -1444,7 +1722,12 @@ pub async fn mark_agent_publication_failed(
     sqlx::query(
         r#"
         UPDATE agent_publications
-        SET status = 'failed', last_error = $2, updated_at = now()
+        SET status = CASE
+                WHEN retry_count >= 7 OR $2 ~* '(401|403|404|422|authentication|permission|forbidden)'
+                THEN 'failed' ELSE 'pending' END,
+            retry_count = retry_count + 1,
+            next_attempt_at = now() + make_interval(secs => LEAST(900, 30 * power(2, retry_count))::int),
+            last_error = $2, updated_at = now()
         WHERE id = $1
         "#,
     )
@@ -1459,7 +1742,8 @@ pub async fn retry_agent_publication(pool: &PgPool, id: i64) -> Result<bool, DbE
     Ok(sqlx::query(
         r#"
         UPDATE agent_publications
-        SET status = 'pending', last_error = NULL, updated_at = now()
+        SET status = 'pending', retry_count = 0, next_attempt_at = now(),
+            last_error = NULL, updated_at = now()
         WHERE id = $1 AND status = 'failed'
         "#,
     )
@@ -1479,6 +1763,9 @@ pub async fn unpublished_agent_publications_exist(
         SELECT EXISTS (
             SELECT 1 FROM agent_publications
             WHERE coordinator_job_id = $1 AND status <> 'published'
+            UNION ALL
+            SELECT 1 FROM projected_work_items
+            WHERE coordinator_job_id = $1 AND sync_status <> 'applied'
         )
         "#,
     )

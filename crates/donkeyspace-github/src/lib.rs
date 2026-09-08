@@ -625,12 +625,48 @@ pub struct GitHubWorkItem {
     pub body: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub proposed_commit: Option<String>,
+    #[serde(default)]
+    pub proposed_commit_url: Option<String>,
+    #[serde(default)]
+    pub proposed_compare_url: Option<String>,
+    #[serde(default)]
+    pub accepted_commit: Option<String>,
+    #[serde(default)]
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubProjectedIssue {
     pub id: i64,
     pub number: i64,
+}
+
+/// Provider-owned links for an immutable repository checkpoint.
+pub fn branch_url(owner: &str, repo: &str, branch: &str) -> String {
+    format!("https://github.com/{owner}/{repo}/tree/{branch}")
+}
+
+pub fn commit_url(owner: &str, repo: &str, sha: &str) -> String {
+    format!("https://github.com/{owner}/{repo}/commit/{sha}")
+}
+
+pub fn compare_url(owner: &str, repo: &str, base: &str, head: &str) -> Option<String> {
+    (base != head).then(|| format!("https://github.com/{owner}/{repo}/compare/{base}...{head}"))
+}
+
+pub fn file_url(owner: &str, repo: &str, sha: &str, path: &str) -> String {
+    let encoded = path
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect::<String>();
+    format!("https://github.com/{owner}/{repo}/blob/{sha}/{encoded}")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -838,6 +874,10 @@ impl GitHubClient {
     ) -> Result<BTreeMap<String, GitHubProjectedIssue>, GitHubClientError> {
         let mut projected = BTreeMap::<String, (i64, i64)>::new();
         for item in work_items {
+            if let Some(issue) = self.find_projected_work_item(owner, repo, &item.id).await? {
+                projected.insert(item.id.clone(), (issue.id, issue.number));
+                continue;
+            }
             let issue: Value = self
                 .client
                 .post(
@@ -886,6 +926,32 @@ impl GitHubClient {
             .into_iter()
             .map(|(key, (id, number))| (key, GitHubProjectedIssue { id, number }))
             .collect())
+    }
+
+    async fn find_projected_work_item(
+        &self,
+        owner: &str,
+        repo: &str,
+        work_item: &str,
+    ) -> Result<Option<GitHubProjectedIssue>, GitHubClientError> {
+        let issues: Value = self
+            .client
+            .get(
+                format!("/repos/{owner}/{repo}/issues?state=all&per_page=100"),
+                None::<&()>,
+            )
+            .await?;
+        let marker = format!("<!-- donkeyspace-work-item-id:{work_item} -->");
+        Ok(issues.as_array().into_iter().flatten().find_map(|issue| {
+            issue
+                .get("body")
+                .and_then(Value::as_str)
+                .filter(|body| body.contains(&marker))?;
+            Some(GitHubProjectedIssue {
+                id: issue.get("id")?.as_i64()?,
+                number: issue.get("number")?.as_i64()?,
+            })
+        }))
     }
 
     pub async fn update_projected_work_item(
@@ -1134,9 +1200,31 @@ fn github_error_status(error: &octocrab::Error) -> Option<u16> {
 }
 
 fn projected_work_item_body(parent_issue_number: i64, item: &GitHubWorkItem) -> String {
+    let mut checkpoint = if item.accepted {
+        String::from("Status: **Accepted**\n")
+    } else {
+        String::from("Status: **Proposed — awaiting approval**\n")
+    };
+    if let (Some(sha), Some(url)) = (&item.proposed_commit, &item.proposed_commit_url) {
+        checkpoint.push_str(&format!(
+            "\nProposed commit: [`{}`]({url})\n",
+            &sha[..sha.len().min(8)]
+        ));
+    }
+    if let Some(url) = &item.proposed_compare_url {
+        checkpoint.push_str(&format!("\n[Review the exact checkpoint diff]({url})\n"));
+    } else if item.proposed_commit.is_some() {
+        checkpoint.push_str("\nThis checkpoint has no file changes.\n");
+    }
+    if let Some(sha) = &item.accepted_commit {
+        checkpoint.push_str(&format!(
+            "\nLast accepted commit: `{}`\n",
+            &sha[..sha.len().min(8)]
+        ));
+    }
     format!(
-        "<!-- donkeyspace-work-item -->\n\nParent lifecycle issue: #{parent_issue_number}\n\nSpecification path: `{}`\n\n{}",
-        item.spec, item.body
+        "<!-- donkeyspace-work-item -->\n<!-- donkeyspace-work-item-id:{} -->\n\nParent lifecycle issue: #{parent_issue_number}\n\n{checkpoint}\nSpecification path: `{}`\n\n{}",
+        item.id, item.spec, item.body
     )
 }
 
@@ -1155,9 +1243,9 @@ fn workflow_label_color(label: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubWorkItem, SignatureError,
-        parse_app_webhook_status, parse_repository, projected_work_item_body,
-        select_installation_id, validate_installation_response,
+        GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubWorkItem, SignatureError, branch_url,
+        commit_url, compare_url, file_url, parse_app_webhook_status, parse_repository,
+        projected_work_item_body, select_installation_id, validate_installation_response,
         validate_members_permission_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
@@ -1213,6 +1301,11 @@ mod tests {
                 spec: "docs/divider/spec.md".into(),
                 body: "Specification version: 1.1.0\nSigned division.".into(),
                 depends_on: Vec::new(),
+                proposed_commit: None,
+                proposed_commit_url: None,
+                proposed_compare_url: None,
+                accepted_commit: None,
+                accepted: false,
             },
         );
 
@@ -1220,6 +1313,48 @@ mod tests {
         assert!(body.contains("Specification path: `docs/divider/spec.md`"));
         assert!(body.contains("Specification version: 1.1.0"));
         assert!(body.contains("Signed division."));
+    }
+
+    #[test]
+    fn checkpoint_links_are_immutable_and_zero_diff_has_no_compare_url() {
+        assert_eq!(
+            branch_url("acme", "widgets", "agent/issue-1"),
+            "https://github.com/acme/widgets/tree/agent/issue-1"
+        );
+        assert_eq!(
+            commit_url("acme", "widgets", "abc123"),
+            "https://github.com/acme/widgets/commit/abc123"
+        );
+        assert_eq!(compare_url("acme", "widgets", "abc", "abc"), None);
+        assert_eq!(
+            compare_url("acme", "widgets", "abc", "def").as_deref(),
+            Some("https://github.com/acme/widgets/compare/abc...def")
+        );
+        assert_eq!(
+            file_url("acme", "widgets", "abc123", "docs/design spec.md"),
+            "https://github.com/acme/widgets/blob/abc123/docs/design%20spec.md"
+        );
+    }
+
+    #[test]
+    fn projected_issue_distinguishes_proposed_and_accepted_checkpoints() {
+        let mut item = GitHubWorkItem {
+            id: "storage".into(),
+            spec: "docs/storage.md".into(),
+            body: "Storage specification".into(),
+            depends_on: Vec::new(),
+            proposed_commit: Some("0123456789abcdef".into()),
+            proposed_commit_url: Some("https://github.com/acme/repo/commit/0123".into()),
+            proposed_compare_url: Some("https://github.com/acme/repo/compare/a...b".into()),
+            accepted_commit: Some("fedcba9876543210".into()),
+            accepted: false,
+        };
+        let proposed = projected_work_item_body(7, &item);
+        assert!(proposed.contains("Proposed — awaiting approval"));
+        assert!(proposed.contains("Last accepted commit: `fedcba98`"));
+        item.accepted = true;
+        let accepted = projected_work_item_body(7, &item);
+        assert!(accepted.contains("Status: **Accepted**"));
     }
 
     #[test]

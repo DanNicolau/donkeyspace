@@ -464,10 +464,15 @@ push, apply labels, open pull requests, or edit outside the filtered workspace.
 When `project_github_issues: true`, donkeyspace creates one GitHub sub-issue per
 work item and projects registry dependencies as native blocked-by
 relationships. Generated issues are marked so their webhooks cannot recursively
-start another lifecycle, and each is closed when its block graph completes.
-This projection is for human visibility; donkeyspace's database remains
-authoritative for scheduling and retries. Projection failures are reported but
-do not block local task scheduling.
+start another lifecycle. A successful start-task run first publishes an
+immutable checkpoint, then renders each issue as **Proposed — awaiting
+approval**, with exact commit and diff links. Approval promotes that desired
+state to **Accepted** before dependent tasks are released. A repair updates the
+same issue identities; accepted removals remain open until the replacement
+proposal is approved, while never-accepted superseded issues may close
+immediately. Donkeyspace's durable projection records remain authoritative for
+scheduling, retries, managed dependency edges, and reconciliation. An approval
+command is not exposed while publication or GitHub projection is incomplete.
 
 ## MCP boundary and limitations
 

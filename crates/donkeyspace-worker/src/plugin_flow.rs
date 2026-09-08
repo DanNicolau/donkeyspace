@@ -5,8 +5,12 @@ use donkeyspace_core::{
     PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult, TestResult, TestStatus,
 };
 use donkeyspace_db::{
-    JobRecord, LifecycleEventInput, PgPool, complete_job, create_waiting_job, fail_job, get_job,
+    ApprovalRequestInput, JobRecord, LifecycleEventInput, PgPool, ProjectedWorkItemInput,
+    complete_job, create_waiting_job, fail_job, get_job, list_agent_publications_for_run,
+    list_projected_work_items_for_run, mark_projected_work_item_applied,
     record_github_managed_resource_for_workflow_item, record_lifecycle_event, start_waiting_job,
+    supersede_job, transition_approval_request, upsert_approval_request,
+    upsert_projected_work_item,
 };
 use donkeyspace_github::{GitHubClient, GitHubWorkItem};
 use futures::future::join_all;
@@ -260,7 +264,7 @@ async fn record_flow_event(
     Ok(())
 }
 
-const CHECKPOINT_VERSION: u32 = 3;
+const CHECKPOINT_VERSION: u32 = 4;
 const MAX_RESOURCE_FILES: usize = 1_024;
 const MAX_RESOURCE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -687,7 +691,7 @@ async fn run_work_item_lifecycle(
         if checkpoint_path.is_file() {
             let checkpoint: LifecycleCheckpoint =
                 serde_json::from_str(&fs::read_to_string(&checkpoint_path)?)?;
-            if !matches!(checkpoint.version, 1 | 2 | CHECKPOINT_VERSION) {
+            if !matches!(checkpoint.version, 1 | 2 | 3 | CHECKPOINT_VERSION) {
                 return Err(format!(
                     "unsupported lifecycle checkpoint version {}",
                     checkpoint.version
@@ -706,6 +710,7 @@ async fn run_work_item_lifecycle(
     };
 
     let mut rerun_start = false;
+    let mut accept_start_projection = false;
     if let Some(saved) = checkpoint.as_mut()
         && !saved.pending_approvals.is_empty()
     {
@@ -746,6 +751,7 @@ async fn run_work_item_lifecycle(
             match (&decision, approval.trigger, is_start) {
                 (HumanDecision::Approve { .. }, ApprovalTrigger::Required, true) => {
                     saved.start_approved = true;
+                    accept_start_projection = true;
                 }
                 (HumanDecision::Approve { .. }, ApprovalTrigger::Required, false) => {
                     if !saved.completed_keys.contains(&approval.key) {
@@ -771,6 +777,19 @@ async fn run_work_item_lifecycle(
                 "human_decision": issue_input.pointer("/donkeyspace_human_decision"),
                 "resume_target": approval.key,
             }));
+            if let Some(tracking) = &tracking {
+                transition_approval_request(
+                    tracking.pool,
+                    tracking.coordinator.id,
+                    &approval.key.task,
+                    approval.key.work_item.as_deref(),
+                    match &decision {
+                        HumanDecision::Approve { .. } => "approved",
+                        HumanDecision::Revise { .. } => "revised",
+                    },
+                )
+                .await?;
+            }
         }
         saved
             .pending_approvals
@@ -943,7 +962,8 @@ async fn run_work_item_lifecycle(
             && let Some(publication) = tracking
                 .as_ref()
                 .and_then(|tracking| tracking.publication.as_ref())
-            && let Err(error) = publish_checkpoint(
+        {
+            publish_checkpoint(
                 publication,
                 repo_path,
                 &checkpoint_commit_title(
@@ -961,9 +981,7 @@ async fn run_work_item_lifecycle(
                     )
                 }),
             )
-            .await
-        {
-            tracing::warn!(%error, task = flow.start, "plugin checkpoint publication failed");
+            .await?;
         }
         if planner.result.outcome != Outcome::Implemented {
             publish_task_attempt(
@@ -1004,7 +1022,7 @@ async fn run_work_item_lifecycle(
     let registry: PluginWorkItemRegistry =
         serde_json::from_str(&fs::read_to_string(repo_path.join(&registry_path))?)?;
     validate_work_items(&registry.work_items)?;
-    let work_items =
+    let mut work_items =
         select_lifecycle_work_items(&registry.work_items, requested_work_items.as_deref())?;
     if let Some(item) = work_items
         .iter()
@@ -1050,51 +1068,162 @@ async fn run_work_item_lifecycle(
     for target in &revision_targets {
         graph.restart_from(target)?;
     }
-    if checkpoint.is_none() || rerun_start {
-        if rerun_start
-            && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
-            && let (Some(owner), Some(repo), _) = github_coordinates
-        {
-            let active_ids = work_items
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<BTreeSet<_>>();
-            let removed = projected_issues
-                .iter()
-                .filter(|(id, _)| !active_ids.contains(id.as_str()))
-                .map(|(id, issue)| (id.clone(), *issue))
-                .collect::<Vec<_>>();
-            for (id, issue_number) in removed {
-                if let Err(error) = github.close_issue(owner, repo, issue_number).await {
-                    tracing::warn!(%error, issue_number, "failed to close removed projected issue");
-                }
-                projected_issues.remove(&id);
-            }
-        }
+    if checkpoint.is_none() || rerun_start || accept_start_projection {
+        // Existing projected issues are deliberately retained during a revision.
+        // A removed, previously accepted work item is only closed after the new
+        // architect proposal is approved; until then it remains the accepted view.
         if flow.project_github_issues
             && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
         {
+            if rerun_start && !accept_start_projection {
+                let active_ids = work_items
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                if let Some(tracking) = &tracking {
+                    for item in
+                        list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
+                            .await?
+                            .into_iter()
+                            .filter(|item| {
+                                !item.accepted && !active_ids.contains(item.work_item.as_str())
+                            })
+                    {
+                        if let Some(issue_number) = item.issue_number {
+                            github.close_issue(owner, repo, issue_number).await?;
+                        }
+                        projected_issues.remove(&item.work_item);
+                    }
+                }
+            }
+            if accept_start_projection {
+                let active_ids = work_items
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let removed = projected_issues
+                    .iter()
+                    .filter(|(id, _)| !active_ids.contains(id.as_str()))
+                    .map(|(id, number)| (id.clone(), *number))
+                    .collect::<Vec<_>>();
+                for (id, issue_number) in removed {
+                    github.close_issue(owner, repo, issue_number).await?;
+                    projected_issues.remove(&id);
+                    if let (Some(tracking), Some(checkpoint)) = (&tracking, &checkpoint) {
+                        for tracked in checkpoint
+                            .tracked_jobs
+                            .iter()
+                            .filter(|tracked| tracked.key.work_item.as_deref() == Some(id.as_str()))
+                        {
+                            supersede_job(
+                                tracking.pool,
+                                tracked.job_id,
+                                "The approved architect checkpoint removed this work item.",
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            let run_publications = if let Some(tracking) = &tracking {
+                list_agent_publications_for_run(
+                    tracking.pool,
+                    tracking.coordinator.id,
+                    Some(tracking.coordinator.id),
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
+            let projection_records = if let Some(tracking) = &tracking {
+                list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id).await?
+            } else {
+                Vec::new()
+            };
+            let proposed_publication = run_publications
+                .iter()
+                .filter(|publication| {
+                    publication.kind == "checkpoint" && publication.status == "published"
+                })
+                .max_by_key(|publication| publication.id);
             let github_work_items = work_items
                 .iter()
-                .map(|item| GitHubWorkItem {
-                    id: item.id.clone(),
-                    spec: item.spec.clone(),
-                    body: fs::read_to_string(repo_path.join(&item.spec))
-                        .unwrap_or_default()
-                        .chars()
-                        .take(50_000)
-                        .collect(),
-                    depends_on: item.depends_on.clone(),
+                .map(|item| {
+                    let accepted_commit = if accept_start_projection {
+                        proposed_publication.map(|publication| publication.commit_sha.clone())
+                    } else {
+                        projection_records
+                            .iter()
+                            .find(|record| record.work_item == item.id)
+                            .and_then(|record| record.accepted_publication_id)
+                            .and_then(|id| {
+                                run_publications
+                                    .iter()
+                                    .find(|publication| publication.id == id)
+                            })
+                            .map(|publication| publication.commit_sha.clone())
+                    };
+                    GitHubWorkItem {
+                        id: item.id.clone(),
+                        spec: item.spec.clone(),
+                        body: fs::read_to_string(repo_path.join(&item.spec))
+                            .unwrap_or_default()
+                            .chars()
+                            .take(50_000)
+                            .collect(),
+                        depends_on: item.depends_on.clone(),
+                        proposed_commit: proposed_publication
+                            .as_ref()
+                            .map(|publication| publication.commit_sha.clone()),
+                        proposed_commit_url: proposed_publication
+                            .as_ref()
+                            .and_then(|publication| publication.commit_url.clone()),
+                        proposed_compare_url: proposed_publication
+                            .as_ref()
+                            .and_then(|publication| publication.compare_url.clone()),
+                        accepted_commit,
+                        accepted: accept_start_projection,
+                    }
                 })
                 .collect::<Vec<_>>();
 
-            if rerun_start {
+            if let Some(workflow_item_id) = tracking
+                .as_ref()
+                .and_then(|tracking| tracking.coordinator.workflow_item_id)
+            {
+                for item in &github_work_items {
+                    let digest = format!("{:x}", Sha256::digest(item.body.as_bytes()));
+                    upsert_projected_work_item(
+                        tracking
+                            .as_ref()
+                            .expect("tracking exists when workflow id exists")
+                            .pool,
+                        &ProjectedWorkItemInput {
+                            workflow_item_id,
+                            coordinator_job_id: tracking
+                                .as_ref()
+                                .expect("tracking exists")
+                                .coordinator
+                                .id,
+                            work_item: item.id.clone(),
+                            spec_path: item.spec.clone(),
+                            body_digest: digest,
+                            managed_dependencies: json!(item.depends_on),
+                            proposed_publication_id: proposed_publication
+                                .map(|publication| publication.id),
+                        },
+                    )
+                    .await?;
+                }
+            }
+
+            if rerun_start || accept_start_projection {
                 for item in &github_work_items {
                     let Some(issue_number) = projected_issues.get(&item.id) else {
                         continue;
                     };
-                    if let Err(error) = github
+                    github
                         .update_projected_work_item(
                             owner,
                             repo,
@@ -1102,14 +1231,17 @@ async fn run_work_item_lifecycle(
                             *issue_number,
                             item,
                         )
-                        .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            issue_number,
-                            work_item = item.id,
-                            "failed to update revised projected issue"
-                        );
+                        .await?;
+                    if let Some(tracking) = &tracking {
+                        mark_projected_work_item_applied(
+                            tracking.pool,
+                            tracking.coordinator.id,
+                            &item.id,
+                            None,
+                            *issue_number,
+                            accept_start_projection,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1118,33 +1250,41 @@ async fn run_work_item_lifecycle(
                 .into_iter()
                 .filter(|item| !projected_issues.contains_key(&item.id))
                 .collect::<Vec<_>>();
-            match github
+            let issues = github
                 .project_work_items(owner, repo, parent_issue_number, &github_work_items)
-                .await
+                .await?;
+            if let Some(tracking) = &tracking
+                && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
             {
-                Ok(issues) => {
-                    if let Some(tracking) = &tracking
-                        && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
-                    {
-                        for (work_item, issue) in &issues {
-                            record_github_managed_resource_for_workflow_item(
-                                tracking.pool,
-                                workflow_item_id,
-                                "issue",
-                                &issue.id.to_string(),
-                                &json!({"work_item": work_item, "issue_number": issue.number}),
-                            )
-                            .await?;
-                        }
-                    }
-                    projected_issues.extend(
-                        issues
-                            .into_iter()
-                            .map(|(work_item, issue)| (work_item, issue.number)),
-                    );
+                for (work_item, issue) in &issues {
+                    record_github_managed_resource_for_workflow_item(
+                        tracking.pool,
+                        workflow_item_id,
+                        "issue",
+                        &issue.id.to_string(),
+                        &json!({"work_item": work_item, "issue_number": issue.number}),
+                    )
+                    .await?;
                 }
-                Err(error) => tracing::warn!(%error, "github work-item projection failed"),
             }
+            if let Some(tracking) = &tracking {
+                for (work_item, issue) in &issues {
+                    mark_projected_work_item_applied(
+                        tracking.pool,
+                        tracking.coordinator.id,
+                        work_item,
+                        Some(&issue.id.to_string()),
+                        issue.number,
+                        accept_start_projection,
+                    )
+                    .await?;
+                }
+            }
+            projected_issues.extend(
+                issues
+                    .into_iter()
+                    .map(|(work_item, issue)| (work_item, issue.number)),
+            );
         }
     }
 
@@ -1166,6 +1306,14 @@ async fn run_work_item_lifecycle(
             flow,
             "The lifecycle start task completed successfully and requires approval before downstream work begins.",
         );
+        persist_pending_approvals(
+            tracking.as_ref(),
+            &pending,
+            &projected_issues,
+            flow,
+            &result,
+        )
+        .await?;
         write_lifecycle_checkpoint(
             &checkpoint_path,
             &LifecycleCheckpoint {
@@ -1448,9 +1596,169 @@ async fn run_work_item_lifecycle(
                     publication.issue_number
                 )
             });
-            if let Err(error) = publish_checkpoint(publication, repo_path, &commit_title).await {
-                tracing::warn!(%error, "plugin task-wave checkpoint publication failed");
+            publish_checkpoint(publication, repo_path, &commit_title).await?;
+        }
+        if let Some((_, architect)) = successful_executions.iter().find(|(key, execution)| {
+            key.task == flow.start && execution.result.outcome == Outcome::Implemented
+        }) {
+            let revised_registry: PluginWorkItemRegistry =
+                serde_json::from_str(&fs::read_to_string(repo_path.join(&registry_path))?)?;
+            validate_work_items(&revised_registry.work_items)?;
+            let revised_work_items = select_lifecycle_work_items(
+                &revised_registry.work_items,
+                architect.work_items.as_deref(),
+            )?;
+            if let Some(item) = revised_work_items
+                .iter()
+                .find(|item| !repo_path.join(&item.spec).is_file())
+            {
+                return Err(format!(
+                    "architect work item `{}` references missing specification `{}`",
+                    item.id, item.spec
+                )
+                .into());
             }
+            if flow.project_github_issues
+                && let Some(tracking) = &tracking
+                && let Some(github) = tracking.github
+                && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
+                && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
+            {
+                let publications = list_agent_publications_for_run(
+                    tracking.pool,
+                    tracking.coordinator.id,
+                    Some(tracking.coordinator.id),
+                )
+                .await?;
+                let proposed = publications
+                    .iter()
+                    .filter(|publication| {
+                        publication.kind == "checkpoint" && publication.status == "published"
+                    })
+                    .max_by_key(|publication| publication.id)
+                    .ok_or("architect repair has no published checkpoint")?;
+                let records =
+                    list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
+                        .await?;
+                let active_ids = revised_work_items
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                for removed in records.iter().filter(|record| {
+                    !record.accepted && !active_ids.contains(record.work_item.as_str())
+                }) {
+                    if let Some(issue_number) = removed.issue_number {
+                        github.close_issue(owner, repo, issue_number).await?;
+                    }
+                    projected_issues.remove(&removed.work_item);
+                }
+                let desired = revised_work_items
+                    .iter()
+                    .map(|item| {
+                        let accepted_commit = records
+                            .iter()
+                            .find(|record| record.work_item == item.id)
+                            .and_then(|record| record.accepted_publication_id)
+                            .and_then(|id| {
+                                publications.iter().find(|publication| publication.id == id)
+                            })
+                            .map(|publication| publication.commit_sha.clone());
+                        GitHubWorkItem {
+                            id: item.id.clone(),
+                            spec: item.spec.clone(),
+                            body: fs::read_to_string(repo_path.join(&item.spec))
+                                .unwrap_or_default()
+                                .chars()
+                                .take(50_000)
+                                .collect(),
+                            depends_on: item.depends_on.clone(),
+                            proposed_commit: Some(proposed.commit_sha.clone()),
+                            proposed_commit_url: proposed.commit_url.clone(),
+                            proposed_compare_url: proposed.compare_url.clone(),
+                            accepted_commit,
+                            accepted: false,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for item in &desired {
+                    upsert_projected_work_item(
+                        tracking.pool,
+                        &ProjectedWorkItemInput {
+                            workflow_item_id,
+                            coordinator_job_id: tracking.coordinator.id,
+                            work_item: item.id.clone(),
+                            spec_path: item.spec.clone(),
+                            body_digest: format!("{:x}", Sha256::digest(item.body.as_bytes())),
+                            managed_dependencies: json!(item.depends_on),
+                            proposed_publication_id: Some(proposed.id),
+                        },
+                    )
+                    .await?;
+                    if let Some(issue_number) = projected_issues.get(&item.id) {
+                        github
+                            .update_projected_work_item(
+                                owner,
+                                repo,
+                                parent_issue_number,
+                                *issue_number,
+                                item,
+                            )
+                            .await?;
+                        mark_projected_work_item_applied(
+                            tracking.pool,
+                            tracking.coordinator.id,
+                            &item.id,
+                            None,
+                            *issue_number,
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+                let new_items = desired
+                    .iter()
+                    .filter(|item| !projected_issues.contains_key(&item.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let issues = github
+                    .project_work_items(owner, repo, parent_issue_number, &new_items)
+                    .await?;
+                for (work_item, issue) in &issues {
+                    record_github_managed_resource_for_workflow_item(
+                        tracking.pool,
+                        workflow_item_id,
+                        "issue",
+                        &issue.id.to_string(),
+                        &json!({"work_item": work_item, "issue_number": issue.number}),
+                    )
+                    .await?;
+                    mark_projected_work_item_applied(
+                        tracking.pool,
+                        tracking.coordinator.id,
+                        work_item,
+                        Some(&issue.id.to_string()),
+                        issue.number,
+                        false,
+                    )
+                    .await?;
+                }
+                projected_issues.extend(
+                    issues
+                        .into_iter()
+                        .map(|(work_item, issue)| (work_item, issue.number)),
+                );
+            }
+            let completed = graph.completed_keys().cloned().collect::<Vec<_>>();
+            let mut revised_graph = TaskGraph::for_work_items(flow, &revised_work_items);
+            let valid = revised_graph.keys().cloned().collect::<BTreeSet<_>>();
+            revised_graph.restore_completed(
+                &completed
+                    .into_iter()
+                    .filter(|key| valid.contains(key))
+                    .collect::<Vec<_>>(),
+            )?;
+            graph = revised_graph;
+            work_items = revised_work_items;
         }
         for (key, execution) in &successful_executions {
             let work_item = key
@@ -1677,6 +1985,14 @@ async fn run_work_item_lifecycle(
                             flow,
                             &lead,
                         );
+                        persist_pending_approvals(
+                            tracking.as_ref(),
+                            &required_approvals,
+                            &projected_issues,
+                            flow,
+                            &result,
+                        )
+                        .await?;
                         write_lifecycle_checkpoint(
                             &checkpoint_path,
                             &LifecycleCheckpoint {
@@ -1768,6 +2084,14 @@ async fn run_work_item_lifecycle(
                         flow,
                         &lead,
                     );
+                    persist_pending_approvals(
+                        tracking.as_ref(),
+                        &required_approvals,
+                        &projected_issues,
+                        flow,
+                        &result,
+                    )
+                    .await?;
                     write_lifecycle_checkpoint(
                         &checkpoint_path,
                         &LifecycleCheckpoint {
@@ -1872,6 +2196,14 @@ async fn run_work_item_lifecycle(
                 flow,
                 "The configured tasks completed successfully and require approval before their dependents can run.",
             );
+            persist_pending_approvals(
+                tracking.as_ref(),
+                &required_approvals,
+                &projected_issues,
+                flow,
+                &result,
+            )
+            .await?;
             write_lifecycle_checkpoint(
                 &checkpoint_path,
                 &LifecycleCheckpoint {
@@ -2045,6 +2377,74 @@ fn select_pending_approvals(
         return Ok(pending.to_vec());
     }
     Err("an approval target is required when multiple tasks are pending".into())
+}
+
+async fn persist_pending_approvals(
+    tracking: Option<&LifecycleTracking<'_>>,
+    pending: &[PendingApproval],
+    projected_issues: &BTreeMap<String, i64>,
+    flow: &PluginFlow,
+    result: &RunResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(tracking) = tracking else {
+        return Ok(());
+    };
+    let Some(workflow_item_id) = tracking.coordinator.workflow_item_id else {
+        return Ok(());
+    };
+    let publication = list_agent_publications_for_run(
+        tracking.pool,
+        tracking.coordinator.id,
+        Some(tracking.coordinator.id),
+    )
+    .await?
+    .into_iter()
+    .filter(|publication| publication.kind == "checkpoint" && publication.status == "published")
+    .max_by_key(|publication| publication.id);
+    let projected = projected_issues
+        .iter()
+        .map(|(work_item, number)| json!({"work_item": work_item, "number": number}))
+        .collect::<Vec<_>>();
+    for approval in pending {
+        let task = &flow.tasks[&approval.key.task];
+        let downstream = flow
+            .tasks
+            .iter()
+            .filter(|(_, candidate)| candidate.dependencies.contains(&approval.key.task))
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        upsert_approval_request(
+            tracking.pool,
+            &ApprovalRequestInput {
+                workflow_item_id,
+                coordinator_job_id: tracking.coordinator.id,
+                target_task: approval.key.task.clone(),
+                target_work_item: approval.key.work_item.clone(),
+                purpose: "accept_result".into(),
+                trigger: match approval.trigger {
+                    ApprovalTrigger::Required => "required",
+                    ApprovalTrigger::AgentRequested => "agent_requested",
+                }
+                .into(),
+                approval_subject: task.approval_subject.clone().unwrap_or_else(|| {
+                    approval.key.work_item.as_ref().map_or_else(
+                        || format!("{} result", approval.key.task),
+                        |work_item| format!("{} result for {work_item}", approval.key.task),
+                    )
+                }),
+                result_summary: result.summary.clone(),
+                changed_files: publication.as_ref().map_or_else(
+                    || json!([]),
+                    |publication| publication.changed_files.clone(),
+                ),
+                proposed_publication_id: publication.as_ref().map(|publication| publication.id),
+                projected_issues: json!(projected),
+                downstream_tasks: json!(downstream),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn pending_approval_result(
