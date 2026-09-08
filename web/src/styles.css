@@ -672,6 +672,30 @@ a {
   white-space: pre-wrap;
 }
 
+.approval-card,
+.sync-failure {
+  background: #fffaf0;
+  border: 1px solid #dfc27d;
+  border-radius: 7px;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.approval-card > div:first-child,
+.approval-links,
+.approval-commands {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.approval-card > div:first-child span { color: #68736a; }
+.approval-card p, .sync-failure p { margin: 0; }
+.approval-card ul { margin-bottom: 0; }
+.approval-commands code { background: #f1ead8; border-radius: 4px; padding: 5px 7px; }
+.sync-failure { background: #fff5f5; border-color: #d9a2a2; }
+
 .workflow-result {
   border-top: 1px solid #edf0e8;
   color: #59655d;
