@@ -37,6 +37,7 @@ flows:
         dependencies: [rtl, dv_prepare]
         read: [docs/design, rtl, "dv/{work_item}"]
         write: ["dv/{work_item}"]
+        allowed_handoffs: [architect]
       synthesis:
         role: syn
         scope: work_item
