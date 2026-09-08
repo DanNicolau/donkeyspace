@@ -359,6 +359,12 @@ pub async fn run(
         .flows
         .get(&selection.flow)
         .ok_or_else(|| format!("plugin `{}` has no flow `{}`", manifest.id, selection.flow))?;
+    let enriched_input = crate::plugin_input::with_issue_comments(
+        issue_input,
+        tracking.as_ref().and_then(|tracking| tracking.github),
+    )
+    .await?;
+    let issue_input = &enriched_input;
     if flow.replaces_default_lifecycle {
         return run_work_item_lifecycle(
             selection,

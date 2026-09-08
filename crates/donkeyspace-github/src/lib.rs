@@ -750,6 +750,23 @@ impl GitHubClient {
         Ok(comment.id.to_string())
     }
 
+    /// Read the full conversation, including comments beyond the first page.
+    pub async fn issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<Vec<Value>, GitHubClientError> {
+        let route = format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100");
+        let mut page: octocrab::Page<Value> = self.client.get(route, None::<&()>).await?;
+        let mut comments = page.take_items();
+        while let Some(mut next_page) = self.client.get_page(&page.next).await? {
+            comments.append(&mut next_page.take_items());
+            page = next_page;
+        }
+        Ok(comments)
+    }
+
     pub async fn upsert_issue_comment(
         &self,
         owner: &str,
@@ -1612,6 +1629,62 @@ mod tests {
         assert_eq!(provider.token().await.unwrap(), "installation-token-1");
         assert_eq!(provider.token().await.unwrap(), "installation-token-2");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn issue_comments_include_all_pages_and_propagate_fetch_failures() {
+        for fail_second_page in [false, true] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let request_count = Arc::clone(&requests);
+            let service = service_fn(move |request: http::Request<octocrab::OctoBody>| {
+                let index = request_count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(request.method(), http::Method::GET);
+                    assert_eq!(
+                        request.uri().path(),
+                        "/repos/example/project/issues/1/comments"
+                    );
+                    let response = if index == 0 {
+                        assert_eq!(request.uri().query(), Some("per_page=100"));
+                        http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::LINK, "<https://api.github.com/repos/example/project/issues/1/comments?per_page=100&page=2>; rel=\"next\"")
+                            .body(Full::new(bytes::Bytes::from_static(br#"[{"id":1,"body":"First answer"}]"#)))
+                    } else {
+                        assert_eq!(request.uri().query(), Some("per_page=100&page=2"));
+                        http::Response::builder()
+                            .status(if fail_second_page {
+                                http::StatusCode::FORBIDDEN
+                            } else {
+                                http::StatusCode::OK
+                            })
+                            .body(Full::new(bytes::Bytes::from_static(if fail_second_page {
+                                br#"{"message":"Forbidden"}"#
+                            } else {
+                                br#"[{"id":2,"body":"Second answer"}]"#
+                            })))
+                    };
+                    Ok::<_, Infallible>(response.unwrap())
+                }
+            });
+            let client = GitHubClient {
+                client: OctocrabBuilder::new_empty()
+                    .with_service(service)
+                    .with_auth(AuthState::None)
+                    .build()
+                    .unwrap(),
+            };
+            let result = client.issue_comments("example", "project", 1).await;
+            if fail_second_page {
+                assert!(result.is_err());
+            } else {
+                let comments = result.unwrap();
+                assert_eq!(comments.len(), 2);
+                assert_eq!(comments[0]["body"], "First answer");
+                assert_eq!(comments[1]["body"], "Second answer");
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[tokio::test]

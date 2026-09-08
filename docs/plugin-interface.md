@@ -48,6 +48,22 @@ The environment map is `container variable: worker variable`. A value is
 injected only when the selected role allowlists that variable. Secret values
 are not written into run input.
 
+## Issue conversation input
+
+Both serial stages and lifecycle tasks receive the issue conversation in
+`.donkeyspace/run-input.json` at `issue.comments`. This is an array of comment
+objects with `id`, `body`, `user.login`, `user.type`, `author_association`,
+`created_at`, `updated_at`, and `html_url` (unavailable metadata is null).
+The numeric GitHub comment count is retained separately as `issue.comment_count`.
+
+For connected GitHub runs, the worker fetches every page of comments once per
+plugin invocation, including resumed workflows, and merges the triggering
+comment by ID without overwriting a newer edit. Every stage/task in that
+invocation receives the same snapshot. A fetch failure stops execution instead
+of silently omitting clarification. Offline runs retain supplied comment arrays
+and the triggering comment. Reading conversation context does not authorize
+new work or change generated-comment and duplicate-trigger suppression.
+
 ## Roles and tasks
 
 Roles are agent identities and runtime definitions. Tasks are graph nodes

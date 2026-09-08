@@ -35,6 +35,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod llm_triage;
 mod plugin_flow;
+mod plugin_input;
 mod plugin_task_graph;
 mod publication;
 mod repo_context;
