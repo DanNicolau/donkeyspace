@@ -163,6 +163,57 @@ pub async fn lock_outbound_side_effect(
     Ok(Some(tx))
 }
 
+/// Apply PR-driven state and label changes under the same lock as closure and
+/// reopen. Return the admitted generation for any subsequently created job.
+/// A caller's earlier PR/workflow snapshot is never sufficient authorization.
+pub async fn apply_pull_request_effects(
+    pool: &PgPool,
+    workflow: i64,
+    provider_pr_id: &str,
+    state: Option<&str>,
+    actions: &[(String, serde_json::Value)],
+) -> Result<Option<i64>, DbError> {
+    let mut tx = pool.begin().await?;
+    let current: Workflow =
+        sqlx::query_as("SELECT * FROM workflow_items WHERE id=$1 FOR NO KEY UPDATE")
+            .bind(workflow)
+            .fetch_one(&mut *tx)
+            .await?;
+    // Read after acquiring the workflow lock, including when admission waited
+    // for an in-flight close/reopen transaction.
+    let pr_generation: Option<i64> = sqlx::query_scalar(
+        "SELECT generation FROM pull_requests WHERE workflow_item_id=$1 AND provider_pr_id=$2",
+    )
+    .bind(workflow)
+    .bind(provider_pr_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if current.provider_state == "closed" || pr_generation != Some(current.generation) {
+        return Ok(None);
+    }
+    if let Some(state) = state
+        && current.current_state.as_deref() != Some(state)
+    {
+        let reason = format!("managed pull request transitioned workflow to {state}");
+        sqlx::query("UPDATE workflow_items SET current_state=$2,updated_at=now() WHERE id=$1")
+            .bind(workflow)
+            .bind(state)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO state_transitions (workflow_item_id,from_state,to_state,reason) VALUES ($1,$2,$3,$4)")
+            .bind(workflow).bind(current.current_state).bind(state).bind(&reason)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO lifecycle_events (workflow_item_id,event_type,level,source,status,summary,reason) VALUES ($1,'workflow_transition','milestone','system',$2,$3,$3)")
+            .bind(workflow).bind(state).bind(&reason).execute(&mut *tx).await?;
+    }
+    for (action_type, payload) in actions {
+        sqlx::query("INSERT INTO outbound_actions (workflow_item_id,provider,action_type,payload) VALUES ($1,'github',$2,$3)")
+            .bind(workflow).bind(action_type).bind(payload).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(Some(current.generation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +223,145 @@ mod tests {
         get_job, mark_job_running, resume_latest_paused_job, upsert_repository,
     };
     use chrono::Duration;
+
+    #[tokio::test]
+    #[ignore = "requires isolated DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL"]
+    async fn pr_effects_and_followup_jobs_cannot_cross_reopen() {
+        let url = std::env::var("DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL").unwrap();
+        assert!(url.ends_with("/donkeyspace_cancellation_test"));
+        let pool = connect(&DbConfig::from_database_url(url)).await.unwrap();
+        apply_migrations(&pool).await.unwrap();
+        let repository = upsert_repository(
+            &pool,
+            &RepositoryInput {
+                installation_external_id: None,
+                installation_account_login: None,
+                provider: "github".into(),
+                owner: format!("pr-race-{}", Uuid::now_v7()),
+                name: "umbrella".into(),
+                default_branch: "main".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut issue = WorkflowItemInput {
+            repository_id: repository,
+            provider_issue_id: "1".into(),
+            issue_number: 1,
+            provider_state: "open".into(),
+            current_state: None,
+            current_labels: vec![],
+        };
+        let observe = |issue: WorkflowItemInput| {
+            let pool = pool.clone();
+            async move {
+                observe_issue(
+                    &pool,
+                    &IssueObservation {
+                        issue: &issue,
+                        updated_at: None,
+                        close_reason: None,
+                        owner: "test",
+                        repo: "umbrella",
+                        state_labels: vec!["ai:pr-open".into()],
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+        let workflow = observe(issue.clone()).await;
+        let mut pr = crate::PullRequestInput {
+            repository_id: repository,
+            workflow_item_id: Some(workflow),
+            provider_pr_id: "old".into(),
+            pr_number: 2,
+            title: "test".into(),
+            html_url: "https://example.invalid".into(),
+            state: "open".into(),
+            head_ref: "test".into(),
+            head_sha: None,
+            base_ref: "main".into(),
+            base_sha: None,
+            managed_by_donkeyspace: true,
+        };
+        crate::upsert_pull_request(&pool, &pr).await.unwrap();
+        let actions = vec![("issue.add_label".into(), json!({"label":"ai:pr-open"}))];
+        let admitted =
+            apply_pull_request_effects(&pool, workflow, "old", Some("pr_open"), &actions)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(admitted, 1);
+        // This is the old API's successful precheck. Pause that request here,
+        // then close/reopen before it can write state, history, labels or a job.
+        assert!(
+            pull_request_is_current(&pool, workflow, "old")
+                .await
+                .unwrap()
+        );
+        issue.provider_state = "closed".into();
+        observe(issue.clone()).await;
+        assert!(
+            apply_pull_request_effects(&pool, workflow, "old", Some("pr_open"), &actions)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        issue.provider_state = "open".into();
+        observe(issue.clone()).await;
+        let counts_before: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM state_transitions WHERE workflow_item_id=$1),(SELECT count(*) FROM outbound_actions WHERE workflow_item_id=$1)")
+            .bind(workflow).fetch_one(&pool).await.unwrap();
+        assert!(
+            apply_pull_request_effects(&pool, workflow, "old", Some("pr_open"), &actions)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let counts_after: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM state_transitions WHERE workflow_item_id=$1),(SELECT count(*) FROM outbound_actions WHERE workflow_item_id=$1)")
+            .bind(workflow).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            counts_after, counts_before,
+            "old event emitted history or labels"
+        );
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT current_state FROM workflow_items WHERE id=$1")
+                .bind(workflow)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(state.is_none(), "old PR restored pr_open after reopen");
+        let late_reviewer = create_job(
+            &pool,
+            Some(workflow),
+            "reviewer",
+            &json!({"donkeyspace_workflow_generation":admitted}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(late_reviewer.status, "cancelled");
+        // A newly admitted PR still works and stamps its actions with generation 2.
+        pr.provider_pr_id = "new".into();
+        pr.pr_number = 3;
+        crate::upsert_pull_request(&pool, &pr).await.unwrap();
+        assert_eq!(
+            apply_pull_request_effects(&pool, workflow, "new", Some("pr_open"), &actions)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        let action: (String, i64) = sqlx::query_as("SELECT status,generation FROM outbound_actions WHERE workflow_item_id=$1 ORDER BY id DESC LIMIT 1")
+            .bind(workflow).fetch_one(&pool).await.unwrap();
+        assert_eq!(action, ("pending".into(), 2));
+        let state: String =
+            sqlx::query_scalar("SELECT current_state FROM workflow_items WHERE id=$1")
+                .bind(workflow)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "pr_open");
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL"]

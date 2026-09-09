@@ -12,10 +12,9 @@ use donkeyspace_core::{
     Policy, WorkflowState, normalize_workflow_labels,
 };
 use donkeyspace_db::{
-    DbConfig, EngagementDecisionInput, JobRecord, LifecycleEventInput, OutboundActionInput, PgPool,
-    PullRequestInput, RepositoryInput, WorkflowItemInput, acquire_job_lease,
-    active_job_exists_for_workflow_item, apply_migrations, connect, create_job,
-    create_outbound_action, create_retry_job, get_job, get_workflow_by_issue,
+    DbConfig, EngagementDecisionInput, JobRecord, LifecycleEventInput, PgPool, PullRequestInput,
+    RepositoryInput, WorkflowItemInput, acquire_job_lease, active_job_exists_for_workflow_item,
+    apply_migrations, connect, create_job, create_retry_job, get_job, get_workflow_by_issue,
     get_workflow_item_by_issue_number, get_workflow_item_state, github_ingress_delivery_stats,
     github_managed_resource_exists, latest_workflow_job_input, list_agent_publications_for_run,
     list_approval_requests_for_run, list_job_command_results, list_job_outbound_actions,
@@ -26,8 +25,8 @@ use donkeyspace_db::{
     pending_outbound_comment_exists, record_engagement_decision, record_lifecycle_event,
     record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
     requeue_failed_job, resume_latest_paused_job, retry_agent_publication,
-    retry_projected_work_items, reviewer_job_exists_for_pr_head, update_workflow_item_state,
-    upsert_pull_request, upsert_repository, webhook_delivery_exists,
+    retry_projected_work_items, reviewer_job_exists_for_pr_head, upsert_pull_request,
+    upsert_repository, webhook_delivery_exists,
 };
 use donkeyspace_github::{
     GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider, file_url,
@@ -2890,50 +2889,40 @@ async fn persist_pull_request_webhook(
         );
         return Ok(WebhookPersistOutcome::Ignored);
     };
-    if !donkeyspace_db::cancellation::pull_request_is_current(
-        pool,
-        workflow_item.id,
-        &payload.pull_request.id.to_string(),
-    )
-    .await?
-    {
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
     let linked_issue_number = linked_issue_number
         .expect("a matched pull request workflow item has a linked issue number");
-
-    if managed {
-        let workflow_state = match pull_request_state {
+    let workflow_state = if managed {
+        match pull_request_state {
             "open" => Some(WorkflowState::PrOpen.as_str()),
             "merged" => Some("pr_merged"),
             "closed" => Some("pr_closed"),
             _ => None,
-        };
-        if let Some(workflow_state) = workflow_state
-            && workflow_item.current_state.as_deref() != Some(workflow_state)
-        {
-            update_workflow_item_state(pool, workflow_item.id, workflow_state).await?;
-            record_state_transition(
-                pool,
-                workflow_item.id,
-                None,
-                workflow_item.current_state.as_deref(),
-                workflow_state,
-                &format!("managed pull request is {pull_request_state}"),
-            )
-            .await?;
         }
-        queue_pull_request_label_reconciliation(
-            pool,
+    } else {
+        None
+    };
+    let actions = if managed {
+        pull_request_label_actions(
             policy,
-            workflow_item.id,
             &payload.repository.owner.login,
             &payload.repository.name,
             linked_issue_number,
             pull_request_state,
         )
-        .await?;
-    }
+    } else {
+        Vec::new()
+    };
+    let Some(generation) = donkeyspace_db::cancellation::apply_pull_request_effects(
+        pool,
+        workflow_item.id,
+        &payload.pull_request.id.to_string(),
+        workflow_state,
+        &actions,
+    )
+    .await?
+    else {
+        return Ok(WebhookPersistOutcome::Ignored);
+    };
 
     if policy.lifecycle.plugin.is_some()
         || !should_queue_reviewer(
@@ -2976,6 +2965,9 @@ async fn persist_pull_request_webhook(
         );
         return Ok(WebhookPersistOutcome::Ignored);
     };
+    // Closure/reopen may occur after PR effects commit. Preserve admission's
+    // generation even if the reusable input now belongs to a newer workflow.
+    job_input["donkeyspace_workflow_generation"] = json!(generation);
     attach_pull_request_input(&mut job_input, payload_value["pull_request"].clone());
 
     let job = create_job(
@@ -3685,16 +3677,13 @@ fn normalized_pull_request_state(state: &str, merged: bool) -> &str {
     if merged { "merged" } else { state }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn queue_pull_request_label_reconciliation(
-    pool: &PgPool,
+fn pull_request_label_actions(
     policy: &Policy,
-    workflow_item_id: i64,
     owner: &str,
     repo: &str,
     issue_number: i64,
     pull_request_state: &str,
-) -> Result<(), donkeyspace_db::DbError> {
+) -> Vec<(String, Value)> {
     let target_label = (pull_request_state == "open")
         .then(|| {
             policy
@@ -3711,46 +3700,26 @@ async fn queue_pull_request_label_reconciliation(
         .cloned()
         .collect::<Vec<_>>();
 
+    let mut actions = Vec::new();
     if !stale_labels.is_empty() {
-        create_outbound_action(
-            pool,
-            &OutboundActionInput {
-                workflow_item_id,
-                job_id: None,
-                provider: "github".into(),
-                action_type: "issue.remove_labels".into(),
-                payload: json!({
-                    "owner": owner,
-                    "repo": repo,
-                    "issue_number": issue_number,
-                    "labels": stale_labels,
-                }),
-            },
-        )
-        .await?;
+        actions.push((
+            "issue.remove_labels".into(),
+            json!({
+                "owner": owner, "repo": repo, "issue_number": issue_number,
+                "labels": stale_labels,
+            }),
+        ));
     }
-
     if let Some(target_label) = target_label {
-        create_outbound_action(
-            pool,
-            &OutboundActionInput {
-                workflow_item_id,
-                job_id: None,
-                provider: "github".into(),
-                action_type: "issue.add_label".into(),
-                payload: json!({
-                    "owner": owner,
-                    "repo": repo,
-                    "issue_number": issue_number,
-                    "label": target_label,
-                    "state": WorkflowState::PrOpen.as_str(),
-                }),
-            },
-        )
-        .await?;
+        actions.push((
+            "issue.add_label".into(),
+            json!({
+                "owner": owner, "repo": repo, "issue_number": issue_number,
+                "label": target_label, "state": WorkflowState::PrOpen.as_str(),
+            }),
+        ));
     }
-
-    Ok(())
+    actions
 }
 
 #[derive(Debug, Deserialize)]

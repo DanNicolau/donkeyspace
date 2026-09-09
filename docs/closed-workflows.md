@@ -19,11 +19,16 @@ Jobs and outbound actions carry a workflow generation. Reopening starts a new
 generation and does not resume cancelled jobs or paused checkpoints. Older provider
 timestamps are ignored; lifecycle edges are checked against GitHub when credentials
 are configured, including same-second delayed close/reopen events. Already recorded
-PRs retain their generation and cannot drive a reopened workflow. Worker state
+PRs retain their generation and cannot drive a reopened workflow. PR generation
+validation, state/history updates and queued label changes share one transaction
+and workflow lock. Reviewer jobs retain that admitted generation even when they
+are created after a concurrent reopen. Worker state
 writes, publication retries, and outbound dispatch reject cancelled or superseded
 jobs. Git pushes, PR creation, and GitHub projections take a workflow row lock to
 serialize admission with closure; closure can wait for an admitted operation.
-Individual outbound/push/PR creation calls are bounded to 60 seconds. A remote
+Individual outbound/push/PR creation calls and each complete GitHub projection
+batch are bounded to 60 seconds. A stalled projection releases the workflow lock
+when its deadline expires so that closure can persist cancellation. A remote
 request already accepted by GitHub cannot be retracted if its local caller times
 out or loses its connection.
 
@@ -59,6 +64,23 @@ It covers both close reasons, all active job states, late completion/failure,
 publication retry fencing, retained checkpoints, generation fencing, stale
 observations, duplicate close events, heartbeat ownership, side-effect admission
 ordering, projection foreign-key lock compatibility, and legacy convergence.
+
+Two further regressions use the same disposable database:
+
+```sh
+DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL=postgres://postgres:test-only@127.0.0.1:55438/donkeyspace_cancellation_test \
+  cargo test -p donkeyspace-db pr_effects_and_followup_jobs_cannot_cross_reopen \
+  -- --ignored --nocapture
+DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL=postgres://postgres:test-only@127.0.0.1:55438/donkeyspace_cancellation_test \
+  cargo test -p donkeyspace-worker stalled_projection_releases_lock_so_closure_can_commit \
+  -- --ignored --nocapture
+```
+
+The PR regression interleaves close/reopen after a successful earlier generation
+check and verifies that stale state, history, labels and reviewer jobs are fenced,
+while a new PR remains accepted. The projection regression uses a local HTTP
+endpoint that accepts the actual Octocrab PATCH request and never replies, with a
+short injected deadline; concurrent closure must commit and later work is denied.
 
 The live harness is restricted to the user-authorized `EPIC-BLOCKCHAIN/umbrella`
 test repository. It requires authenticated `gh`, Docker with `busybox:latest`,
