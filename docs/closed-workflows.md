@@ -40,13 +40,28 @@ worker does not implement cancellation acknowledgement. No policy changes are
 required. The worker also converges previously stored closed workflows that still
 have an active state, without resuming historical work.
 
+New managed final/checkpoint and attempt branches include the full originating
+job UUID. UUIDv7 IDs created close together share their leading timestamp bytes;
+truncating them to eight characters previously allowed different runs to reuse a
+branch. Full IDs preserve distinct branches, including after reopening.
+
+Migration `0004_pull_request_generation.sql` resolves a managed PR's original
+generation from that job ID even if the first PR delivery arrives after reopen.
+For old shortened names, persisted publication records provide attribution when
+they identify exactly one generation. Otherwise, after reopening, the PR is
+retained with generation `0` (unknown) and cannot drive state, labels or jobs.
+Repeated deliveries keep a known attribution. PRs first observed without a linked
+workflow can be attributed when the workflow becomes known. Existing attributed
+PRs and saved publication branch names remain unchanged. Non-managed human PRs
+keep their existing issue-linking behavior.
+
 This is a partial implementation of [#28](https://github.com/DanNicolau/donkeyspace/issues/28).
 Remaining work includes hard-crash/expired-orphan reconciliation, durable
 workflow/job container identities and Docker creation-race recovery, and the
 policy-gated manual cancel API/UI. A crashed worker can leave `cancel_requested`
-jobs until that reconciliation exists. Fresh job generations do not yet guarantee
-unique remote branch names, and a historical PR first observed only after reopening
-still needs reliable original-generation attribution. Cancellation acknowledgement
+jobs until that reconciliation exists. Ambiguous legacy managed branches remain
+inactive until their original attribution can be established; this migration does
+not guess or repair already misattributed historical rows. Cancellation acknowledgement
 is validated on Unix workers; other platforms lack process-group guarantees.
 
 ## Regression and live validation
@@ -82,6 +97,13 @@ while a new PR remains accepted. The projection regression uses a local HTTP
 endpoint that accepts the actual Octocrab PATCH request and never replies, with a
 short injected deadline; concurrent closure must commit and later work is denied.
 
+`late_managed_prs_keep_origin_generation_and_unknown_branches_stay_fenced` in
+`donkeyspace-db` also runs with the same database and `--ignored`. It covers first
+delivery after reopen, full job IDs, legacy publication provenance, ambiguous and
+unknown branches, duplicate updates, initially unlinked PRs, and another reopen.
+Worker branch tests use UUIDv7 IDs with identical timestamp prefixes to detect
+branch collisions; API tests accept both legacy and full-UUID names.
+
 The live harness is restricted to the user-authorized `EPIC-BLOCKCHAIN/umbrella`
 test repository. It requires authenticated `gh`, Docker with `busybox:latest`,
 and an **empty disposable** database named `donkeyspace_cancellation_live_test`
@@ -106,6 +128,15 @@ Signed webhook payloads contain actual GitHub issue snapshots but are delivered
 locally by the harness; no installed webhook configuration is changed. This tests
 GitHub reads/writes and the changed ingress/worker/container path, not GitHub's
 webhook transport, paid agents, or hardware tools.
+
+Add `DONKEYSPACE_REOPEN_PR_LIVE_TEST=1` to also create two temporary draft PRs and
+branches for the fresh test issue. The harness publishes tiny test commits using
+the full-job-ID branch format (the production formatter is unit tested), withholds
+the first PR delivery until after reopening, verifies old PR/duplicate rejection
+and new PR acceptance through the changed API, and checks that the first branch's
+commit remains unchanged. It closes both PRs and deletes both branches in cleanup.
+This exercises real GitHub PRs and ingress attribution; test commits are published
+by the harness, rather than by a coding agent.
 
 Evidence and logs are written under `/tmp/donkeyspace-closure-live-<run>/`, including
 the source revision, dirty-tree flag, umbrella revision, issue URL and job IDs.

@@ -54,7 +54,7 @@ pub fn issue_branch_name(
 ) -> String {
     format!(
         "{branch_prefix}/issue-{issue_number}-{}",
-        short_uuid(coordinator_job_id)
+        coordinator_job_id
     )
 }
 
@@ -775,7 +775,7 @@ fn attempt_branch_name(
     format!(
         "{}/attempt-{issue_number}-{}-{}-{}-a{}",
         branch_prefix,
-        short_uuid(attempt.job_id.unwrap_or(coordinator_job_id)),
+        attempt.job_id.unwrap_or(coordinator_job_id),
         safe_segment(attempt.task),
         safe_segment(attempt.work_item.unwrap_or("workflow")),
         attempt.attempt
@@ -835,10 +835,6 @@ async fn changed_files(
         .filter(|path| !path.trim().is_empty())
         .map(str::to_owned)
         .collect())
-}
-
-fn short_uuid(id: Uuid) -> String {
-    id.to_string().chars().take(8).collect()
 }
 
 fn safe_segment(value: &str) -> String {
@@ -1170,7 +1166,7 @@ mod tests {
         let id = Uuid::parse_str("01a03537-b408-7213-bdc7-ead9a6f1a48a").unwrap();
         assert_eq!(
             issue_branch_name("example-agent", 29, id),
-            "example-agent/issue-29-01a03537"
+            "example-agent/issue-29-01a03537-b408-7213-bdc7-ead9a6f1a48a"
         );
         let attempt = AttemptPublication {
             job_id: Some(id),
@@ -1188,7 +1184,23 @@ mod tests {
         };
         assert_eq!(
             attempt_branch_name("example-agent", 29, id, &attempt),
-            "example-agent/attempt-29-01a03537-synthesis-task-counter-detect-a301"
+            "example-agent/attempt-29-01a03537-b408-7213-bdc7-ead9a6f1a48a-synthesis-task-counter-detect-a301"
+        );
+        // UUIDv7 IDs created close together share their first eight characters.
+        // Both final/checkpoint and attempt branches must remain distinct.
+        let other = Uuid::parse_str("01a03537-b408-7213-bdc7-ead9a6f1a48b").unwrap();
+        assert_ne!(
+            issue_branch_name("example-agent", 29, id),
+            issue_branch_name("example-agent", 29, other)
+        );
+        let first_attempt = attempt_branch_name("example-agent", 29, id, &attempt);
+        let other_attempt = AttemptPublication {
+            job_id: Some(other),
+            ..attempt
+        };
+        assert_ne!(
+            first_attempt,
+            attempt_branch_name("example-agent", 29, id, &other_attempt)
         );
         assert_eq!(publication_kind(Some(Outcome::Implemented)), "diagnostic");
         assert_eq!(publication_kind(Some(Outcome::Failed)), "attempt");

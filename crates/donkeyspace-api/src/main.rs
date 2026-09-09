@@ -4768,6 +4768,13 @@ mod tests {
             issue_number_from_managed_branch("example-agent/issue-12-019e399e", "example-agent"),
             Some(12)
         );
+        assert_eq!(
+            issue_number_from_managed_branch(
+                "example-agent/issue-12-01a03537-b408-7213-bdc7-ead9a6f1a48a",
+                "example-agent"
+            ),
+            Some(12)
+        );
     }
 
     fn job_with_status_and_outcome(status: &str, outcome: Option<&str>) -> JobRecord {

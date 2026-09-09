@@ -226,6 +226,177 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL"]
+    async fn late_managed_prs_keep_origin_generation_and_unknown_branches_stay_fenced() {
+        let url = std::env::var("DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL").unwrap();
+        assert!(url.ends_with("/donkeyspace_cancellation_test"));
+        let pool = connect(&DbConfig::from_database_url(url)).await.unwrap();
+        apply_migrations(&pool).await.unwrap();
+        apply_migrations(&pool).await.unwrap();
+        let repository = upsert_repository(
+            &pool,
+            &RepositoryInput {
+                installation_external_id: None,
+                installation_account_login: None,
+                provider: "github".into(),
+                owner: format!("late-pr-{}", Uuid::now_v7()),
+                name: "umbrella".into(),
+                default_branch: "main".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut issue = WorkflowItemInput {
+            repository_id: repository,
+            provider_issue_id: "1".into(),
+            issue_number: 1,
+            provider_state: "open".into(),
+            current_state: None,
+            current_labels: vec![],
+        };
+        let observe = |issue: WorkflowItemInput| {
+            let pool = pool.clone();
+            async move {
+                observe_issue(
+                    &pool,
+                    &IssueObservation {
+                        issue: &issue,
+                        updated_at: None,
+                        close_reason: None,
+                        owner: "test",
+                        repo: "umbrella",
+                        state_labels: vec![],
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+        let workflow = observe(issue.clone()).await;
+        let old = create_job(&pool, Some(workflow), "developer", &json!({}))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO agent_publications (coordinator_job_id,workflow_item_id,kind,branch_name,commit_sha,html_url,local_repo_path) VALUES ($1,$2,'checkpoint','test/issue-1-legacy','abc','https://example.invalid','/tmp/test')")
+            .bind(old.id).bind(workflow).execute(&pool).await.unwrap();
+        issue.provider_state = "closed".into();
+        observe(issue.clone()).await;
+        issue.provider_state = "open".into();
+        observe(issue.clone()).await;
+        let current = create_job(&pool, Some(workflow), "developer", &json!({}))
+            .await
+            .unwrap();
+        let record = |branch: String, workflow_id: Option<i64>| {
+            let pool = pool.clone();
+            async move {
+                let pr = crate::PullRequestInput {
+                    repository_id: repository,
+                    workflow_item_id: workflow_id,
+                    provider_pr_id: Uuid::now_v7().to_string(),
+                    pr_number: 10,
+                    title: "test".into(),
+                    html_url: "https://example.invalid".into(),
+                    state: "open".into(),
+                    head_ref: branch,
+                    head_sha: Some("abc".into()),
+                    base_ref: "main".into(),
+                    base_sha: None,
+                    managed_by_donkeyspace: true,
+                };
+                crate::upsert_pull_request(&pool, &pr).await.unwrap();
+                pr
+            }
+        };
+        let generation = |id: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_,i64>("SELECT generation FROM pull_requests WHERE repository_id=$1 AND provider_pr_id=$2")
+                .bind(repository).bind(id).fetch_one(&pool).await.unwrap()
+            }
+        };
+        for branch in [
+            format!("test/issue-1-{}", old.id),
+            format!("test/attempt-1-{}-rtl-block-a1", old.id),
+            "test/issue-1-legacy".into(),
+        ] {
+            let pr = record(branch, Some(workflow)).await;
+            assert_eq!(generation(pr.provider_pr_id.clone()).await, 1);
+            assert!(
+                apply_pull_request_effects(
+                    &pool,
+                    workflow,
+                    &pr.provider_pr_id,
+                    Some("pr_open"),
+                    &[("issue.add_label".into(), json!({"label":"ai:pr-open"}))]
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            crate::upsert_pull_request(&pool, &pr).await.unwrap();
+            assert_eq!(generation(pr.provider_pr_id.clone()).await, 1);
+        }
+        // Neither a missing UUID nor an unrecognized legacy branch may be
+        // silently adopted by the current generation after reopening.
+        for branch in [
+            format!("test/issue-1-{}", Uuid::now_v7()),
+            "test/issue-1-unknown".into(),
+        ] {
+            let pr = record(branch, Some(workflow)).await;
+            assert_eq!(generation(pr.provider_pr_id.clone()).await, 0);
+            crate::upsert_pull_request(&pool, &pr).await.unwrap();
+            assert_eq!(generation(pr.provider_pr_id.clone()).await, 0);
+            assert!(
+                apply_pull_request_effects(
+                    &pool,
+                    workflow,
+                    &pr.provider_pr_id,
+                    Some("pr_open"),
+                    &[]
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+        }
+        let pr = record(format!("test/issue-1-{}", current.id), Some(workflow)).await;
+        assert_eq!(generation(pr.provider_pr_id.clone()).await, 2);
+        assert_eq!(
+            apply_pull_request_effects(&pool, workflow, &pr.provider_pr_id, Some("pr_open"), &[])
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        // A PR first observed without its linked issue can be attributed later.
+        let mut unlinked = record(format!("test/issue-1-{}", old.id), None).await;
+        assert_eq!(generation(unlinked.provider_pr_id.clone()).await, 0);
+        unlinked.workflow_item_id = Some(workflow);
+        crate::upsert_pull_request(&pool, &unlinked).await.unwrap();
+        assert_eq!(generation(unlinked.provider_pr_id.clone()).await, 1);
+        // Ambiguous legacy branch reuse must not pick whichever generation is newer.
+        sqlx::query("INSERT INTO agent_publications (coordinator_job_id,workflow_item_id,kind,branch_name,commit_sha,html_url,local_repo_path) VALUES ($1,$2,'checkpoint','test/issue-1-legacy','def','https://example.invalid','/tmp/test')")
+            .bind(current.id).bind(workflow).execute(&pool).await.unwrap();
+        let ambiguous = record("test/issue-1-legacy".into(), Some(workflow)).await;
+        assert_eq!(generation(ambiguous.provider_pr_id).await, 0);
+        // Closing/reopening again cannot rewrite an already attributed PR.
+        issue.provider_state = "closed".into();
+        observe(issue.clone()).await;
+        issue.provider_state = "open".into();
+        observe(issue.clone()).await;
+        crate::upsert_pull_request(&pool, &pr).await.unwrap();
+        assert_eq!(generation(pr.provider_pr_id.clone()).await, 2);
+        assert!(
+            !pull_request_is_current(&pool, workflow, &pr.provider_pr_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_job(&pool, old.id).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL"]
     async fn pr_effects_and_followup_jobs_cannot_cross_reopen() {
         let url = std::env::var("DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL").unwrap();
         assert!(url.ends_with("/donkeyspace_cancellation_test"));
@@ -344,6 +515,10 @@ mod tests {
         // A newly admitted PR still works and stamps its actions with generation 2.
         pr.provider_pr_id = "new".into();
         pr.pr_number = 3;
+        let current_job = create_job(&pool, Some(workflow), "developer", &json!({}))
+            .await
+            .unwrap();
+        pr.head_ref = format!("test/issue-1-{}", current_job.id);
         crate::upsert_pull_request(&pool, &pr).await.unwrap();
         assert_eq!(
             apply_pull_request_effects(&pool, workflow, "new", Some("pr_open"), &actions)

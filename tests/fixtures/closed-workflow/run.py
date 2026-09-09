@@ -50,6 +50,7 @@ def main():
     database = os.environ["DONKEYSPACE_CLOSURE_TEST_DATABASE_URL"]
     assert database.endswith("/donkeyspace_cancellation_live_test")
     db_container = os.environ["DONKEYSPACE_CLOSURE_TEST_DATABASE_CONTAINER"]
+    test_reopen_prs = os.environ.get("DONKEYSPACE_REOPEN_PR_LIVE_TEST") == "1"
     ROOT.mkdir()
     prefix = f"ds-cxl-{RUN}"
     states = ["needs_info", "ready", "in_progress", "publishing", "pr_open", "needs_human", "blocked"]
@@ -126,7 +127,7 @@ automation:
         "DONKEYSPACE_LEASE_SECONDS": "3",
         "RUST_LOG": "donkeyspace=info",
     })
-    processes, created_labels = [], []
+    processes, created_labels, test_prs, test_branches = [], [], [], []
     issue = None
     evidence = {"source": command("git", "-C", str(SOURCE), "rev-parse", "HEAD"),
                 "source_dirty": bool(command("git", "-C", str(SOURCE), "status", "--porcelain")),
@@ -157,17 +158,45 @@ automation:
         except (OSError, urllib.error.URLError):
             return False
 
-    def ingress(action, snapshot, delivery=None):
-        payload = json.dumps({"action": action, "issue": snapshot, "repository": repository, "sender": user}).encode()
+    def ingress(action, snapshot, delivery=None, event="issues"):
+        key = "pull_request" if event == "pull_request" else "issue"
+        payload = json.dumps({"action": action, key: snapshot, "repository": repository, "sender": user}).encode()
         delivery = delivery or str(uuid.uuid4())
         signature = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
         request = urllib.request.Request(base + "/webhooks/github", data=payload, headers={
-            "Content-Type": "application/json", "X-GitHub-Event": "issues", "X-GitHub-Delivery": delivery,
+            "Content-Type": "application/json", "X-GitHub-Event": event, "X-GitHub-Delivery": delivery,
             "X-Hub-Signature-256": signature,
         })
         with urllib.request.urlopen(request, timeout=30) as response:
             assert response.status in (200, 202)
         return delivery
+
+    def create_test_pr(job, generation):
+        # Match the production branch format; its uniqueness is separately
+        # covered against same-prefix UUIDv7 IDs in the Rust formatter test.
+        branch = f"donkeyspace/issue-{issue['number']}-{job}"
+        base_commit = github(f"repos/{REPO}/git/commits/{evidence['umbrella_revision']}")
+        tree = github(f"repos/{REPO}/git/trees", "POST", {
+            "base_tree": base_commit["tree"]["sha"],
+            "tree": [{"path": f".donkeyspace-tests/reopen-{RUN}-{generation}.txt",
+                      "mode": "100644", "type": "blob", "content": f"Disposable generation {generation} test.\n"}],
+        })
+        commit = github(f"repos/{REPO}/git/commits", "POST", {
+            "message": f"test: reopen isolation {RUN} generation {generation}",
+            "tree": tree["sha"], "parents": [evidence["umbrella_revision"]],
+        })
+        github(f"repos/{REPO}/git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
+        test_branches.append(branch)
+        pr = github(f"repos/{REPO}/pulls", "POST", {
+            "title": f"[Reopen isolation test {RUN}] generation {generation}",
+            "head": branch, "base": repository["default_branch"], "draft": True,
+            "body": f"Authorized disposable test. Refs #{issue['number']}. This PR will be closed without merge.\n<!-- donkeyspace-generated -->",
+        })
+        test_prs.append(pr)
+        evidence.setdefault("pull_requests", []).append({"url": pr["html_url"], "head": branch,
+            "commit": commit["sha"], "job": job, "generation": generation})
+        print("Test PR:", pr["html_url"], flush=True)
+        return pr
 
     def owned_containers():
         names = command("docker", "ps", "--all", "--filter", "label=donkeyspace.managed=true", "--format", "{{.Names}}").splitlines()
@@ -210,6 +239,27 @@ automation:
             assert active[0]["live_lease"] and active[0]["status"] == "running", active
             assert len(owned_containers()) == 1
             print(f"Generation {generation}: running container; heartbeat verified", flush=True)
+            if test_reopen_prs:
+                pr = create_test_pr(active[0]["id"], generation)
+                if generation == 2:
+                    old = test_prs[0]
+                    before = sql("SELECT current_state || ':' || (SELECT count(*) FROM outbound_actions) FROM workflow_items")
+                    delivery = ingress("opened", old, event="pull_request")
+                    ingress("opened", old, delivery, event="pull_request")
+                    ingress("synchronize", old, event="pull_request")
+                    assert sql(f"SELECT generation FROM pull_requests WHERE provider_pr_id='{old['id']}'") == "1"
+                    assert sql("SELECT current_state || ':' || (SELECT count(*) FROM outbound_actions) FROM workflow_items") == before
+                    delivery = ingress("opened", pr, event="pull_request")
+                    after = sql("SELECT count(*) FROM outbound_actions")
+                    ingress("opened", pr, delivery, event="pull_request")
+                    assert sql("SELECT count(*) FROM outbound_actions") == after
+                    assert sql(f"SELECT generation FROM pull_requests WHERE provider_pr_id='{pr['id']}'") == "2"
+                    assert sql("SELECT current_state FROM workflow_items") == "pr_open"
+                    assert test_branches[0] != test_branches[1]
+                    old_ref = github(f"repos/{REPO}/git/ref/heads/{test_branches[0]}")
+                    assert old_ref["object"]["sha"] == evidence["pull_requests"][0]["commit"]
+                    evidence["reopen_pr_isolation"] = "passed: first-seen old PR and duplicates fenced; new PR accepted; original branch unchanged"
+                    print("Late old PR fenced; new PR accepted; old branch preserved", flush=True)
             closed = github(f"repos/{REPO}/issues/{issue['number']}", "PATCH", {"state": "closed", "state_reason": reason})
             started = time.monotonic()
             delivery = ingress("closed", closed)
@@ -243,12 +293,16 @@ automation:
                     process.wait()
         for name in owned_containers():
             command("docker", "rm", "--force", name)
+        for pr in test_prs:
+            github(f"repos/{REPO}/pulls/{pr['number']}", "PATCH", {"state": "closed"})
+        for branch in test_branches:
+            github(f"repos/{REPO}/git/refs/heads/{branch}", "DELETE")
         if issue:
             github(f"repos/{REPO}/issues/{issue['number']}", "PATCH", {"state": "closed", "state_reason": "not_planned"})
         for label in created_labels:
             from urllib.parse import quote
             github(f"repos/{REPO}/labels/{quote(label, safe='')}", "DELETE")
-        evidence["cleanup"] = "API/worker stopped; test containers and labels removed; issue closed; database and local logs retained for inspection"
+        evidence["cleanup"] = "API/worker stopped; test containers, labels and branches removed; issue and test PRs closed; database and local logs retained for inspection"
         (ROOT / "evidence.json").write_text(json.dumps(evidence, indent=2))
         print("Evidence:", ROOT / "evidence.json", flush=True)
 
