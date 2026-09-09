@@ -172,9 +172,14 @@ automation:
         return delivery
 
     def create_test_pr(job, generation):
-        # Match the production branch format; its uniqueness is separately
-        # covered against same-prefix UUIDv7 IDs in the Rust formatter test.
-        branch = f"donkeyspace/issue-{issue['number']}-{job}"
+        # The real worker publishes its initial checkpoint before the sleeping
+        # role starts. Test that exact branch, including the production formatter
+        # and push path, then add a tiny commit so GitHub can open a draft PR.
+        branch = sql(f"SELECT branch_name FROM agent_publications WHERE coordinator_job_id='{job}' AND kind='checkpoint' AND status='published' ORDER BY id DESC LIMIT 1")
+        assert branch == f"donkeyspace/issue-{issue['number']}-{job}", branch
+        test_branches.append(branch)
+        existing = github(f"repos/{REPO}/git/ref/heads/{branch}")
+        assert existing["object"]["sha"] == evidence["umbrella_revision"]
         base_commit = github(f"repos/{REPO}/git/commits/{evidence['umbrella_revision']}")
         tree = github(f"repos/{REPO}/git/trees", "POST", {
             "base_tree": base_commit["tree"]["sha"],
@@ -185,8 +190,7 @@ automation:
             "message": f"test: reopen isolation {RUN} generation {generation}",
             "tree": tree["sha"], "parents": [evidence["umbrella_revision"]],
         })
-        github(f"repos/{REPO}/git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
-        test_branches.append(branch)
+        github(f"repos/{REPO}/git/refs/heads/{branch}", "PATCH", {"sha": commit["sha"], "force": False})
         pr = github(f"repos/{REPO}/pulls", "POST", {
             "title": f"[Reopen isolation test {RUN}] generation {generation}",
             "head": branch, "base": repository["default_branch"], "draft": True,
@@ -295,8 +299,19 @@ automation:
             command("docker", "rm", "--force", name)
         for pr in test_prs:
             github(f"repos/{REPO}/pulls/{pr['number']}", "PATCH", {"state": "closed"})
+        if issue:
+            # Include branches the worker published even if the harness failed
+            # before creating a PR or the optional PR scenario was disabled.
+            published = json.loads(sql("SELECT COALESCE(json_agg(DISTINCT branch_name),'[]') FROM agent_publications"))
+            for branch in published:
+                assert branch.startswith((f"donkeyspace/issue-{issue['number']}-", f"donkeyspace/attempt-{issue['number']}-")), branch
+                if branch not in test_branches:
+                    test_branches.append(branch)
         for branch in test_branches:
-            github(f"repos/{REPO}/git/refs/heads/{branch}", "DELETE")
+            removed = subprocess.run(["gh", "api", f"repos/{REPO}/git/refs/heads/{branch}",
+                                      "--method", "DELETE"], text=True, capture_output=True)
+            if removed.returncode and "HTTP 404" not in removed.stderr:
+                raise RuntimeError(f"Failed to remove test branch {branch}: {removed.stderr}")
         if issue:
             github(f"repos/{REPO}/issues/{issue['number']}", "PATCH", {"state": "closed", "state_reason": "not_planned"})
         for label in created_labels:

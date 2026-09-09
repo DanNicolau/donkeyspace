@@ -129,14 +129,15 @@ locally by the harness; no installed webhook configuration is changed. This test
 GitHub reads/writes and the changed ingress/worker/container path, not GitHub's
 webhook transport, paid agents, or hardware tools.
 
-Add `DONKEYSPACE_REOPEN_PR_LIVE_TEST=1` to also create two temporary draft PRs and
-branches for the fresh test issue. The harness publishes tiny test commits using
-the full-job-ID branch format (the production formatter is unit tested), withholds
-the first PR delivery until after reopening, verifies old PR/duplicate rejection
-and new PR acceptance through the changed API, and checks that the first branch's
-commit remains unchanged. It closes both PRs and deletes both branches in cleanup.
-This exercises real GitHub PRs and ingress attribution; test commits are published
-by the harness, rather than by a coding agent.
+Add `DONKEYSPACE_REOPEN_PR_LIVE_TEST=1` to also create two temporary draft PRs for
+the fresh test issue. The changed worker publishes each initial checkpoint to its
+full-job-ID branch. The harness reads that persisted branch, adds a tiny test
+commit so GitHub can open a PR, and withholds the first PR delivery until after
+reopening. It verifies old PR/duplicate rejection and new PR acceptance through
+the changed API, and checks that the first branch's commit remains unchanged.
+It closes both PRs and deletes the worker-published branches in cleanup. This
+exercises the production branch formatter, checkpoint push and PR attribution;
+the extra commits required for nonempty PRs are created by the harness.
 
 Evidence and logs are written under `/tmp/donkeyspace-closure-live-<run>/`, including
 the source revision, dirty-tree flag, umbrella revision, issue URL and job IDs.
