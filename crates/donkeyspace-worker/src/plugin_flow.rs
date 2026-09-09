@@ -21,12 +21,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Component, Path, PathBuf},
-    process::Stdio,
 };
-use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::active_facade;
+use crate::plugin_container::run_container;
 use crate::plugin_task_graph::{TaskGraph, TaskKey};
 use crate::publication::{
     AttemptPublication, PublicationContext, publish_attempt, publish_checkpoint,
@@ -3591,91 +3590,6 @@ async fn run_validators(
         });
     }
     Ok(results)
-}
-
-async fn run_container(
-    image: &str,
-    command: &[String],
-    stage_root: &Path,
-    configured: &BTreeMap<String, String>,
-    allowed: &[String],
-) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-    let mut docker = Command::new("docker");
-    docker.arg("run").arg("--rm").arg("--network").arg("bridge");
-    if let Ok(volume) = env::var("DONKEYSPACE_WORKSPACE_VOLUME") {
-        let workspace_root =
-            env::var("DONKEYSPACE_WORKSPACE_ROOT").unwrap_or_else(|_| "/workspaces".into());
-        docker.args([
-            "--mount",
-            &format!("type=volume,src={volume},dst={workspace_root}"),
-        ]);
-        docker.args(["--workdir", &stage_root.display().to_string()]);
-    } else {
-        docker.args([
-            "--mount",
-            &format!("type=bind,src={},dst=/workspace", stage_root.display()),
-        ]);
-        docker.args(["--workdir", "/workspace"]);
-    }
-    if let Ok(volume) = env::var("DONKEYSPACE_CODEX_VOLUME") {
-        docker.args([
-            "--mount",
-            &format!("type=volume,src={volume},dst=/root/.codex"),
-        ]);
-    }
-    if let Ok(source) = env::var("DONKEYSPACE_OSS_TOOLS_PATH") {
-        let source = source.trim();
-        if !source.is_empty() {
-            let source_path = Path::new(source);
-            if !source_path.is_absolute() || source.contains(',') {
-                return Err(
-                    "DONKEYSPACE_OSS_TOOLS_PATH must be an absolute path without commas".into(),
-                );
-            }
-            docker.args([
-                "--mount",
-                &format!("type=bind,src={source},dst=/mnt/oss-tools,readonly"),
-            ]);
-        }
-    }
-    if let Ok(source) = env::var("DONKEYSPACE_TECH_PATH") {
-        let source = source.trim();
-        if !source.is_empty() {
-            let source_path = Path::new(source);
-            if !source_path.is_absolute() || source.contains(',') {
-                return Err("DONKEYSPACE_TECH_PATH must be an absolute path without commas".into());
-            }
-            docker.args([
-                "--mount",
-                &format!("type=bind,src={source},dst=/mnt/tech,readonly"),
-            ]);
-        }
-    }
-    for name in allowed {
-        if let Some(source) = configured.get(name) {
-            let value = if Path::new(source).is_absolute() {
-                std::fs::read_to_string(source)
-                    .map(|value| value.trim_end().to_string())
-                    .map_err(|_| {
-                        format!("required plugin environment file `{source}` is unreadable")
-                    })?
-            } else {
-                env::var(source).map_err(|_| {
-                    format!("required plugin environment source `{source}` is unset")
-                })?
-            };
-            // Pass only the variable name on Docker's command line. The value
-            // is inherited from this worker process and is never exposed in
-            // process listings or command diagnostics.
-            docker.arg("--env").arg(name).env(name, value);
-        }
-    }
-    docker
-        .arg(image)
-        .args(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    Ok(docker.output().await?)
 }
 
 fn resolve_access(
