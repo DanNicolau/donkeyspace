@@ -12,6 +12,7 @@ pub struct ContainerExecution {
     pub lease_owner: String,
     pub container_name: String,
     pub execution_scope: String,
+    pub docker_daemon_id: Option<String>,
 }
 
 /// Register only while the coordinator owns a live running lease. Serialize
@@ -22,6 +23,7 @@ pub async fn register_container_execution(
     coordinator: Uuid,
     lease_owner: &str,
     execution_scope: &str,
+    docker_daemon_id: &str,
 ) -> Result<ContainerExecution, DbError> {
     let mut tx = pool.begin().await?;
     // Use the same workflow-before-job lock order as issue closure. Jobs without
@@ -39,11 +41,11 @@ pub async fn register_container_execution(
     };
     let id = Uuid::now_v7();
     let record = sqlx::query_as(
-        "INSERT INTO container_executions (id,coordinator_job_id,workflow_item_id,generation,lease_owner,container_name,execution_scope)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+        "INSERT INTO container_executions (id,coordinator_job_id,workflow_item_id,generation,lease_owner,container_name,execution_scope,docker_daemon_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",
     )
     .bind(id).bind(coordinator).bind(workflow).bind(generation).bind(lease_owner)
-    .bind(format!("donkeyspace-execution-{id}")).bind(execution_scope)
+    .bind(format!("donkeyspace-execution-{id}")).bind(execution_scope).bind(docker_daemon_id)
     .fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(record)
@@ -107,7 +109,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            register_container_execution(&pool, job.id, "owner", "scope")
+            register_container_execution(&pool, job.id, "owner", "scope", "test-daemon")
                 .await
                 .is_err()
         );
@@ -116,21 +118,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            register_container_execution(&pool, job.id, "owner", "scope")
+            register_container_execution(&pool, job.id, "owner", "scope", "test-daemon")
                 .await
                 .is_err()
         );
         mark_job_running(&pool, job.id).await.unwrap().unwrap();
         assert!(
-            register_container_execution(&pool, job.id, "other", "scope")
+            register_container_execution(&pool, job.id, "other", "scope", "test-daemon")
                 .await
                 .is_err()
         );
 
-        let first = register_container_execution(&pool, job.id, "owner", "scope")
+        let first = register_container_execution(&pool, job.id, "owner", "scope", "test-daemon")
             .await
             .unwrap();
-        let second = register_container_execution(&pool, job.id, "owner", "scope")
+        let second = register_container_execution(&pool, job.id, "owner", "scope", "test-daemon")
             .await
             .unwrap();
         assert_ne!(first.id, second.id);
@@ -139,7 +141,7 @@ mod tests {
         assert_eq!(first.workflow_item_id, Some(workflow));
         assert_eq!(first.generation, 1);
         assert_eq!(first.lease_owner, "owner");
-        assert_eq!(first.execution_scope, "scope");
+        assert_eq!(first.execution_scope, "scope", "test-daemon");
         // Observe committed intent from another connection before Docker would run.
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -158,7 +160,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            register_container_execution(&pool, job.id, "owner", "scope")
+            register_container_execution(&pool, job.id, "owner", "scope", "test-daemon")
                 .await
                 .is_err()
         );
@@ -176,7 +178,8 @@ mod tests {
             .execute(&mut *lifecycle)
             .await
             .unwrap();
-        let registration = register_container_execution(&pool, job.id, "owner", "scope");
+        let registration =
+            register_container_execution(&pool, job.id, "owner", "scope", "test-daemon");
         tokio::pin!(registration);
         let waiting = async {
             loop {
@@ -219,7 +222,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            register_container_execution(&pool, job.id, "owner", "scope")
+            register_container_execution(&pool, job.id, "owner", "scope", "test-daemon")
                 .await
                 .is_err()
         );
@@ -231,7 +234,7 @@ mod tests {
             .unwrap()
             .unwrap();
         mark_job_running(&pool, new_job.id).await.unwrap().unwrap();
-        let new = register_container_execution(&pool, new_job.id, "owner", "scope")
+        let new = register_container_execution(&pool, new_job.id, "owner", "scope", "test-daemon")
             .await
             .unwrap();
         assert_eq!(new.generation, 2);
@@ -256,9 +259,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let standalone = register_container_execution(&pool, standalone.id, "owner", "scope")
-            .await
-            .unwrap();
+        let standalone =
+            register_container_execution(&pool, standalone.id, "owner", "scope", "test-daemon")
+                .await
+                .unwrap();
         assert_eq!(standalone.workflow_item_id, None);
 
         // Retain fixture history in the disposable database for inspection.

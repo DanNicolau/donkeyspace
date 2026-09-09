@@ -40,7 +40,11 @@ pub(crate) async fn run_container(
         "{:x}",
         Sha256::digest(stage_root.as_os_str().as_encoded_bytes())
     );
-    let execution = register_container_execution(&pool, coordinator, &owner, &scope).await?;
+    let daemon = crate::execution_recovery::docker_daemon_id()
+        .await
+        .map_err(|error| error as Box<dyn std::error::Error>)?;
+    let execution =
+        register_container_execution(&pool, coordinator, &owner, &scope, &daemon).await?;
     run_container_until(
         &execution,
         image,
@@ -220,6 +224,7 @@ mod tests {
             generation: 2,
             lease_owner: "isolated-test".into(),
             container_name: format!("donkeyspace-execution-{id}"),
+            docker_daemon_id: Some("test-daemon".into()),
             execution_scope: format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes())),
         }
     }

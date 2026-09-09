@@ -50,7 +50,9 @@ def main():
     database = os.environ["DONKEYSPACE_CLOSURE_TEST_DATABASE_URL"]
     assert database.endswith("/donkeyspace_cancellation_live_test")
     db_container = os.environ["DONKEYSPACE_CLOSURE_TEST_DATABASE_CONTAINER"]
+    test_recovery = os.environ.get("DONKEYSPACE_RECOVERY_LIVE_TEST") == "1"
     test_reopen_prs = os.environ.get("DONKEYSPACE_REOPEN_PR_LIVE_TEST") == "1"
+    assert not (test_recovery and test_reopen_prs), "run recovery and PR scenarios separately"
     ROOT.mkdir()
     prefix = f"ds-cxl-{RUN}"
     states = ["needs_info", "ready", "in_progress", "publishing", "pr_open", "needs_human", "blocked"]
@@ -276,11 +278,72 @@ automation:
                     assert old_ref["object"]["sha"] == evidence["pull_requests"][0]["commit"]
                     evidence["reopen_pr_isolation"] = "passed: first-seen old PR and duplicates fenced; new PR accepted; original branch unchanged"
                     print("Late old PR fenced; new PR accepted; old branch preserved", flush=True)
+            if test_recovery:
+                worker.kill()  # Actual SIGKILL: no supervisor cleanup can run.
+                worker.wait(timeout=10)
+                assert container in owned_containers(), "crash must leave a real orphan"
+                time.sleep(4)  # Let the last heartbeat expire before recovery.
+
+                def recover():
+                    recovery = spawn("donkeyspace-worker", "--recover-once")
+                    recovery.wait(timeout=40)
+                    assert recovery.returncode == 0, "bounded recovery failed; inspect worker logs"
+
+                def materialize(scope):
+                    # Reproduce daemon materialization after an earlier absence
+                    # check. Reuse this invocation's committed identity only.
+                    args = ["docker", "run", "-d", "--rm", "--name", container,
+                            "--mount", f"type=bind,src={ROOT},dst=/fixture"]
+                    for key, value in container_labels.items():
+                        if key == "donkeyspace.execution-scope":
+                            value = scope
+                        args += ["--label", f"{key}={value}"]
+                    command(*args, "busybox:latest", "sleep", "180")
+
+                if generation == 1:
+                    # A same-name impostor must survive and prevent successful
+                    # cleanup acknowledgement. The test owns/removes it explicitly.
+                    command("docker", "rm", "--force", container)
+                    materialize("ownership-mismatch")
+                    recover()
+                    assert jobs()[0]["status"] == "cancel_requested"
+                    assert container in owned_containers()
+                    assert "ownership mismatch" in sql(f"SELECT error FROM container_cleanup_observations WHERE execution_id='{identity['id']}'").lower()
+                    command("docker", "rm", "--force", container)
+                    materialize(identity["execution_scope"])
+                    recover()
+                    assert jobs()[0]["status"] == "cancelled"
+                    assert not owned_containers()
+                    assert sql("SELECT current_state FROM workflow_items") == "needs_human"
+                    # Keep the tombstone even after cancellation was acknowledged.
+                    materialize(identity["execution_scope"])
+                    recover()
+                    assert not owned_containers(), "late materialization escaped recovery"
+                    assert sql("SELECT count(*) FROM lifecycle_events WHERE event_type='execution_recovery'") == "1"
+                    flush = spawn("donkeyspace-worker", "--once")
+                    flush.wait(timeout=40)
+                    assert flush.returncode == 0
+                    snapshot = github(f"repos/{REPO}/issues/{issue['number']}")
+                    assert f"{prefix}:needs_human" in [label["name"] for label in snapshot["labels"]]
+                    evidence["open_crash_recovery"] = "passed: expired execution fenced, ownership mismatch withheld cleanup/ack, retry removed orphan, late materialization removed, needs_human label published, no replay"
+
             closed = github(f"repos/{REPO}/issues/{issue['number']}", "PATCH", {"state": "closed", "state_reason": reason})
             started = time.monotonic()
             delivery = ingress("closed", closed)
             ingress("closed", closed, delivery)  # Duplicate delivery.
             ingress("closed", closed)  # Duplicate observation under another delivery.
+            if test_recovery:
+                if generation == 2:
+                    env["DOCKER_HOST"] = f"unix://{ROOT}/missing-docker.sock"
+                    unavailable = spawn("donkeyspace-worker", "--recover-once")
+                    unavailable.wait(timeout=40)
+                    env.pop("DOCKER_HOST")
+                    assert unavailable.returncode != 0
+                    assert jobs()[-1]["status"] == "cancel_requested"
+                    assert container in owned_containers()
+                    evidence["daemon_failure_retry"] = "passed: unavailable daemon did not acknowledge cancellation; subsequent recovery retried"
+                recover()
+                worker = spawn("donkeyspace-worker", "--once")
             wait(lambda: all(job["status"] == "cancelled" for job in jobs()), "cancellation acknowledgement")
             assert not owned_containers(), "worker acknowledged cancellation before container cleanup"
             # Cancellation cleanup must retain immutable launch provenance.
@@ -293,7 +356,7 @@ automation:
             assert not any(label["name"].startswith(prefix + ":") for label in final["labels"])
             evidence["scenarios"].append({"generation": generation, "close_reason": reason,
                 "job": active[0]["id"], "seconds_to_cleanup": round(time.monotonic() - started, 2),
-                "result": "passed", "duplicate_delivery": delivery})
+                "result": "passed", "duplicate_delivery": delivery, "worker_killed": test_recovery})
             previous_closed = closed
             print(f"Generation {generation}: closed, cancelled, container removed, active labels removed", flush=True)
         assert len({job["id"] for job in jobs()}) == 2

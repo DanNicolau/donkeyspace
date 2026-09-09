@@ -1,5 +1,6 @@
 pub mod cancellation;
 pub mod container_executions;
+pub mod execution_recovery;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,11 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../../migrations/0005_container_executions.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0006_execution_recovery.sql"
     ))
     .execute(&mut *transaction)
     .await?;
@@ -2440,8 +2446,7 @@ pub async fn acquire_job_lease(
             lease_expires_at = now() + ($3::text || ' seconds')::interval,
             updated_at = now()
         WHERE id = $1
-          AND status IN ('queued', 'leased')
-          AND (lease_expires_at IS NULL OR lease_expires_at < now())
+          AND status = 'queued'
         RETURNING *
         "#,
     )
@@ -2465,7 +2470,6 @@ pub async fn acquire_next_queued_job(
             SELECT id
             FROM jobs
             WHERE status = 'queued'
-               OR (status = 'leased' AND lease_expires_at < now())
             ORDER BY created_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED

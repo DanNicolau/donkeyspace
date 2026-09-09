@@ -56,10 +56,9 @@ PRs and saved publication branch names remain unchanged. Non-managed human PRs
 keep their existing issue-linking behavior.
 
 This is a partial implementation of [#28](https://github.com/DanNicolau/donkeyspace/issues/28).
-Remaining work includes hard-crash/expired-orphan reconciliation,
-Docker creation-race recovery, and the
-policy-gated manual cancel API/UI. A crashed worker can leave `cancel_requested`
-jobs until that reconciliation exists. Ambiguous legacy managed branches remain
+Remaining work includes recovery of unregistered native processes and legacy
+containers, and the policy-gated manual cancel API/UI. Unknown ownership leaves
+`cancel_requested` pending for operator reconciliation. Ambiguous legacy managed branches remain
 inactive until their original attribution can be established; this migration does
 not guess or repair already misattributed historical rows. Cancellation acknowledgement
 is validated on Unix workers; other platforms lack process-group guarantees.
@@ -67,7 +66,7 @@ is validated on Unix workers; other platforms lack process-group guarantees.
 ## Container launch ownership
 
 Migration `0005_container_executions.sql` adds a durable launch registry. Before
-issuing any Docker command, the worker commits a `container_executions` row with
+issuing any Docker launch command, the worker commits a `container_executions` row with
 the invocation UUID, unique container name, coordinator job UUID, workflow ID and
 generation, lease owner, and hashed execution scope. Registration requires a
 running coordinator with an unexpired lease owned by this worker; it takes the
@@ -87,13 +86,53 @@ explicitly propagate execution ownership and process supervision to that task.
 Rows are **launch intents**, not evidence that a container exists or has stopped.
 They remain after normal completion, cancellation, failed configuration/creation,
 or worker death so the exact intended resource can be inspected later. This
-release adds neither an orphan sweeper nor a cleanup-status field. In particular,
-a Docker request whose outcome is unknown can still create a container after
-local cleanup; the durable identity is a prerequisite for reconciling that race.
-Do not infer successful crash recovery from an absent container or a worker
-restart alone. Older launches have no registry row and are not backfilled by
-guessing ownership. Apply the migration before starting the upgraded worker;
-no policy changes are needed.
+release periodically reconciles these retained intents, including late Docker
+materialization. Older launches are never backfilled by guessing ownership.
+
+## Expired execution recovery
+
+Migration `0006_execution_recovery.sql` records the Docker daemon ID read before
+launch registration, a recovery-request timestamp on jobs, and separate cleanup
+observations. Existing intent rows keep unknown (`NULL`) daemon ownership.
+The migration runner reapplies the cancellation trigger from migration 0003,
+which now also fences cancelled standalone jobs. Drain existing execution and
+apply migrations before upgrading workers; no policy additions are required.
+
+The worker runs a recovery task independently of its serial job loop. Every five
+seconds after the preceding pass, it fences up to 100 expired root leases and
+checks up to 100 retired intents for its Docker daemon. Each pass has a 30-second
+deadline; each Docker command has a 10-second deadline. Busy workflow/job locks
+are skipped. Child tasks inherit the coordinator's lifetime, not a separate lease.
+Heartbeats cannot revive expired leases; expired leased UUIDs are never reassigned.
+Unstarted leased jobs become cancelled; running jobs and their active children
+request cancellation. Current open workflows move to `needs_human`, with history
+and configured labels queued. Closed/reopened generations are not rewritten.
+There is no automatic execution replay or checkpoint resume.
+
+Cleanup requires an exact container name and all persisted identity labels. It
+removes by immutable Docker container ID and verifies absence with a successful
+Docker listing. Another daemon's absence, Docker errors, and ownership mismatches
+are not cleanup proof. Errors are recorded and retried. Crashed coordinators with
+registered containers are acknowledged only when every owning daemon has reported
+successful cleanup since cancellation. A recovery worker must run against each
+owning daemon. A daemon reset with a new identity requires operator reconciliation.
+
+Successful cleanup observations do not retire launch intents: subsequent passes
+continue checking them, so a Docker request accepted before worker death that
+materializes later is eventually removed. This is eventual convergence, not an
+atomic transaction with Docker: a late container can briefly exist after an
+absence check or cancellation acknowledgement. Retained history grows and is
+rotated in batches; cleanup latency grows with backlog or daemon failures.
+No unbounded Docker creation delay can be proven finished by an absence check.
+Unregistered native process groups and legacy containers require operator review;
+recovery never guesses from PIDs, worker names, or path prefixes. GitHub requests
+already accepted remotely retain the ambiguity described above.
+
+For diagnostics or a bounded reconciliation without leasing new work, use
+`donkeyspace-worker --recover-once`. It requires the same database and Docker
+endpoint as the owning worker. An unsuccessful pass exits nonzero; individual
+container failures remain in `container_cleanup_observations` for retry. A zero
+exit status alone does not assert every orphan was removed.
 
 ## Regression and live validation
 
@@ -185,3 +224,20 @@ The harness stops its API/workers, removes its containers and labels, and leaves
 the new issue closed. Retain evidence and logs, then remove the disposable database
 container and temporary workspaces after inspection. Never reuse a terminated
 historical run or point the harness at an existing stack database.
+
+Add `DONKEYSPACE_RECOVERY_LIVE_TEST=1` (separately from the PR scenario) to SIGKILL
+the fresh worker in both generations. The first open workflow verifies expiry,
+no replay, ownership-mismatch refusal, cleanup retry, needs-human labeling, and
+late container materialization after a prior successful absence check. The second
+verifies closed-workflow recovery after Docker unavailability, with duplicate
+close delivery and preserved launch history. The deterministic late-materialization
+fixture recreates the registered resource; it does not delay an actual daemon
+create request. The ordinary closure mode still validates healthy supervision.
+
+The database regression
+`expired_coordinators_are_fenced_once_and_cleanup_requires_all_owning_daemons`
+covers concurrent recoverers, busy locks, healthy roots/children, lease expiry,
+late writes, daemon ownership, failed observations, retained tombstones, reopen,
+and unknown legacy ownership. Run all DB regressions with `--ignored --test-threads=1`
+in the isolated test database; concurrent migration setup can otherwise contend
+with active fixtures.

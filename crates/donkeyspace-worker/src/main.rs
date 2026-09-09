@@ -34,6 +34,7 @@ use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cancellation;
+mod execution_recovery;
 mod llm_triage;
 mod plugin_container;
 mod plugin_flow;
@@ -122,6 +123,9 @@ struct Args {
     lease_seconds: i32,
     #[arg(long, default_value_t = false)]
     once: bool,
+    /// Run one bounded recovery pass without leasing or replaying work.
+    #[arg(long, conflicts_with = "once")]
+    recover_once: bool,
     #[arg(long, env = "DONKEYSPACE_GITHUB_TOKEN", hide_env_values = true)]
     github_token: Option<String>,
     #[arg(long, env = "DONKEYSPACE_TRIAGE_PROVIDER", default_value = "auto")]
@@ -260,6 +264,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(provider) = &github_auth {
         let _ = GITHUB_AUTH.set(provider.clone());
     }
+
+    if args.recover_once {
+        let pool = pool.as_ref().ok_or("recovery requires a database")?;
+        return tokio::time::timeout(
+            Duration::from_secs(30),
+            execution_recovery::reconcile(pool, &policy.workflow.state_labels),
+        )
+        .await?
+        .map_err(|error| error as Box<dyn std::error::Error>);
+    }
+
+    // Keep recovery alive even while the main loop is awaiting an agent.
+    // Runtime shutdown aborts this task; each pass is bounded and retryable.
+    let _recovery = pool.as_ref().map(|pool| {
+        tokio::spawn(execution_recovery::run(
+            pool.clone(),
+            policy.workflow.state_labels.clone(),
+        ))
+    });
 
     let mut label_synced_repositories = HashSet::new();
 
