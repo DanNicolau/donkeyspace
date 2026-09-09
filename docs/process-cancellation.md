@@ -32,15 +32,11 @@ names and labels contain no agent environment values. Cleanup is bounded to ten
 seconds, and failure is logged and returned rather than hidden. A caller waiting
 for cancellation therefore waits for termination and cleanup, not just a signal.
 
-This is the process-supervision slice of
-[issue #28](https://github.com/DanNicolau/donkeyspace/issues/28). It does **not**
-connect GitHub closure or dashboard actions to cancellation yet. Atomic workflow
-closure, persisted cancellation requests, lease heartbeats, orphan reconciliation,
-workflow/job container identity, publication fencing, and fresh reopen semantics
-remain subsequent work. A worker crash or a Docker-daemon creation race must be
-handled by that reconciliation layer; this change does not establish the full
-workflow cancellation acceptance criteria. Manual cancellation API/UI is also
-still pending. No database or policy migration is needed for this slice.
+GitHub closure now connects to this supervisor through durable job cancellation.
+See [closed workflows](closed-workflows.md) for the database migration, execution
+fencing, live test, and remaining scope of
+[issue #28](https://github.com/DanNicolau/donkeyspace/issues/28), including crash
+reconciliation and manual cancellation API/UI.
 
 ## Validation
 

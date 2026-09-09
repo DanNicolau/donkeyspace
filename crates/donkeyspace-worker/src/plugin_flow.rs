@@ -1081,215 +1081,227 @@ async fn run_work_item_lifecycle(
             && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
         {
-            if rerun_start && !accept_start_projection {
-                let active_ids = work_items
-                    .iter()
-                    .map(|item| item.id.as_str())
-                    .collect::<BTreeSet<_>>();
-                if let Some(tracking) = &tracking {
-                    for item in
-                        list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
+            let tracking_ref = tracking
+                .as_ref()
+                .expect("GitHub projection requires tracking");
+            crate::cancellation::side_effect(
+                tracking_ref.pool,
+                tracking_ref.coordinator.id,
+                async {
+                    if rerun_start && !accept_start_projection {
+                        let active_ids = work_items
+                            .iter()
+                            .map(|item| item.id.as_str())
+                            .collect::<BTreeSet<_>>();
+                        if let Some(tracking) = &tracking {
+                            for item in list_projected_work_items_for_run(
+                                tracking.pool,
+                                tracking.coordinator.id,
+                            )
                             .await?
                             .into_iter()
                             .filter(|item| {
                                 !item.accepted && !active_ids.contains(item.work_item.as_str())
-                            })
-                    {
-                        if let Some(issue_number) = item.issue_number {
-                            github.close_issue(owner, repo, issue_number).await?;
+                            }) {
+                                if let Some(issue_number) = item.issue_number {
+                                    github.close_issue(owner, repo, issue_number).await?;
+                                }
+                                projected_issues.remove(&item.work_item);
+                            }
                         }
-                        projected_issues.remove(&item.work_item);
                     }
-                }
-            }
-            if accept_start_projection {
-                let active_ids = work_items
-                    .iter()
-                    .map(|item| item.id.as_str())
-                    .collect::<BTreeSet<_>>();
-                let removed = projected_issues
-                    .iter()
-                    .filter(|(id, _)| !active_ids.contains(id.as_str()))
-                    .map(|(id, number)| (id.clone(), *number))
-                    .collect::<Vec<_>>();
-                for (id, issue_number) in removed {
-                    github.close_issue(owner, repo, issue_number).await?;
-                    projected_issues.remove(&id);
-                    if let (Some(tracking), Some(checkpoint)) = (&tracking, &checkpoint) {
-                        for tracked in checkpoint
-                            .tracked_jobs
+                    if accept_start_projection {
+                        let active_ids = work_items
                             .iter()
-                            .filter(|tracked| tracked.key.work_item.as_deref() == Some(id.as_str()))
-                        {
-                            supersede_job(
-                                tracking.pool,
-                                tracked.job_id,
-                                "The approved architect checkpoint removed this work item.",
+                            .map(|item| item.id.as_str())
+                            .collect::<BTreeSet<_>>();
+                        let removed = projected_issues
+                            .iter()
+                            .filter(|(id, _)| !active_ids.contains(id.as_str()))
+                            .map(|(id, number)| (id.clone(), *number))
+                            .collect::<Vec<_>>();
+                        for (id, issue_number) in removed {
+                            github.close_issue(owner, repo, issue_number).await?;
+                            projected_issues.remove(&id);
+                            if let (Some(tracking), Some(checkpoint)) = (&tracking, &checkpoint) {
+                                for tracked in checkpoint.tracked_jobs.iter().filter(|tracked| {
+                                    tracked.key.work_item.as_deref() == Some(id.as_str())
+                                }) {
+                                    supersede_job(
+                                        tracking.pool,
+                                        tracked.job_id,
+                                        "The approved architect checkpoint removed this work item.",
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+                    let run_publications = if let Some(tracking) = &tracking {
+                        list_agent_publications_for_run(
+                            tracking.pool,
+                            tracking.coordinator.id,
+                            Some(tracking.coordinator.id),
+                        )
+                        .await?
+                    } else {
+                        Vec::new()
+                    };
+                    let projection_records = if let Some(tracking) = &tracking {
+                        list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
+                            .await?
+                    } else {
+                        Vec::new()
+                    };
+                    let proposed_publication = run_publications
+                        .iter()
+                        .filter(|publication| {
+                            publication.kind == "checkpoint" && publication.status == "published"
+                        })
+                        .max_by_key(|publication| publication.id);
+                    let github_work_items = work_items
+                        .iter()
+                        .map(|item| {
+                            let accepted_commit = if accept_start_projection {
+                                proposed_publication
+                                    .map(|publication| publication.commit_sha.clone())
+                            } else {
+                                projection_records
+                                    .iter()
+                                    .find(|record| record.work_item == item.id)
+                                    .and_then(|record| record.accepted_publication_id)
+                                    .and_then(|id| {
+                                        run_publications
+                                            .iter()
+                                            .find(|publication| publication.id == id)
+                                    })
+                                    .map(|publication| publication.commit_sha.clone())
+                            };
+                            GitHubWorkItem {
+                                id: item.id.clone(),
+                                spec: item.spec.clone(),
+                                body: fs::read_to_string(repo_path.join(&item.spec))
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(50_000)
+                                    .collect(),
+                                depends_on: item.depends_on.clone(),
+                                proposed_commit: proposed_publication
+                                    .as_ref()
+                                    .map(|publication| publication.commit_sha.clone()),
+                                proposed_commit_url: proposed_publication
+                                    .as_ref()
+                                    .and_then(|publication| publication.commit_url.clone()),
+                                proposed_compare_url: proposed_publication
+                                    .as_ref()
+                                    .and_then(|publication| publication.compare_url.clone()),
+                                accepted_commit,
+                                accepted: accept_start_projection,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
+                    if let Some(workflow_item_id) = tracking
+                        .as_ref()
+                        .and_then(|tracking| tracking.coordinator.workflow_item_id)
+                    {
+                        for item in &github_work_items {
+                            let digest = format!("{:x}", Sha256::digest(item.body.as_bytes()));
+                            upsert_projected_work_item(
+                                tracking
+                                    .as_ref()
+                                    .expect("tracking exists when workflow id exists")
+                                    .pool,
+                                &ProjectedWorkItemInput {
+                                    workflow_item_id,
+                                    coordinator_job_id: tracking
+                                        .as_ref()
+                                        .expect("tracking exists")
+                                        .coordinator
+                                        .id,
+                                    work_item: item.id.clone(),
+                                    spec_path: item.spec.clone(),
+                                    body_digest: digest,
+                                    managed_dependencies: json!(item.depends_on),
+                                    proposed_publication_id: proposed_publication
+                                        .map(|publication| publication.id),
+                                },
                             )
                             .await?;
                         }
                     }
-                }
-            }
-            let run_publications = if let Some(tracking) = &tracking {
-                list_agent_publications_for_run(
-                    tracking.pool,
-                    tracking.coordinator.id,
-                    Some(tracking.coordinator.id),
-                )
-                .await?
-            } else {
-                Vec::new()
-            };
-            let projection_records = if let Some(tracking) = &tracking {
-                list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id).await?
-            } else {
-                Vec::new()
-            };
-            let proposed_publication = run_publications
-                .iter()
-                .filter(|publication| {
-                    publication.kind == "checkpoint" && publication.status == "published"
-                })
-                .max_by_key(|publication| publication.id);
-            let github_work_items = work_items
-                .iter()
-                .map(|item| {
-                    let accepted_commit = if accept_start_projection {
-                        proposed_publication.map(|publication| publication.commit_sha.clone())
-                    } else {
-                        projection_records
-                            .iter()
-                            .find(|record| record.work_item == item.id)
-                            .and_then(|record| record.accepted_publication_id)
-                            .and_then(|id| {
-                                run_publications
-                                    .iter()
-                                    .find(|publication| publication.id == id)
-                            })
-                            .map(|publication| publication.commit_sha.clone())
-                    };
-                    GitHubWorkItem {
-                        id: item.id.clone(),
-                        spec: item.spec.clone(),
-                        body: fs::read_to_string(repo_path.join(&item.spec))
-                            .unwrap_or_default()
-                            .chars()
-                            .take(50_000)
-                            .collect(),
-                        depends_on: item.depends_on.clone(),
-                        proposed_commit: proposed_publication
-                            .as_ref()
-                            .map(|publication| publication.commit_sha.clone()),
-                        proposed_commit_url: proposed_publication
-                            .as_ref()
-                            .and_then(|publication| publication.commit_url.clone()),
-                        proposed_compare_url: proposed_publication
-                            .as_ref()
-                            .and_then(|publication| publication.compare_url.clone()),
-                        accepted_commit,
-                        accepted: accept_start_projection,
+
+                    if rerun_start || accept_start_projection {
+                        for item in &github_work_items {
+                            let Some(issue_number) = projected_issues.get(&item.id) else {
+                                continue;
+                            };
+                            github
+                                .update_projected_work_item(
+                                    owner,
+                                    repo,
+                                    parent_issue_number,
+                                    *issue_number,
+                                    item,
+                                )
+                                .await?;
+                            if let Some(tracking) = &tracking {
+                                mark_projected_work_item_applied(
+                                    tracking.pool,
+                                    tracking.coordinator.id,
+                                    &item.id,
+                                    None,
+                                    *issue_number,
+                                    accept_start_projection,
+                                )
+                                .await?;
+                            }
+                        }
                     }
-                })
-                .collect::<Vec<_>>();
 
-            if let Some(workflow_item_id) = tracking
-                .as_ref()
-                .and_then(|tracking| tracking.coordinator.workflow_item_id)
-            {
-                for item in &github_work_items {
-                    let digest = format!("{:x}", Sha256::digest(item.body.as_bytes()));
-                    upsert_projected_work_item(
-                        tracking
-                            .as_ref()
-                            .expect("tracking exists when workflow id exists")
-                            .pool,
-                        &ProjectedWorkItemInput {
-                            workflow_item_id,
-                            coordinator_job_id: tracking
-                                .as_ref()
-                                .expect("tracking exists")
-                                .coordinator
-                                .id,
-                            work_item: item.id.clone(),
-                            spec_path: item.spec.clone(),
-                            body_digest: digest,
-                            managed_dependencies: json!(item.depends_on),
-                            proposed_publication_id: proposed_publication
-                                .map(|publication| publication.id),
-                        },
-                    )
-                    .await?;
-                }
-            }
-
-            if rerun_start || accept_start_projection {
-                for item in &github_work_items {
-                    let Some(issue_number) = projected_issues.get(&item.id) else {
-                        continue;
-                    };
-                    github
-                        .update_projected_work_item(
-                            owner,
-                            repo,
-                            parent_issue_number,
-                            *issue_number,
-                            item,
-                        )
+                    let github_work_items = github_work_items
+                        .into_iter()
+                        .filter(|item| !projected_issues.contains_key(&item.id))
+                        .collect::<Vec<_>>();
+                    let issues = github
+                        .project_work_items(owner, repo, parent_issue_number, &github_work_items)
                         .await?;
+                    if let Some(tracking) = &tracking
+                        && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
+                    {
+                        for (work_item, issue) in &issues {
+                            record_github_managed_resource_for_workflow_item(
+                                tracking.pool,
+                                workflow_item_id,
+                                "issue",
+                                &issue.id.to_string(),
+                                &json!({"work_item": work_item, "issue_number": issue.number}),
+                            )
+                            .await?;
+                        }
+                    }
                     if let Some(tracking) = &tracking {
-                        mark_projected_work_item_applied(
-                            tracking.pool,
-                            tracking.coordinator.id,
-                            &item.id,
-                            None,
-                            *issue_number,
-                            accept_start_projection,
-                        )
-                        .await?;
+                        for (work_item, issue) in &issues {
+                            mark_projected_work_item_applied(
+                                tracking.pool,
+                                tracking.coordinator.id,
+                                work_item,
+                                Some(&issue.id.to_string()),
+                                issue.number,
+                                accept_start_projection,
+                            )
+                            .await?;
+                        }
                     }
-                }
-            }
-
-            let github_work_items = github_work_items
-                .into_iter()
-                .filter(|item| !projected_issues.contains_key(&item.id))
-                .collect::<Vec<_>>();
-            let issues = github
-                .project_work_items(owner, repo, parent_issue_number, &github_work_items)
-                .await?;
-            if let Some(tracking) = &tracking
-                && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
-            {
-                for (work_item, issue) in &issues {
-                    record_github_managed_resource_for_workflow_item(
-                        tracking.pool,
-                        workflow_item_id,
-                        "issue",
-                        &issue.id.to_string(),
-                        &json!({"work_item": work_item, "issue_number": issue.number}),
-                    )
-                    .await?;
-                }
-            }
-            if let Some(tracking) = &tracking {
-                for (work_item, issue) in &issues {
-                    mark_projected_work_item_applied(
-                        tracking.pool,
-                        tracking.coordinator.id,
-                        work_item,
-                        Some(&issue.id.to_string()),
-                        issue.number,
-                        accept_start_projection,
-                    )
-                    .await?;
-                }
-            }
-            projected_issues.extend(
-                issues
-                    .into_iter()
-                    .map(|(work_item, issue)| (work_item, issue.number)),
-            );
+                    projected_issues.extend(
+                        issues
+                            .into_iter()
+                            .map(|(work_item, issue)| (work_item, issue.number)),
+                    );
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                },
+            )
+            .await?;
         }
     }
 
@@ -1642,116 +1654,120 @@ async fn run_work_item_lifecycle(
                     })
                     .max_by_key(|publication| publication.id)
                     .ok_or("architect repair has no published checkpoint")?;
-                let records =
-                    list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
-                        .await?;
-                let active_ids = revised_work_items
-                    .iter()
-                    .map(|item| item.id.as_str())
-                    .collect::<BTreeSet<_>>();
-                for removed in records.iter().filter(|record| {
-                    !record.accepted && !active_ids.contains(record.work_item.as_str())
-                }) {
-                    if let Some(issue_number) = removed.issue_number {
-                        github.close_issue(owner, repo, issue_number).await?;
-                    }
-                    projected_issues.remove(&removed.work_item);
-                }
-                let desired = revised_work_items
-                    .iter()
-                    .map(|item| {
-                        let accepted_commit = records
-                            .iter()
-                            .find(|record| record.work_item == item.id)
-                            .and_then(|record| record.accepted_publication_id)
-                            .and_then(|id| {
-                                publications.iter().find(|publication| publication.id == id)
-                            })
-                            .map(|publication| publication.commit_sha.clone());
-                        GitHubWorkItem {
-                            id: item.id.clone(),
-                            spec: item.spec.clone(),
-                            body: fs::read_to_string(repo_path.join(&item.spec))
-                                .unwrap_or_default()
-                                .chars()
-                                .take(50_000)
-                                .collect(),
-                            depends_on: item.depends_on.clone(),
-                            proposed_commit: Some(proposed.commit_sha.clone()),
-                            proposed_commit_url: proposed.commit_url.clone(),
-                            proposed_compare_url: proposed.compare_url.clone(),
-                            accepted_commit,
-                            accepted: false,
+                crate::cancellation::side_effect(tracking.pool, tracking.coordinator.id, async {
+                    let records =
+                        list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
+                            .await?;
+                    let active_ids = revised_work_items
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<BTreeSet<_>>();
+                    for removed in records.iter().filter(|record| {
+                        !record.accepted && !active_ids.contains(record.work_item.as_str())
+                    }) {
+                        if let Some(issue_number) = removed.issue_number {
+                            github.close_issue(owner, repo, issue_number).await?;
                         }
-                    })
-                    .collect::<Vec<_>>();
-                for item in &desired {
-                    upsert_projected_work_item(
-                        tracking.pool,
-                        &ProjectedWorkItemInput {
-                            workflow_item_id,
-                            coordinator_job_id: tracking.coordinator.id,
-                            work_item: item.id.clone(),
-                            spec_path: item.spec.clone(),
-                            body_digest: format!("{:x}", Sha256::digest(item.body.as_bytes())),
-                            managed_dependencies: json!(item.depends_on),
-                            proposed_publication_id: Some(proposed.id),
-                        },
-                    )
-                    .await?;
-                    if let Some(issue_number) = projected_issues.get(&item.id) {
-                        github
-                            .update_projected_work_item(
-                                owner,
-                                repo,
-                                parent_issue_number,
+                        projected_issues.remove(&removed.work_item);
+                    }
+                    let desired = revised_work_items
+                        .iter()
+                        .map(|item| {
+                            let accepted_commit = records
+                                .iter()
+                                .find(|record| record.work_item == item.id)
+                                .and_then(|record| record.accepted_publication_id)
+                                .and_then(|id| {
+                                    publications.iter().find(|publication| publication.id == id)
+                                })
+                                .map(|publication| publication.commit_sha.clone());
+                            GitHubWorkItem {
+                                id: item.id.clone(),
+                                spec: item.spec.clone(),
+                                body: fs::read_to_string(repo_path.join(&item.spec))
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(50_000)
+                                    .collect(),
+                                depends_on: item.depends_on.clone(),
+                                proposed_commit: Some(proposed.commit_sha.clone()),
+                                proposed_commit_url: proposed.commit_url.clone(),
+                                proposed_compare_url: proposed.compare_url.clone(),
+                                accepted_commit,
+                                accepted: false,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    for item in &desired {
+                        upsert_projected_work_item(
+                            tracking.pool,
+                            &ProjectedWorkItemInput {
+                                workflow_item_id,
+                                coordinator_job_id: tracking.coordinator.id,
+                                work_item: item.id.clone(),
+                                spec_path: item.spec.clone(),
+                                body_digest: format!("{:x}", Sha256::digest(item.body.as_bytes())),
+                                managed_dependencies: json!(item.depends_on),
+                                proposed_publication_id: Some(proposed.id),
+                            },
+                        )
+                        .await?;
+                        if let Some(issue_number) = projected_issues.get(&item.id) {
+                            github
+                                .update_projected_work_item(
+                                    owner,
+                                    repo,
+                                    parent_issue_number,
+                                    *issue_number,
+                                    item,
+                                )
+                                .await?;
+                            mark_projected_work_item_applied(
+                                tracking.pool,
+                                tracking.coordinator.id,
+                                &item.id,
+                                None,
                                 *issue_number,
-                                item,
+                                false,
                             )
                             .await?;
+                        }
+                    }
+                    let new_items = desired
+                        .iter()
+                        .filter(|item| !projected_issues.contains_key(&item.id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let issues = github
+                        .project_work_items(owner, repo, parent_issue_number, &new_items)
+                        .await?;
+                    for (work_item, issue) in &issues {
+                        record_github_managed_resource_for_workflow_item(
+                            tracking.pool,
+                            workflow_item_id,
+                            "issue",
+                            &issue.id.to_string(),
+                            &json!({"work_item": work_item, "issue_number": issue.number}),
+                        )
+                        .await?;
                         mark_projected_work_item_applied(
                             tracking.pool,
                             tracking.coordinator.id,
-                            &item.id,
-                            None,
-                            *issue_number,
+                            work_item,
+                            Some(&issue.id.to_string()),
+                            issue.number,
                             false,
                         )
                         .await?;
                     }
-                }
-                let new_items = desired
-                    .iter()
-                    .filter(|item| !projected_issues.contains_key(&item.id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let issues = github
-                    .project_work_items(owner, repo, parent_issue_number, &new_items)
-                    .await?;
-                for (work_item, issue) in &issues {
-                    record_github_managed_resource_for_workflow_item(
-                        tracking.pool,
-                        workflow_item_id,
-                        "issue",
-                        &issue.id.to_string(),
-                        &json!({"work_item": work_item, "issue_number": issue.number}),
-                    )
-                    .await?;
-                    mark_projected_work_item_applied(
-                        tracking.pool,
-                        tracking.coordinator.id,
-                        work_item,
-                        Some(&issue.id.to_string()),
-                        issue.number,
-                        false,
-                    )
-                    .await?;
-                }
-                projected_issues.extend(
-                    issues
-                        .into_iter()
-                        .map(|(work_item, issue)| (work_item, issue.number)),
-                );
+                    projected_issues.extend(
+                        issues
+                            .into_iter()
+                            .map(|(work_item, issue)| (work_item, issue.number)),
+                    );
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })
+                .await?;
             }
             let completed = graph.completed_keys().cloned().collect::<Vec<_>>();
             let mut revised_graph = TaskGraph::for_work_items(flow, &revised_work_items);
@@ -2250,19 +2266,30 @@ async fn run_work_item_lifecycle(
         if let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), _) = github_coordinates
         {
-            for item in &work_items {
-                if graph.work_item_is_complete(&item.id)
-                    && closed_projected_issues.insert(item.id.clone())
-                    && let Some(issue_number) = projected_issues.get(&item.id)
-                    && let Err(error) = github.close_issue(owner, repo, *issue_number).await
-                {
-                    tracing::warn!(
-                        %error,
-                        work_item = item.id,
-                        "failed to close projected github work-item issue"
-                    );
-                }
-            }
+            let tracking_ref = tracking
+                .as_ref()
+                .expect("GitHub projection requires tracking");
+            crate::cancellation::side_effect(
+                tracking_ref.pool,
+                tracking_ref.coordinator.id,
+                async {
+                    for item in &work_items {
+                        if graph.work_item_is_complete(&item.id)
+                            && closed_projected_issues.insert(item.id.clone())
+                            && let Some(issue_number) = projected_issues.get(&item.id)
+                            && let Err(error) = github.close_issue(owner, repo, *issue_number).await
+                        {
+                            tracing::warn!(
+                                %error,
+                                work_item = item.id,
+                                "failed to close projected github work-item issue"
+                            );
+                        }
+                    }
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                },
+            )
+            .await?;
         }
     }
 

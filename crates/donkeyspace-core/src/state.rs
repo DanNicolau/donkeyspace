@@ -37,6 +37,9 @@ pub enum WorkflowState {
     PrOpen,
     NeedsHuman,
     Blocked,
+    Finished,
+    Cancelling,
+    Cancelled,
 }
 
 impl WorkflowState {
@@ -49,6 +52,9 @@ impl WorkflowState {
             Self::PrOpen => "pr_open",
             Self::NeedsHuman => "needs_human",
             Self::Blocked => "blocked",
+            Self::Finished => "finished",
+            Self::Cancelling => "cancelling",
+            Self::Cancelled => "cancelled",
         }
     }
 }

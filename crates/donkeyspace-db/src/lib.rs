@@ -1,3 +1,5 @@
+pub mod cancellation;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +11,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum DbError {
+    #[error("workflow execution was cancelled or superseded")]
+    ExecutionCancelled,
     #[error("database url is empty")]
     EmptyDatabaseUrl,
     #[error("database error: {0}")]
@@ -55,6 +59,11 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
         .await?;
     sqlx::raw_sql(include_str!(
         "../../../migrations/0002_reviewable_checkpoints.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0003_workflow_cancellation.sql"
     ))
     .execute(&mut *transaction)
     .await?;
@@ -600,6 +609,7 @@ pub async fn get_workflow_item_state(
             SELECT status, result
             FROM jobs
             WHERE jobs.workflow_item_id = workflow_items.id
+              AND jobs.generation = workflow_items.generation
               AND jobs.role = 'triage'
             ORDER BY jobs.created_at DESC
             LIMIT 1
@@ -736,6 +746,7 @@ pub async fn list_open_managed_pull_requests_for_base(
           AND state = 'open'
           AND managed_by_donkeyspace = true
           AND workflow_item_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM workflow_items w WHERE w.id=pull_requests.workflow_item_id AND w.generation=pull_requests.generation AND w.provider_state <> 'closed')
         ORDER BY updated_at ASC
         "#,
     )
@@ -1208,6 +1219,7 @@ pub async fn list_ready_developer_candidates(
             SELECT jobs.input
             FROM jobs
             WHERE jobs.workflow_item_id = workflow_items.id
+              AND jobs.generation = workflow_items.generation
               AND jobs.role = 'triage'
               AND jobs.status = 'completed'
             ORDER BY jobs.created_at DESC
@@ -1304,6 +1316,11 @@ pub async fn record_state_transition(
     reason: &str,
 ) -> Result<(), DbError> {
     let mut transaction = pool.begin().await?;
+    let allowed: bool = sqlx::query_scalar("SELECT provider_state <> 'closed' AND ($2::uuid IS NULL OR EXISTS (SELECT 1 FROM jobs j WHERE j.id=$2 AND j.generation=workflow_items.generation AND j.status NOT IN ('cancel_requested','cancelled'))) FROM workflow_items WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(workflow_item_id).bind(job_id).fetch_one(&mut *transaction).await?;
+    if !allowed {
+        return Ok(());
+    }
     sqlx::query(
         r#"
         INSERT INTO state_transitions (workflow_item_id, job_id, from_state, to_state, reason)
@@ -1343,6 +1360,11 @@ pub async fn record_lifecycle_event(
     pool: &PgPool,
     input: &LifecycleEventInput,
 ) -> Result<Option<LifecycleEventRecord>, DbError> {
+    if let Some(job) = input.coordinator_job_id.or(input.job_id)
+        && !cancellation::job_execution_allowed(pool, job).await?
+    {
+        return Ok(None);
+    }
     Ok(sqlx::query_as::<_, LifecycleEventRecord>(
         r#"
         INSERT INTO lifecycle_events (
@@ -2087,6 +2109,7 @@ pub async fn list_workflows(
             SELECT j.*
             FROM jobs j
             WHERE j.workflow_item_id = wi.id
+              AND j.generation = wi.generation
               AND j.input #>> '{plugin_execution,coordinator_run_id}' IS NULL
             ORDER BY
                 COALESCE((j.input ->> 'donkeyspace_lifecycle_coordinator')::boolean, false) DESC,
@@ -2097,6 +2120,7 @@ pub async fn list_workflows(
             SELECT p.*
             FROM pull_requests p
             WHERE p.workflow_item_id = wi.id
+              AND p.generation = wi.generation
               AND p.managed_by_donkeyspace = true
             ORDER BY p.updated_at DESC
             LIMIT 1
@@ -2156,6 +2180,7 @@ pub async fn get_workflow_by_issue(
             SELECT j.*
             FROM jobs j
             WHERE j.workflow_item_id = wi.id
+              AND j.generation = wi.generation
               AND j.input #>> '{plugin_execution,coordinator_run_id}' IS NULL
             ORDER BY
                 COALESCE((j.input ->> 'donkeyspace_lifecycle_coordinator')::boolean, false) DESC,
@@ -2166,6 +2191,7 @@ pub async fn get_workflow_by_issue(
             SELECT p.*
             FROM pull_requests p
             WHERE p.workflow_item_id = wi.id
+              AND p.generation = wi.generation
               AND p.managed_by_donkeyspace = true
             ORDER BY p.updated_at DESC
             LIMIT 1
@@ -2358,7 +2384,7 @@ pub async fn update_workflow_item_state(
         UPDATE workflow_items
         SET current_state = $2,
             updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND provider_state <> 'closed'
         "#,
     )
     .bind(workflow_item_id)

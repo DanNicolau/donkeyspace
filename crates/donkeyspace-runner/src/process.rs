@@ -1,8 +1,82 @@
 //! Process supervision for Unix workers. Cancellation is local to an execution;
 //! callers remain responsible for workflow authorization and publication fencing.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::{future::Future, io, process::Output, process::Stdio, time::Duration};
-use tokio::{process::Command, sync::oneshot, task::JoinHandle};
+use tokio::{
+    process::Command,
+    sync::{Notify, oneshot},
+    task::JoinHandle,
+};
+
+tokio::task_local! {
+    static EXECUTION_SUPERVISORS: Vec<Arc<Supervisors>>;
+}
+
+#[derive(Default)]
+struct Supervisors {
+    active: AtomicUsize,
+    failed: AtomicBool,
+    finished: Notify,
+}
+
+struct SupervisorRegistration(Vec<Arc<Supervisors>>);
+impl SupervisorRegistration {
+    fn failed(&self) {
+        for supervisors in &self.0 {
+            supervisors.failed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for SupervisorRegistration {
+    fn drop(&mut self) {
+        for supervisors in &self.0 {
+            supervisors.active.fetch_sub(1, Ordering::SeqCst);
+            supervisors.finished.notify_one();
+        }
+    }
+}
+
+/// Drop the workflow future on cancellation, then wait for all process/container
+/// supervisors it started to finish cleanup before reporting cancellation.
+/// The workflow future must execute its commands in this task's scope.
+pub async fn run_cancellable_execution<F: Future, C: Future<Output = ()>>(
+    work: F,
+    cancel: C,
+) -> io::Result<Option<F::Output>> {
+    let supervisors = Arc::new(Supervisors::default());
+    let mut scopes = EXECUTION_SUPERVISORS
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    scopes.push(supervisors.clone());
+    let result = EXECUTION_SUPERVISORS
+        .scope(scopes, async {
+            tokio::pin!(work, cancel);
+            tokio::select! {
+                biased;
+                _ = &mut cancel => None,
+                result = &mut work => Some(result),
+            }
+        })
+        .await;
+    loop {
+        let finished = supervisors.finished.notified();
+        if supervisors.active.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        finished.await;
+    }
+    if supervisors.failed.load(Ordering::SeqCst) {
+        return Err(io::Error::other(
+            "execution cleanup failed; reconciliation required",
+        ));
+    }
+    Ok(result)
+}
 
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,7 +126,16 @@ async fn run_command_with_grace(
     let child = command.spawn()?;
     let group = ProcessGroup(child.id().expect("new child has a process id") as i32);
     let (request_cancel, cancellation) = oneshot::channel::<()>();
+    let registration = EXECUTION_SUPERVISORS
+        .try_with(|supervisors| {
+            for scope in supervisors {
+                scope.active.fetch_add(1, Ordering::SeqCst);
+            }
+            SupervisorRegistration(supervisors.clone())
+        })
+        .ok();
     let mut supervisor = tokio::spawn(async move {
+        let registration = registration;
         // Keep this guard across awaits: aborting the supervisor kills the group.
         let mut group = group;
         let execution = async {
@@ -88,6 +171,9 @@ async fn run_command_with_grace(
         // The leader is reaped and remaining descendants have been terminated.
         // Disarm before cleanup to avoid signaling a subsequently reused group ID.
         if execution.is_err() {
+            if let Some(registration) = &registration {
+                registration.failed();
+            }
             let _ = group.signal(libc::SIGKILL);
         }
         group.0 = 0;
@@ -95,6 +181,9 @@ async fn run_command_with_grace(
             // A dropped caller cannot observe the returned error. Keep cleanup
             // failures visible to operators without logging command arguments.
             tracing::warn!(%error, "execution cleanup failed");
+            if let Some(registration) = &registration {
+                registration.failed();
+            }
             return Err(error);
         }
         execution
@@ -491,5 +580,80 @@ mod tests {
             assert_eq!(output.output.stderr, b"stderr");
             assert!(fixture.0.join("cleaned").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_cancellation_waits_for_nested_supervisor_cleanup() {
+        let fixture = Fixture::new();
+        let result = run_cancellable_execution(
+            async {
+                run_cancellable_execution(
+                    async {
+                        run_command_with_grace(
+                            &mut fixture.command("trap '' TERM; touch ready; exec sleep 60"),
+                            Some(fixture.command("sleep 0.1; touch cleaned")),
+                            std::future::pending(),
+                            Duration::from_millis(100),
+                        )
+                        .await
+                        .unwrap();
+                        std::fs::write(fixture.0.join("published"), "late result").unwrap();
+                    },
+                    std::future::pending(),
+                )
+                .await
+                .unwrap();
+            },
+            wait_for_file(&fixture.0.join("ready")),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(fixture.0.join("cleaned").exists());
+        assert!(!fixture.0.join("published").exists());
+    }
+
+    #[tokio::test]
+    async fn workflow_cancellation_reports_failed_cleanup() {
+        let fixture = Fixture::new();
+        let error = run_cancellable_execution(
+            async {
+                run_command_with_grace(
+                    &mut fixture.command("touch ready; exec sleep 60"),
+                    Some(fixture.command("exit 9")),
+                    std::future::pending(),
+                    Duration::from_millis(100),
+                )
+                .await
+                .unwrap();
+            },
+            wait_for_file(&fixture.0.join("ready")),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup failed"));
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_cannot_hide_failed_cleanup() {
+        let fixture = Fixture::new();
+        let error = run_cancellable_execution(
+            async {
+                // A workflow can handle a command error and return before the
+                // cancellation monitor polls. Its scope must still report the
+                // cleanup failure so the worker cannot acknowledge cancellation.
+                let _ = run_command_with_grace(
+                    &mut fixture.command("exit 0"),
+                    Some(fixture.command("exit 9")),
+                    std::future::pending(),
+                    Duration::from_millis(100),
+                )
+                .await;
+            },
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup failed"));
     }
 }
