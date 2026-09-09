@@ -158,6 +158,9 @@ fn workflow_label_text(state: WorkflowState) -> &'static str {
         WorkflowState::PrOpen => "ai:pr-open",
         WorkflowState::NeedsHuman => "ai:needs-human",
         WorkflowState::Blocked => "ai:blocked",
+        WorkflowState::Finished => "ai:finished",
+        WorkflowState::Cancelling => "ai:cancelling",
+        WorkflowState::Cancelled => "ai:cancelled",
     }
 }
 

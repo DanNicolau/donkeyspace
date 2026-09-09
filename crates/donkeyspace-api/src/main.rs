@@ -27,7 +27,7 @@ use donkeyspace_db::{
     record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
     requeue_failed_job, resume_latest_paused_job, retry_agent_publication,
     retry_projected_work_items, reviewer_job_exists_for_pr_head, update_workflow_item_state,
-    upsert_pull_request, upsert_repository, upsert_workflow_item, webhook_delivery_exists,
+    upsert_pull_request, upsert_repository, webhook_delivery_exists,
 };
 use donkeyspace_github::{
     GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider, file_url,
@@ -2400,11 +2400,9 @@ async fn persist_issue_webhook(
     )
     .await?;
 
-    let inserted =
-        record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
-    let Some(webhook_delivery_id) = inserted else {
+    if webhook_delivery_exists(pool, delivery).await? {
         return Ok(WebhookPersistOutcome::Duplicate);
-    };
+    }
 
     let labels = payload
         .issue
@@ -2420,20 +2418,64 @@ async fn persist_issue_webhook(
     };
     let previous_state =
         get_workflow_item_state(pool, repository_id, &payload.issue.id.to_string()).await?;
+    let was_finished = previous_state.as_deref() == Some("finished");
     let current_state = label_state_name.or(previous_state);
+    // GitHub issue timestamps have second precision. Verify lifecycle edges
+    // against GitHub so a delayed event from the same second cannot close a
+    // reopened workflow or reopen an issue that is currently closed.
+    if (matches!(payload.action.as_str(), "opened" | "closed" | "reopened")
+        || payload.issue.state == "closed"
+        || was_finished)
+        && let Some(auth) = &app_state.github_auth
+    {
+        let currently_closed = auth
+            .client()
+            .issue_is_closed(
+                &payload.repository.owner.login,
+                &payload.repository.name,
+                payload.issue.number,
+            )
+            .await?;
+        if currently_closed != (payload.issue.state == "closed") {
+            return Ok(WebhookPersistOutcome::Ignored);
+        }
+    }
 
-    let workflow_item_id = upsert_workflow_item(
+    let Some(workflow_item_id) = donkeyspace_db::cancellation::observe_issue(
         pool,
-        &WorkflowItemInput {
-            repository_id,
-            provider_issue_id: payload.issue.id.to_string(),
-            issue_number: payload.issue.number,
-            provider_state: payload.issue.state.clone(),
-            current_state: current_state.clone(),
-            current_labels: labels.clone(),
+        &donkeyspace_db::cancellation::IssueObservation {
+            issue: &WorkflowItemInput {
+                repository_id,
+                provider_issue_id: payload.issue.id.to_string(),
+                issue_number: payload.issue.number,
+                provider_state: payload.issue.state.clone(),
+                current_state: current_state.clone(),
+                current_labels: labels.clone(),
+            },
+            updated_at: payload.issue.updated_at,
+            close_reason: payload.issue.state_reason.as_deref(),
+            owner: &payload.repository.owner.login,
+            repo: &payload.repository.name,
+            state_labels: policy.workflow.state_labels.values().cloned().collect(),
         },
     )
-    .await?;
+    .await?
+    else {
+        return Ok(WebhookPersistOutcome::Ignored);
+    };
+    // Closure is convergent and committed before delivery deduplication, so a
+    // failed persistence attempt can be retried without losing cancellation.
+    let inserted =
+        record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
+    let Some(webhook_delivery_id) = inserted else {
+        return Ok(WebhookPersistOutcome::Duplicate);
+    };
+
+    let current_state =
+        get_workflow_item_state(pool, repository_id, &payload.issue.id.to_string()).await?;
+    if payload.issue.state == "closed" {
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
 
     if matches!(label_state, LabelState::Conflict(_)) {
         record_state_transition(
@@ -2445,16 +2487,6 @@ async fn persist_issue_webhook(
             "conflicting ai workflow labels detected",
         )
         .await?;
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    if payload.issue.state == "closed" {
-        tracing::info!(
-            event,
-            action = payload.action,
-            issue_number = payload.issue.number,
-            "closed issue did not queue agent work"
-        );
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
@@ -2858,6 +2890,15 @@ async fn persist_pull_request_webhook(
         );
         return Ok(WebhookPersistOutcome::Ignored);
     };
+    if !donkeyspace_db::cancellation::pull_request_is_current(
+        pool,
+        workflow_item.id,
+        &payload.pull_request.id.to_string(),
+    )
+    .await?
+    {
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
     let linked_issue_number = linked_issue_number
         .expect("a matched pull request workflow item has a linked issue number");
 
@@ -3563,6 +3604,10 @@ struct GitHubOwner {
 
 #[derive(Debug, Deserialize)]
 struct GitHubIssue {
+    #[serde(default)]
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    state_reason: Option<String>,
     id: i64,
     number: i64,
     state: String,
@@ -4119,6 +4164,8 @@ mod tests {
                 },
             },
             issue: GitHubIssue {
+                updated_at: None,
+                state_reason: None,
                 id: 7,
                 number: 7,
                 state: "open".into(),

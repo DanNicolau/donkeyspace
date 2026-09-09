@@ -1081,6 +1081,14 @@ async fn run_work_item_lifecycle(
             && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
         {
+            let tracking_ref = tracking
+                .as_ref()
+                .expect("GitHub projection requires tracking");
+            let _side_effect_guard = donkeyspace_db::cancellation::lock_job_side_effect(
+                tracking_ref.pool,
+                tracking_ref.coordinator.id,
+            )
+            .await?;
             if rerun_start && !accept_start_projection {
                 let active_ids = work_items
                     .iter()
@@ -1642,6 +1650,11 @@ async fn run_work_item_lifecycle(
                     })
                     .max_by_key(|publication| publication.id)
                     .ok_or("architect repair has no published checkpoint")?;
+                let _side_effect_guard = donkeyspace_db::cancellation::lock_job_side_effect(
+                    tracking.pool,
+                    tracking.coordinator.id,
+                )
+                .await?;
                 let records =
                     list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
                         .await?;
@@ -2250,6 +2263,14 @@ async fn run_work_item_lifecycle(
         if let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), _) = github_coordinates
         {
+            let tracking_ref = tracking
+                .as_ref()
+                .expect("GitHub projection requires tracking");
+            let _side_effect_guard = donkeyspace_db::cancellation::lock_job_side_effect(
+                tracking_ref.pool,
+                tracking_ref.coordinator.id,
+            )
+            .await?;
             for item in &work_items {
                 if graph.work_item_is_complete(&item.id)
                     && closed_projected_issues.insert(item.id.clone())

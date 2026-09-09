@@ -1,10 +1,11 @@
 use donkeyspace_core::{Outcome, PluginArtifact, PluginArtifactType};
+use donkeyspace_db::cancellation::update_workflow_state_for_job;
 use donkeyspace_db::{
     AgentPublicationInput, AgentPublicationRecord, LifecycleEventInput, OutboundActionInput,
     OutboundActionRecord, PgPool, get_workflow_by_issue, list_agent_publications_for_run,
     list_jobs_for_workflow_item, list_lifecycle_events, mark_agent_publication_failed,
-    mark_agent_publication_published, record_lifecycle_event, update_workflow_item_state,
-    upsert_agent_publication, upsert_pending_outbound_action,
+    mark_agent_publication_published, record_lifecycle_event, upsert_agent_publication,
+    upsert_pending_outbound_action,
 };
 use donkeyspace_github::{branch_url, commit_url, compare_url, file_url};
 use serde_json::{Value, json};
@@ -63,7 +64,13 @@ pub async fn publish_checkpoint(
     commit_title: &str,
 ) -> Result<AgentPublicationRecord, Box<dyn std::error::Error>> {
     if let Some(workflow_item_id) = context.workflow_item_id {
-        update_workflow_item_state(context.pool, workflow_item_id, "publishing").await?;
+        update_workflow_state_for_job(
+            context.pool,
+            workflow_item_id,
+            context.coordinator_job_id,
+            "publishing",
+        )
+        .await?;
     }
     let branch = issue_branch_name(
         &active_facade().branch_prefix,
@@ -121,7 +128,13 @@ pub async fn publish_checkpoint(
     .await?;
     push_publication(context, &record).await?;
     if let Some(workflow_item_id) = context.workflow_item_id {
-        update_workflow_item_state(context.pool, workflow_item_id, "in_progress").await?;
+        update_workflow_state_for_job(
+            context.pool,
+            workflow_item_id,
+            context.coordinator_job_id,
+            "in_progress",
+        )
+        .await?;
     }
     record_publication_event(context, &record).await?;
     queue_status_comment(context, None).await?;
@@ -687,6 +700,11 @@ pub async fn push_existing_publication(
     workspace_path: &Path,
     publication: &AgentPublicationRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !donkeyspace_db::cancellation::job_execution_allowed(pool, publication.coordinator_job_id)
+        .await?
+    {
+        return Err(donkeyspace_db::DbError::ExecutionCancelled.into());
+    }
     let askpass = workspace_path.join("git-askpass-publication.sh");
     let result = async {
         let token = crate::current_github_token(token)
@@ -698,11 +716,15 @@ pub async fn push_existing_publication(
             "{}:refs/heads/{}",
             publication.commit_sha, publication.branch_name
         );
-        git(
-            Path::new(&publication.local_repo_path),
-            &["push", &remote, &refspec],
-            Some(&token),
-            Some(&askpass),
+        crate::cancellation::side_effect(
+            pool,
+            publication.coordinator_job_id,
+            git(
+                Path::new(&publication.local_repo_path),
+                &["push", &remote, &refspec],
+                Some(&token),
+                Some(&askpass),
+            ),
         )
         .await
     }
@@ -864,6 +886,12 @@ async fn git(
     if let Some(askpass) = askpass {
         command.env("GIT_ASKPASS", askpass);
     }
+    #[cfg(unix)]
+    let output =
+        donkeyspace_runner::process::run_command_until(&mut command, None, std::future::pending())
+            .await?
+            .output;
+    #[cfg(not(unix))]
     let output = command.output().await?;
     if !output.status.success() {
         return Err(format!(

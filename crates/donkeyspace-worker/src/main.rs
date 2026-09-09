@@ -4,6 +4,7 @@ use donkeyspace_core::{
     Confidence, DeploymentMode, Facade, Outcome, PluginManifest, Policy, Risk, RunResult,
     TestResult, TestStatus, WorkflowState, triage_github_issue_actions, workflow_state_for_outcome,
 };
+use donkeyspace_db::cancellation::update_workflow_state_for_job;
 use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, LifecycleEventInput, OutboundActionInput,
     OutboundActionRecord, acquire_next_queued_job, apply_migrations, complete_job, connect,
@@ -13,7 +14,6 @@ use donkeyspace_db::{
     list_ready_developer_candidates, list_repair_candidates, mark_job_running,
     mark_outbound_action_completed, mark_outbound_action_failed, pause_job, record_lifecycle_event,
     record_state_transition, set_checkpoint_pull_request, unpublished_agent_publications_exist,
-    update_workflow_item_state,
 };
 use donkeyspace_github::{
     GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubCredentialProvider,
@@ -33,6 +33,7 @@ use tokio::fs as tokio_fs;
 use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod cancellation;
 mod llm_triage;
 mod plugin_container;
 mod plugin_flow;
@@ -328,6 +329,16 @@ async fn poll_once(
     ready_reconcile_limit: i64,
     repair_reconcile_limit: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    donkeyspace_db::cancellation::reconcile_closed_workflows(
+        pool,
+        &policy
+            .workflow
+            .state_labels
+            .values()
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     reconcile_ready_developer_jobs(pool, policy, ready_reconcile_limit).await?;
     reconcile_pr_repair_jobs(pool, policy, repair_reconcile_limit).await?;
 
@@ -338,14 +349,19 @@ async fn poll_once(
                 role = job.role,
                 "leased queued job"
             );
-            execute_job(
+            cancellation::execute_until_cancelled(
                 pool,
-                policy,
-                triage_provider,
-                triage_client,
-                repo_context_config,
-                github_token,
-                job,
+                &job,
+                lease_seconds,
+                execute_job(
+                    pool,
+                    policy,
+                    triage_provider,
+                    triage_client,
+                    repo_context_config,
+                    github_token,
+                    job.clone(),
+                ),
             )
             .await?;
         }
@@ -626,6 +642,10 @@ async fn execute_job(
         return Ok(());
     };
 
+    if running_job.status != "running" {
+        return Ok(());
+    }
+
     if input_issue_is_closed(&running_job.input) {
         complete_ignored_closed_issue_job(pool, &running_job).await?;
         tracing::info!(
@@ -713,7 +733,13 @@ async fn execute_job(
             cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
             if let Some(workflow_item_id) = running_job.workflow_item_id {
-                update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+                update_workflow_state_for_job(
+                    pool,
+                    workflow_item_id,
+                    running_job.id,
+                    workflow_state.as_str(),
+                )
+                .await?;
                 record_state_transition(
                     pool,
                     workflow_item_id,
@@ -799,7 +825,8 @@ async fn execute_job(
             fail_job(pool, running_job.id, &result_value).await?;
 
             if let Some(workflow_item_id) = running_job.workflow_item_id {
-                update_workflow_item_state(pool, workflow_item_id, "blocked").await?;
+                update_workflow_state_for_job(pool, workflow_item_id, running_job.id, "blocked")
+                    .await?;
                 record_state_transition(
                     pool,
                     workflow_item_id,
@@ -838,7 +865,7 @@ async fn fail_triage_job(
     fail_job(pool, running_job.id, &result_value).await?;
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_item_state(pool, workflow_item_id, "blocked").await?;
+        update_workflow_state_for_job(pool, workflow_item_id, running_job.id, "blocked").await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -938,8 +965,13 @@ async fn execute_developer_job(
     }
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_item_state(pool, workflow_item_id, WorkflowState::InProgress.as_str())
-            .await?;
+        update_workflow_state_for_job(
+            pool,
+            workflow_item_id,
+            running_job.id,
+            WorkflowState::InProgress.as_str(),
+        )
+        .await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -1185,7 +1217,13 @@ async fn execute_developer_job(
         }
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
-            update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+            update_workflow_state_for_job(
+                pool,
+                workflow_item_id,
+                running_job.id,
+                workflow_state.as_str(),
+            )
+            .await?;
             record_state_transition(
                 pool,
                 workflow_item_id,
@@ -1294,8 +1332,13 @@ async fn execute_developer_job(
         cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
-            update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str())
-                .await?;
+            update_workflow_state_for_job(
+                pool,
+                workflow_item_id,
+                running_job.id,
+                WorkflowState::Blocked.as_str(),
+            )
+            .await?;
             record_state_transition(
                 pool,
                 workflow_item_id,
@@ -1344,14 +1387,18 @@ async fn execute_developer_job(
     };
     let commit_body = developer_commit_body(&running_job, &result, &changed_files);
     let workspace = workspace_path(running_job.id, repo_context_config);
-    if let Err(error) = push_developer_branch(
-        &repo_path,
-        &workspace,
-        github_token,
-        &uncommitted_files,
-        &branch_name,
-        &commit_title,
-        &commit_body,
+    if let Err(error) = cancellation::side_effect(
+        pool,
+        running_job.id,
+        push_developer_branch(
+            &repo_path,
+            &workspace,
+            github_token,
+            &uncommitted_files,
+            &branch_name,
+            &commit_title,
+            &commit_body,
+        ),
     )
     .await
     {
@@ -1388,16 +1435,19 @@ async fn execute_developer_job(
             "configured GitHub authentication is required to open implementation pull requests",
         )?;
         let github_client = configured_github_client(github_token)?;
-        let pull_request_url = github_client
-            .create_pull_request(
+        let pull_request_url = cancellation::side_effect(
+            pool,
+            running_job.id,
+            github_client.create_pull_request(
                 &owner,
                 &repo,
                 &commit_title,
                 &branch_name,
                 &base_branch,
                 &pull_request_body,
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok::<_, Box<dyn std::error::Error>>(pull_request_url)
     }
     .await;
@@ -1435,7 +1485,13 @@ async fn execute_developer_job(
         // gate; applying it here would relabel a published PR as needs-human
         // without leaving any resumable approval checkpoint.
         let workflow_state = completed_implementation_state(result.outcome);
-        update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+        update_workflow_state_for_job(
+            pool,
+            workflow_item_id,
+            running_job.id,
+            workflow_state.as_str(),
+        )
+        .await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -1606,7 +1662,13 @@ async fn execute_reviewer_job(
     let _ = cleanup_repository_context(running_job.id, repo_context_config);
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+        update_workflow_state_for_job(
+            pool,
+            workflow_item_id,
+            running_job.id,
+            workflow_state.as_str(),
+        )
+        .await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -1735,8 +1797,13 @@ async fn execute_repair_job(
         cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
-            update_workflow_item_state(pool, workflow_item_id, WorkflowState::PrOpen.as_str())
-                .await?;
+            update_workflow_state_for_job(
+                pool,
+                workflow_item_id,
+                running_job.id,
+                WorkflowState::PrOpen.as_str(),
+            )
+            .await?;
             record_state_transition(
                 pool,
                 workflow_item_id,
@@ -1753,8 +1820,13 @@ async fn execute_repair_job(
     }
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_item_state(pool, workflow_item_id, WorkflowState::InProgress.as_str())
-            .await?;
+        update_workflow_state_for_job(
+            pool,
+            workflow_item_id,
+            running_job.id,
+            WorkflowState::InProgress.as_str(),
+        )
+        .await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -1832,7 +1904,13 @@ async fn execute_repair_job(
         cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
-            update_workflow_item_state(pool, workflow_item_id, workflow_state.as_str()).await?;
+            update_workflow_state_for_job(
+                pool,
+                workflow_item_id,
+                running_job.id,
+                workflow_state.as_str(),
+            )
+            .await?;
             record_state_transition(
                 pool,
                 workflow_item_id,
@@ -1943,8 +2021,13 @@ async fn execute_repair_job(
         cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
-            update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str())
-                .await?;
+            update_workflow_state_for_job(
+                pool,
+                workflow_item_id,
+                running_job.id,
+                WorkflowState::Blocked.as_str(),
+            )
+            .await?;
             record_state_transition(
                 pool,
                 workflow_item_id,
@@ -1981,14 +2064,18 @@ async fn execute_repair_job(
 
     let commit_title = repair_commit_title(&running_job.input);
     let commit_body = repair_commit_body(&running_job, &result, &changed_files);
-    if let Err(error) = push_repair_branch(
-        &repo_path,
-        &repair_input.workspace_path,
-        github_token,
-        &changed_files,
-        &pull_request_head_ref(&running_job.input)?,
-        &commit_title,
-        &commit_body,
+    if let Err(error) = cancellation::side_effect(
+        pool,
+        running_job.id,
+        push_repair_branch(
+            &repo_path,
+            &repair_input.workspace_path,
+            github_token,
+            &changed_files,
+            &pull_request_head_ref(&running_job.input)?,
+            &commit_title,
+            &commit_body,
+        ),
     )
     .await
     {
@@ -2020,7 +2107,13 @@ async fn execute_repair_job(
     let _ = cleanup_repository_context(running_job.id, repo_context_config);
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_item_state(pool, workflow_item_id, WorkflowState::PrOpen.as_str()).await?;
+        update_workflow_state_for_job(
+            pool,
+            workflow_item_id,
+            running_job.id,
+            WorkflowState::PrOpen.as_str(),
+        )
+        .await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -2048,7 +2141,13 @@ async fn fail_role_job(
     fail_job(pool, running_job.id, &result_value).await?;
 
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_item_state(pool, workflow_item_id, WorkflowState::Blocked.as_str()).await?;
+        update_workflow_state_for_job(
+            pool,
+            workflow_item_id,
+            running_job.id,
+            WorkflowState::Blocked.as_str(),
+        )
+        .await?;
         record_state_transition(
             pool,
             workflow_item_id,
@@ -2927,6 +3026,12 @@ async fn run_git(
         command.env("GIT_ASKPASS", path);
     }
 
+    #[cfg(unix)]
+    let output =
+        donkeyspace_runner::process::run_command_until(&mut command, None, std::future::pending())
+            .await?
+            .output;
+    #[cfg(not(unix))]
     let output = command.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3600,7 +3705,19 @@ async fn process_outbound_action(
     client: &GitHubClient,
     action: &OutboundActionRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match execute_outbound_action(client, action).await {
+    let Some(guard) =
+        donkeyspace_db::cancellation::lock_outbound_side_effect(pool, action.id).await?
+    else {
+        return Ok(());
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        execute_outbound_action(client, action),
+    )
+    .await;
+    drop(guard);
+    let result = result.unwrap_or_else(|_| Err("outbound action timed out".into()));
+    match result {
         Ok(provider_resource_id) => {
             mark_outbound_action_completed(pool, action.id, provider_resource_id.as_deref())
                 .await?;

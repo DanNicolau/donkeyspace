@@ -693,6 +693,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
