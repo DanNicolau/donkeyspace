@@ -8,6 +8,11 @@ its descendants. Output is drained during shutdown, and cancellation is reported
 separately from failure even if a TERM handler returns exit code zero.
 Already-requested cancellation returns an interrupted error without launching
 the command. Cancellation arriving during cleanup also prevents a success result.
+Normal command completion also shuts down surviving members of its process group
+before cleanup begins, using the same TERM/grace/KILL sequence. Background work
+cannot outlive its command. This prevents cancellation during cleanup from leaving
+a child running after the parent has exited, while allowing group ownership to be
+released before the cleanup delay. The parent's output and exit status are retained.
 
 The ordinary `run_agent_command` API uses the same supervisor. Dropping either
 execution future requests cancellation; a supervisor task owns termination and

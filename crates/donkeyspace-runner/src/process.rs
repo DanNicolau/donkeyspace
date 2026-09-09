@@ -22,6 +22,8 @@ pub struct ProcessOutput {
 /// `cleanup`, when provided, runs after execution on success, failure, or
 /// cancellation (for example, removing a Docker container). Cleanup failure is
 /// returned rather than reporting a successful execution with leaked resources.
+/// Normal command completion also terminates remaining group members before
+/// cleanup; background processes cannot outlive their execution scope.
 ///
 /// An abruptly stopped worker/runtime still needs external orphan reconciliation.
 pub async fn run_command_until(
@@ -59,25 +61,13 @@ async fn run_command_with_grace(
             tokio::select! {
                 biased;
                 _ = cancellation => {
-                    group.signal(libc::SIGTERM)?;
-                    let shutdown = async {
-                        while group.exists()? {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
-                        }
-                        Ok::<_, io::Error>(())
-                    };
-                    // Continue draining pipes/reaping the leader during the grace
-                    // period. Leader exit alone does not prove descendants exited.
+                    // Continue draining pipes/reaping the leader while the
+                    // whole process group shuts down.
                     let (captured, stopped) = tokio::join!(
-                        async {
-                            tokio::time::timeout(grace, &mut output).await
-                        },
-                        tokio::time::timeout(grace, shutdown),
+                        tokio::time::timeout(grace, &mut output),
+                        group.terminate(grace),
                     );
-                    match stopped {
-                        Ok(result) => result?,
-                        Err(_) => group.signal(libc::SIGKILL)?,
-                    }
+                    stopped?;
                     let output = match captured {
                         Ok(result) => result?,
                         Err(_) => tokio::time::timeout(Duration::from_secs(1), &mut output).await
@@ -85,10 +75,17 @@ async fn run_command_with_grace(
                     };
                     Ok(ProcessOutput { output, cancelled: true })
                 }
-                result = &mut output => Ok(ProcessOutput { output: result?, cancelled: false }),
+                result = &mut output => {
+                    let output = result?;
+                    // A completed command must not leave background work behind.
+                    // Stop remaining descendants before releasing group ownership
+                    // or starting cleanup, where cancellation can still arrive.
+                    group.terminate(grace).await?;
+                    Ok(ProcessOutput { output, cancelled: false })
+                },
             }
         }.await;
-        // The leader is reaped and cancellation has killed surviving descendants.
+        // The leader is reaped and remaining descendants have been terminated.
         // Disarm before cleanup to avoid signaling a subsequently reused group ID.
         if execution.is_err() {
             let _ = group.signal(libc::SIGKILL);
@@ -145,6 +142,24 @@ async fn run_cleanup(cleanup: Option<Command>) -> io::Result<()> {
 struct ProcessGroup(i32);
 
 impl ProcessGroup {
+    async fn terminate(&self, grace: Duration) -> io::Result<()> {
+        if !self.exists()? {
+            return Ok(());
+        }
+        self.signal(libc::SIGTERM)?;
+        let stopped = tokio::time::timeout(grace, async {
+            while self.exists()? {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Ok::<_, io::Error>(())
+        })
+        .await;
+        match stopped {
+            Ok(result) => result,
+            Err(_) => self.signal(libc::SIGKILL),
+        }
+    }
+
     fn signal(&self, signal: i32) -> io::Result<()> {
         // SAFETY: the negative ID addresses only the process group established
         // for this child by process_group(0); it never targets the worker group.
@@ -405,5 +420,76 @@ mod tests {
         assert!(output.cancelled);
         assert!(output.output.status.success());
         assert!(fixture.0.join("cleaned").exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_cleanup_does_not_leave_a_descendant_running() {
+        let fixture = Fixture::new();
+        let output = run_command_with_grace(
+            &mut fixture.command(
+                "sh -c 'trap \"\" TERM; echo $$ > child; touch ready; exec sleep 60' >/dev/null 2>&1 & while [ ! -f ready ]; do sleep 0.01; done; exit 0",
+            ),
+            Some(fixture.command("touch cleaning; sleep 0.1; touch cleaned")),
+            wait_for_file(&fixture.0.join("cleaning")),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let child: i32 = std::fs::read_to_string(fixture.0.join("child"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            while process_is_running(child) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        // Clean up even when running this regression against the broken revision.
+        if !stopped {
+            let _ = Command::new("kill")
+                .args(["-KILL", &child.to_string()])
+                .status()
+                .await;
+        }
+        assert!(output.cancelled);
+        assert!(output.output.status.success());
+        assert!(fixture.0.join("cleaned").exists());
+        assert!(stopped, "cancelled execution left its descendant running");
+    }
+
+    #[tokio::test]
+    async fn completed_commands_stop_descendants_before_cleanup() {
+        for exit_code in [0, 7] {
+            let fixture = Fixture::new();
+            let output = run_command_with_grace(
+                &mut fixture.command(&format!(
+                    "sleep 60 >/dev/null 2>&1 & echo $! > child; printf stdout; printf stderr >&2; exit {exit_code}",
+                )),
+                Some(fixture.command("sleep 0.05; touch cleaned")),
+                std::future::pending(),
+                Duration::from_millis(100),
+            ).await.unwrap();
+            let child: i32 = std::fs::read_to_string(fixture.0.join("child"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let running = process_is_running(child);
+            if running {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &child.to_string()])
+                    .status()
+                    .await;
+            }
+            assert!(!running, "completed command left its descendant running");
+            assert!(!output.cancelled);
+            assert_eq!(output.output.status.code(), Some(exit_code));
+            assert_eq!(output.output.stdout, b"stdout");
+            assert_eq!(output.output.stderr, b"stderr");
+            assert!(fixture.0.join("cleaned").exists());
+        }
     }
 }
