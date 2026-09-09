@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::{fs, process::Command};
 
+#[cfg(unix)]
+pub mod process;
+
 #[derive(Debug, Error)]
 pub enum RunnerError {
     #[error("agent command cannot be empty")]
@@ -34,6 +37,7 @@ pub struct AgentCommandResult {
 pub enum AgentCommandStatus {
     Passed,
     Failed,
+    Cancelled,
 }
 
 impl AgentCommandStatus {
@@ -41,6 +45,7 @@ impl AgentCommandStatus {
         match self {
             Self::Passed => "passed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -87,15 +92,51 @@ pub async fn run_agent(command: &AgentCommand) -> Result<AgentRunOutput, RunnerE
 }
 
 pub async fn run_agent_command(command: &AgentCommand) -> Result<AgentCommandResult, RunnerError> {
-    let output = Command::new(&command.program)
-        .args(&command.args)
-        .current_dir(&command.working_dir)
-        .output()
-        .await?;
+    #[cfg(unix)]
+    {
+        run_agent_command_until(command, std::future::pending()).await
+    }
+    #[cfg(not(unix))]
+    {
+        let output = Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_dir)
+            .output()
+            .await?;
 
-    let command_result = AgentCommandResult {
+        Ok(command_result(command, output, false))
+    }
+}
+
+/// Execute an agent with cancellation independent of its semantic run result.
+/// A cancelled command must never have its run-result file published or accepted.
+#[cfg(unix)]
+pub async fn run_agent_command_until(
+    command: &AgentCommand,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<AgentCommandResult, RunnerError> {
+    let output = process::run_command_until(
+        Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.working_dir),
+        None,
+        cancel,
+    )
+    .await?;
+    Ok(command_result(command, output.output, output.cancelled))
+}
+
+fn command_result(
+    command: &AgentCommand,
+    output: std::process::Output,
+    cancelled: bool,
+) -> AgentCommandResult {
+    tracing::info!(status = ?output.status, cancelled, "agent command completed");
+    AgentCommandResult {
         command: command.command_line(),
-        status: if output.status.success() {
+        status: if cancelled {
+            AgentCommandStatus::Cancelled
+        } else if output.status.success() {
             AgentCommandStatus::Passed
         } else {
             AgentCommandStatus::Failed
@@ -103,10 +144,7 @@ pub async fn run_agent_command(command: &AgentCommand) -> Result<AgentCommandRes
         exit_code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-    };
-
-    tracing::info!(status = ?output.status, "agent command completed");
-    Ok(command_result)
+    }
 }
 
 pub async fn read_run_result(path: impl AsRef<Path>) -> Result<RunResult, RunnerError> {

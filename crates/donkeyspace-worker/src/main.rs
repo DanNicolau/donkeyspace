@@ -34,6 +34,7 @@ use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod llm_triage;
+mod plugin_container;
 mod plugin_flow;
 mod plugin_input;
 mod plugin_task_graph;
@@ -2691,7 +2692,7 @@ async fn run_required_command(
     record_agent_command_result(pool, job_id, &required.name, &output).await?;
     let status = match output.status {
         AgentCommandStatus::Passed => TestStatus::Passed,
-        AgentCommandStatus::Failed => TestStatus::Failed,
+        AgentCommandStatus::Failed | AgentCommandStatus::Cancelled => TestStatus::Failed,
     };
     let summary = command_summary(&output.stdout, &output.stderr);
 
