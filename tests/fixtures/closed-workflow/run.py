@@ -242,6 +242,18 @@ automation:
             active = [job for job in jobs() if job["generation"] == generation]
             assert active[0]["live_lease"] and active[0]["status"] == "running", active
             assert len(owned_containers()) == 1
+            container = owned_containers()[0]
+            identity = json.loads(sql(f"SELECT row_to_json(e) FROM container_executions e WHERE container_name='{container}'"))
+            assert identity["coordinator_job_id"] == active[0]["id"]
+            assert identity["generation"] == generation
+            assert identity["lease_owner"] == f"closure-test-{RUN}"
+            assert str(identity["workflow_item_id"]) == sql("SELECT id FROM workflow_items")
+            container_labels = json.loads(command("docker", "inspect", container))[0]["Config"]["Labels"]
+            for label, field in [("execution-id", "id"), ("coordinator-job-id", "coordinator_job_id"),
+                                 ("workflow-id", "workflow_item_id"), ("workflow-generation", "generation"),
+                                 ("execution-scope", "execution_scope")]:
+                assert container_labels[f"donkeyspace.{label}"] == str(identity[field]), (label, identity)
+            evidence.setdefault("container_executions", []).append(identity)
             print(f"Generation {generation}: running container; heartbeat verified", flush=True)
             if test_reopen_prs:
                 pr = create_test_pr(active[0]["id"], generation)
@@ -271,6 +283,8 @@ automation:
             ingress("closed", closed)  # Duplicate observation under another delivery.
             wait(lambda: all(job["status"] == "cancelled" for job in jobs()), "cancellation acknowledgement")
             assert not owned_containers(), "worker acknowledged cancellation before container cleanup"
+            # Cancellation cleanup must retain immutable launch provenance.
+            assert json.loads(sql(f"SELECT row_to_json(e) FROM container_executions e WHERE id='{identity['id']}'")) == identity
             worker.wait(timeout=30)
             assert worker.returncode == 0
             assert sql("SELECT current_state || ':' || provider_close_reason FROM workflow_items") == f"finished:{reason}"
@@ -284,6 +298,9 @@ automation:
             print(f"Generation {generation}: closed, cancelled, container removed, active labels removed", flush=True)
         assert len({job["id"] for job in jobs()}) == 2
         assert sql("SELECT count(*) FROM state_transitions WHERE to_state='finished'") == "2"
+        assert sql("SELECT count(*) FROM container_executions") == "2"
+        assert len({entry["container_name"] for entry in evidence["container_executions"]}) == 2
+        evidence["container_identity"] = "passed: persisted launch identities match Docker labels; distinct invocations/generations; records retained after cleanup"
         evidence["final_jobs"] = jobs()
         evidence["result"] = "passed"
     finally:

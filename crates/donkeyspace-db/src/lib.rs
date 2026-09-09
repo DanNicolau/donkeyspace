@@ -1,4 +1,5 @@
 pub mod cancellation;
+pub mod container_executions;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,11 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../../migrations/0004_pull_request_generation.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0005_container_executions.sql"
     ))
     .execute(&mut *transaction)
     .await?;
