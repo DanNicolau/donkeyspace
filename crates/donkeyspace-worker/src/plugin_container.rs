@@ -1,8 +1,30 @@
 //! Owned plugin containers with supervised process execution and cleanup.
+use donkeyspace_db::{
+    PgPool,
+    container_executions::{ContainerExecution, register_container_execution},
+};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, env, path::Path, process::Stdio};
+use std::{collections::BTreeMap, env, future::Future, path::Path, process::Stdio};
 use tokio::process::Command;
 use uuid::Uuid;
+
+tokio::task_local! {
+    static EXECUTION_OWNER: (PgPool, Uuid, String);
+}
+
+// Like process supervision, this scope covers agents and validators polled in
+// the coordinator task. A newly spawned task must explicitly enter the scope;
+// an unscoped production container launch fails closed.
+pub(crate) async fn with_execution_owner<F: Future>(
+    pool: &PgPool,
+    job: Uuid,
+    owner: &str,
+    work: F,
+) -> F::Output {
+    EXECUTION_OWNER
+        .scope((pool.clone(), job, owner.to_owned()), work)
+        .await
+}
 
 pub(crate) async fn run_container(
     image: &str,
@@ -11,7 +33,16 @@ pub(crate) async fn run_container(
     configured: &BTreeMap<String, String>,
     allowed: &[String],
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    let (pool, coordinator, owner) = EXECUTION_OWNER
+        .try_with(Clone::clone)
+        .map_err(|_| "plugin container launch requires a coordinator execution scope")?;
+    let scope = format!(
+        "{:x}",
+        Sha256::digest(stage_root.as_os_str().as_encoded_bytes())
+    );
+    let execution = register_container_execution(&pool, coordinator, &owner, &scope).await?;
     run_container_until(
+        &execution,
         image,
         command,
         stage_root,
@@ -22,7 +53,8 @@ pub(crate) async fn run_container(
     .await
 }
 
-pub(crate) async fn run_container_until(
+async fn run_container_until(
+    execution: &ContainerExecution,
     image: &str,
     command: &[String],
     stage_root: &Path,
@@ -30,27 +62,25 @@ pub(crate) async fn run_container_until(
     allowed: &[String],
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
-    // Each invocation owns its container name. A delayed cleanup cannot remove
-    // a replacement attempt, while the stable scope label identifies the task
-    // attempt across its agent and validator invocations.
-    let container_name = format!("donkeyspace-execution-{}", Uuid::now_v7());
-    let scope = format!(
-        "{:x}",
-        Sha256::digest(stage_root.as_os_str().as_encoded_bytes())
-    );
+    // The identity is already committed before any Docker request. Each agent
+    // and validator invocation gets a distinct name, even in the same scope.
+    let container_name = &execution.container_name;
     let mut docker = Command::new("docker");
     docker.args([
         "run",
         "--rm",
         "--name",
-        &container_name,
+        container_name,
         "--label",
         "donkeyspace.managed=true",
         "--label",
-        &format!("donkeyspace.execution-scope={scope}"),
+        &format!("donkeyspace.execution-scope={}", execution.execution_scope),
         "--network",
         "bridge",
     ]);
+    for (key, value) in execution_labels(execution) {
+        docker.args(["--label", &format!("{key}={value}")]);
+    }
     if let Ok(volume) = env::var("DONKEYSPACE_WORKSPACE_VOLUME") {
         let workspace_root =
             env::var("DONKEYSPACE_WORKSPACE_ROOT").unwrap_or_else(|_| "/workspaces".into());
@@ -158,10 +188,112 @@ pub(crate) async fn run_container_until(
     }
 }
 
+fn execution_labels(execution: &ContainerExecution) -> Vec<(&'static str, String)> {
+    let mut labels = vec![
+        ("donkeyspace.execution-id", execution.id.to_string()),
+        (
+            "donkeyspace.coordinator-job-id",
+            execution.coordinator_job_id.to_string(),
+        ),
+        (
+            "donkeyspace.workflow-generation",
+            execution.generation.to_string(),
+        ),
+    ];
+    if let Some(workflow) = execution.workflow_item_id {
+        labels.push(("donkeyspace.workflow-id", workflow.to_string()));
+    }
+    labels
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{path::PathBuf, time::Duration};
+
+    fn fixture_execution(root: &Path) -> ContainerExecution {
+        let id = Uuid::now_v7();
+        ContainerExecution {
+            id,
+            coordinator_job_id: Uuid::now_v7(),
+            workflow_item_id: Some(7),
+            generation: 2,
+            lease_owner: "isolated-test".into(),
+            container_name: format!("donkeyspace-execution-{id}"),
+            execution_scope: format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes())),
+        }
+    }
+
+    // Low-level supervision tests use synthetic identities. Production always
+    // registers through run_container; the live harness verifies that path.
+    async fn run_fixture_container(
+        image: &str,
+        command: &[String],
+        root: &Path,
+        configured: &BTreeMap<String, String>,
+        allowed: &[String],
+    ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+        run_fixture_container_until(
+            image,
+            command,
+            root,
+            configured,
+            allowed,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    async fn run_fixture_container_until(
+        image: &str,
+        command: &[String],
+        root: &Path,
+        configured: &BTreeMap<String, String>,
+        allowed: &[String],
+        cancel: impl Future<Output = ()>,
+    ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+        run_container_until(
+            &fixture_execution(root),
+            image,
+            command,
+            root,
+            configured,
+            allowed,
+            cancel,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unscoped_container_launch_is_rejected_before_docker() {
+        let error = run_container("unused", &[], Path::new("/unused"), &BTreeMap::new(), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a coordinator execution scope")
+        );
+    }
+
+    #[test]
+    fn container_labels_use_persisted_execution_identity() {
+        let mut execution = fixture_execution(Path::new("/unused"));
+        let labels: BTreeMap<_, _> = execution_labels(&execution).into_iter().collect();
+        assert_eq!(labels["donkeyspace.execution-id"], execution.id.to_string());
+        assert_eq!(
+            labels["donkeyspace.coordinator-job-id"],
+            execution.coordinator_job_id.to_string()
+        );
+        assert_eq!(labels["donkeyspace.workflow-id"], "7");
+        assert_eq!(labels["donkeyspace.workflow-generation"], "2");
+        execution.workflow_item_id = None;
+        assert!(
+            !execution_labels(&execution)
+                .iter()
+                .any(|(name, _)| *name == "donkeyspace.workflow-id")
+        );
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -273,7 +405,7 @@ mod tests {
     async fn container_execution_cleanup_and_cancellation_in_umbrella_checkout() {
         let fixture = Fixture::new().await;
         let configured = BTreeMap::new();
-        let passed = run_container(
+        let passed = run_fixture_container(
             "busybox:latest",
             &shell("test -d repo/.git && printf passed"),
             &fixture.root,
@@ -285,7 +417,7 @@ mod tests {
         assert!(passed.status.success());
         assert_eq!(passed.stdout, b"passed");
         fixture.wait_for_container_count(0).await;
-        let failed = run_container(
+        let failed = run_fixture_container(
             "busybox:latest",
             &shell("printf failed >&2; exit 7"),
             &fixture.root,
@@ -300,7 +432,7 @@ mod tests {
 
         let root = fixture.root.clone();
         let first = tokio::spawn(async move {
-            run_container(
+            run_fixture_container(
                 "busybox:latest",
                 &shell("test -d repo/.git || exit 90; trap '' TERM; touch first-ready; sleep 60"),
                 &root,
@@ -315,7 +447,7 @@ mod tests {
         let root = fixture.root.clone();
         let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
         let second = tokio::spawn(async move {
-            run_container_until(
+            run_fixture_container_until(
                 "busybox:latest",
                 &shell("test -d repo/.git || exit 90; trap '' TERM; touch second-ready; sleep 60"),
                 &root,

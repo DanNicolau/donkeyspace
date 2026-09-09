@@ -56,13 +56,44 @@ PRs and saved publication branch names remain unchanged. Non-managed human PRs
 keep their existing issue-linking behavior.
 
 This is a partial implementation of [#28](https://github.com/DanNicolau/donkeyspace/issues/28).
-Remaining work includes hard-crash/expired-orphan reconciliation, durable
-workflow/job container identities and Docker creation-race recovery, and the
+Remaining work includes hard-crash/expired-orphan reconciliation,
+Docker creation-race recovery, and the
 policy-gated manual cancel API/UI. A crashed worker can leave `cancel_requested`
 jobs until that reconciliation exists. Ambiguous legacy managed branches remain
 inactive until their original attribution can be established; this migration does
 not guess or repair already misattributed historical rows. Cancellation acknowledgement
 is validated on Unix workers; other platforms lack process-group guarantees.
+
+## Container launch ownership
+
+Migration `0005_container_executions.sql` adds a durable launch registry. Before
+issuing any Docker command, the worker commits a `container_executions` row with
+the invocation UUID, unique container name, coordinator job UUID, workflow ID and
+generation, lease owner, and hashed execution scope. Registration requires a
+running coordinator with an unexpired lease owned by this worker; it takes the
+workflow lock to serialize with closure/reopen. A new invocation gets a new name,
+including validators and repeated invocations in the same task directory.
+
+Docker labels `donkeyspace.execution-id`, `donkeyspace.coordinator-job-id`,
+`donkeyspace.workflow-id` (when linked), and `donkeyspace.workflow-generation`
+match that persisted row. The existing `donkeyspace.managed` and
+`donkeyspace.execution-scope` labels remain. No credentials, repository contents,
+or command arguments are stored in this registry or the new labels.
+
+Launches run inside the coordinator's execution scope. An unscoped launch fails
+before contacting Docker; future code that spawns a separate Tokio task must
+explicitly propagate execution ownership and process supervision to that task.
+
+Rows are **launch intents**, not evidence that a container exists or has stopped.
+They remain after normal completion, cancellation, failed configuration/creation,
+or worker death so the exact intended resource can be inspected later. This
+release adds neither an orphan sweeper nor a cleanup-status field. In particular,
+a Docker request whose outcome is unknown can still create a container after
+local cleanup; the durable identity is a prerequisite for reconciling that race.
+Do not infer successful crash recovery from an absent container or a worker
+restart alone. Older launches have no registry row and are not backfilled by
+guessing ownership. Apply the migration before starting the upgraded worker;
+no policy changes are needed.
 
 ## Regression and live validation
 
@@ -104,6 +135,13 @@ unknown branches, duplicate updates, initially unlinked PRs, and another reopen.
 Worker branch tests use UUIDv7 IDs with identical timestamp prefixes to detect
 branch collisions; API tests accept both legacy and full-UUID names.
 
+`container_intents_require_live_ownership_and_retain_origin_after_reopen` runs
+with the same isolated database and `--ignored`. It covers running/lease-owner
+admission, expired leases, distinct invocations, committed intent visibility,
+registration waiting behind closure, old-generation rejection after reopening,
+retained provenance, and unlinked jobs. Ordinary worker tests verify identity
+labels and reject unscoped launches before Docker is invoked.
+
 The live harness is restricted to the user-authorized `EPIC-BLOCKCHAIN/umbrella`
 test repository. It requires authenticated `gh`, Docker with `busybox:latest`,
 and an **empty disposable** database named `donkeyspace_cancellation_live_test`
@@ -124,6 +162,8 @@ umbrella checkout. It closes, reopens, and closes that issue with the other reas
 It verifies heartbeat renewal beyond a three-second lease, distinct jobs on
 reopening, cancellation acknowledgement only after container removal, active
 label removal, duplicate delivery handling and a delayed old close event.
+It also compares each live container's labels with its committed launch record
+and verifies distinct names/generations and unchanged records after cleanup.
 Signed webhook payloads contain actual GitHub issue snapshots but are delivered
 locally by the harness; no installed webhook configuration is changed. This tests
 GitHub reads/writes and the changed ingress/worker/container path, not GitHub's

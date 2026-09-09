@@ -12,6 +12,7 @@ where
     F: Future<Output = Result<(), Box<dyn std::error::Error>>>,
 {
     let owner = job.lease_owner.as_deref().ok_or("job has no lease owner")?;
+    let work = crate::plugin_container::with_execution_owner(pool, job.id, owner, work);
     let monitor = async {
         loop {
             match job_execution_allowed(pool, job.id).await {
