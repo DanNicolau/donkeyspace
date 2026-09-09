@@ -209,7 +209,7 @@ automation:
         owned = []
         for name in names:
             info = json.loads(command("docker", "inspect", name))[0]
-            if any(mount.get("Source", "").startswith(str(ROOT) + "/") for mount in info["Mounts"]):
+            if any((mount.get("Source", "") == str(ROOT) or mount.get("Source", "").startswith(str(ROOT) + "/")) for mount in info["Mounts"]):
                 owned.append(name)
         return owned
 
@@ -278,6 +278,20 @@ automation:
                     assert old_ref["object"]["sha"] == evidence["pull_requests"][0]["commit"]
                     evidence["reopen_pr_isolation"] = "passed: first-seen old PR and duplicates fenced; new PR accepted; original branch unchanged"
                     print("Late old PR fenced; new PR accepted; old branch preserved", flush=True)
+            if test_recovery and generation == 2:
+                old = evidence["container_executions"][0]
+                args = ["docker", "run", "-d", "--rm", "--name", old["container_name"],
+                        "--mount", f"type=bind,src={ROOT},dst=/fixture", "--label", "donkeyspace.managed=true"]
+                for label, field in [("execution-id", "id"), ("coordinator-job-id", "coordinator_job_id"),
+                                     ("workflow-id", "workflow_item_id"), ("workflow-generation", "generation"),
+                                     ("execution-scope", "execution_scope")]:
+                    args += ["--label", f"donkeyspace.{label}={old[field]}"]
+                command(*args, "busybox:latest", "sleep", "180")
+                wait(lambda: old["container_name"] not in command("docker", "ps", "-a", "--format", "{{.Names}}").splitlines(),
+                     "background recovery while the reopened agent is running", timeout=40)
+                assert container in owned_containers()
+                assert jobs()[-1]["status"] == "running" and jobs()[-1]["live_lease"]
+                evidence["background_recovery"] = "passed: old-generation late container removed during a live new-generation agent; current container/heartbeat preserved"
             if test_recovery:
                 worker.kill()  # Actual SIGKILL: no supervisor cleanup can run.
                 worker.wait(timeout=10)
