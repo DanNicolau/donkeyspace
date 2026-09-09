@@ -3120,11 +3120,7 @@ fn conflict_markers_present_in_dir(
 }
 
 fn developer_branch_name(issue_number: i64, job_id: uuid::Uuid) -> String {
-    let short_id = job_id.to_string().chars().take(8).collect::<String>();
-    format!(
-        "{}/issue-{issue_number}-{short_id}",
-        active_facade().branch_prefix
-    )
+    publication::issue_branch_name(&active_facade().branch_prefix, issue_number, job_id)
 }
 
 fn conventional_commit_title(input: &Value, changed_files: &[String]) -> String {

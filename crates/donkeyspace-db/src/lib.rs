@@ -67,6 +67,11 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
     ))
     .execute(&mut *transaction)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0004_pull_request_generation.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     Ok(())
 }
