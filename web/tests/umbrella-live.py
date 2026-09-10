@@ -76,7 +76,7 @@ def main():
         policy.write_text((SOURCE / ".donkeyspace/policy.yml").read_text() + '\nfacade:\n  display_name: "Umbrella validation"\n  tagline: "Isolated dashboard test"\n')
         secret = uuid.uuid4().hex
         env = {key: value for key, value in os.environ.items() if not key.startswith("DONKEYSPACE_")}
-        env.update({"DONKEYSPACE_DEPLOYMENT_MODE": "minimal", "DONKEYSPACE_DATABASE_URL": f"postgres://postgres:test-only@127.0.0.1:{port}/donkeyspace_dashboard_test",
+        env.update({"DONKEYSPACE_DEPLOYMENT_MODE": "generated", "DONKEYSPACE_DATABASE_URL": f"postgres://postgres:test-only@127.0.0.1:{port}/donkeyspace_dashboard_test",
                     "DONKEYSPACE_POLICY_PATH": str(policy), "DONKEYSPACE_GITHUB_AUTH_MODE": "pat",
                     "DONKEYSPACE_GITHUB_TOKEN": command("gh", "auth", "token"), "DONKEYSPACE_GITHUB_REPOSITORIES": REPO,
                     "DONKEYSPACE_GITHUB_INGRESS_MODE": "webhook", "DONKEYSPACE_WEBHOOK_SECRET": secret,
@@ -89,6 +89,8 @@ def main():
         api = start_api()
         direct = f"http://{gateway}:8080"
         def health(url):
+            if api.poll() is not None:
+                raise RuntimeError(f"Isolated API exited during startup; inspect logs in {ROOT}")
             try:
                 with urllib.request.urlopen(url + "/healthz", timeout=1) as response:
                     return response.status == 200 and json.load(response)["service"] == "donkeyspace-api"
@@ -115,7 +117,7 @@ def main():
             workflows = json.load(response)
         assert len(workflows) == 1 and workflows[0]["issue_number"] == issue["number"]
         with (ROOT / "browser.log").open("w") as log:
-            browser = subprocess.Popen(["node", str(SOURCE / "web/tests/live-browser.mjs"), origin, issue["title"], str(ROOT)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
+            browser = subprocess.Popen(["node", str(SOURCE / "web/tests/live-browser.mjs"), origin, workflows[0]["issue_title"], str(ROOT)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
         processes.append(browser)
         def browser_stage(expected):
             assert select.select([browser.stdout], [], [], 40)[0], f"browser stalled before {expected}"
@@ -130,7 +132,7 @@ def main():
             assert error.code == 502
         browser.stdin.write("down\n"); browser.stdin.flush()
         browser_stage("down")
-        start_api()
+        api = start_api()
         wait(lambda: health(origin), "API restart through web proxy")
         browser.stdin.write("up\n"); browser.stdin.flush()
         browser_stage("passed")
@@ -151,7 +153,9 @@ def main():
             command("docker", "rm", "--force", container)
         if network: command("docker", "network", "rm", name)
         subprocess.run(["docker", "image", "rm", image], capture_output=True, timeout=30)
-        evidence["cleanup"] = "API/browser stopped; test web/database containers, network and image removed; fresh issue closed; no agents, labels, branches or PRs created; logs/screenshots retained"
+        evidence["issue_created"] = issue is not None
+        evidence["issue_closed"] = issue is not None
+        evidence["cleanup"] = "API/browser stopped; test web/database containers, network and image removed; any created issue closed; no agents, labels, branches or PRs created; logs/screenshots retained"
         (ROOT / "evidence.json").write_text(json.dumps(evidence, indent=2))
         print("Evidence:", ROOT / "evidence.json", flush=True)
 
