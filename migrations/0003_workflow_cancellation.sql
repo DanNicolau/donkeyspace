@@ -7,18 +7,38 @@ ALTER TABLE outbound_actions ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL
 -- Generation stamping fences old coordinators after a reopen, including inserts
 -- racing with closure. Dispatch also revalidates against the locked workflow.
 CREATE OR REPLACE FUNCTION fence_workflow_job() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE w workflow_items; parent_generation BIGINT;
+DECLARE w workflow_items; parent_generation BIGINT; parent_status TEXT;
 BEGIN
+    IF TG_OP = 'UPDATE' AND OLD.status IN ('cancel_requested', 'cancelled') THEN
+        NEW.status := CASE WHEN NEW.status = 'cancelled' THEN 'cancelled' ELSE OLD.status END;
+        NEW.result := OLD.result;
+        NEW.input := NEW.input || jsonb_build_object('donkeyspace_workflow_generation', NEW.generation);
+        RETURN NEW;
+    END IF;
+    -- A crashed coordinator may have an in-flight child insert/update. An open
+    -- issue alone cannot authorize work for an already fenced parent.
+    IF TG_OP='INSERT' THEN
+        -- Serialize child admission with parent fencing. The fence reads its
+        -- children after acquiring the parent lock, so it sees this commit.
+        SELECT status INTO parent_status FROM jobs
+            WHERE id = (NEW.input #>> '{plugin_execution,coordinator_run_id}')::uuid
+            FOR SHARE;
+    ELSE
+        -- UPDATE already holds the child row; do not invert parent/child locks.
+        SELECT status INTO parent_status FROM jobs
+            WHERE id = (NEW.input #>> '{plugin_execution,coordinator_run_id}')::uuid;
+    END IF;
+    IF parent_status IN ('cancel_requested','cancelled') THEN
+        NEW.status := CASE WHEN TG_OP='UPDATE' AND OLD.status='running'
+            THEN 'cancel_requested' ELSE 'cancelled' END;
+        NEW.lease_owner := NULL;
+        NEW.lease_expires_at := NULL;
+    END IF;
     IF NEW.workflow_item_id IS NULL THEN RETURN NEW; END IF;
     SELECT * INTO w FROM workflow_items WHERE id = NEW.workflow_item_id;
     IF TG_OP = 'INSERT' THEN
         parent_generation := (NEW.input->>'donkeyspace_workflow_generation')::bigint;
         NEW.generation := COALESCE(parent_generation, w.generation);
-    ELSIF OLD.status IN ('cancel_requested', 'cancelled') THEN
-        NEW.status := CASE WHEN NEW.status = 'cancelled' THEN 'cancelled' ELSE OLD.status END;
-        NEW.result := OLD.result;
-        NEW.input := NEW.input || jsonb_build_object('donkeyspace_workflow_generation', NEW.generation);
-        RETURN NEW;
     END IF;
     IF (w.provider_state = 'closed' OR NEW.generation <> w.generation)
         AND NEW.status IN ('waiting', 'queued', 'leased', 'running', 'paused') THEN

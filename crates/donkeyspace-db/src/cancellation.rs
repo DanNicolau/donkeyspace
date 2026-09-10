@@ -132,7 +132,7 @@ pub async fn heartbeat_job(
     owner: &str,
     lease_seconds: i32,
 ) -> Result<bool, DbError> {
-    Ok(sqlx::query("UPDATE jobs SET lease_expires_at=now()+make_interval(secs => $3), updated_at=now() WHERE id=$1 AND lease_owner=$2 AND status IN ('leased','running')")
+    Ok(sqlx::query("UPDATE jobs SET lease_expires_at=now()+make_interval(secs => $3), updated_at=now() WHERE id=$1 AND lease_owner=$2 AND status IN ('leased','running') AND lease_expires_at>clock_timestamp()")
         .bind(job_id).bind(owner).bind(lease_seconds as f64).execute(pool).await?.rows_affected()==1)
 }
 
