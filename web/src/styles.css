@@ -1143,3 +1143,32 @@ a {
     grid-column: 2;
   }
 }
+
+.connection-panel {
+  background: #fff;
+  border: 1px solid #dfe3da;
+  border-top: 4px solid #255c48;
+  border-radius: 8px;
+  margin: 56px auto;
+  max-width: 680px;
+  padding: 32px;
+}
+
+.connection-panel[role="alert"] { border-top-color: #a35b12; }
+.connection-label { color: #59655d; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+.connection-panel h2 { font-size: 24px; margin: 12px 0; }
+.connection-panel p { line-height: 1.6; }
+.connection-hint { color: #59655d; }
+.connection-retry { margin-top: 12px; }
+.connection-retry:focus-visible { outline: 3px solid #255c48; outline-offset: 3px; }
+.connection-retry, .configuration-warning button {
+  background: #255c48;
+  border: 1px solid #255c48;
+  border-radius: 7px;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 10px 16px;
+}
+.connection-retry:disabled, .configuration-warning button:disabled { cursor: wait; opacity: 0.65; }
