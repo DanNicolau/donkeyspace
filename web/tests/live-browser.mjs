@@ -33,7 +33,10 @@ try {
   await page.screenshot({ path: resolve(artifacts, 'live-unavailable-mobile.png'), fullPage: true });
   process.stdout.write('down\n');
   await signal('up');
+  const configuration = page.waitForResponse((response) => response.url().endsWith('/api/configuration') && response.status() === 200);
   await page.getByRole('button', { name: 'Retry connection' }).click();
+  await configuration;
+  await expect(page.getByRole('alert')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Umbrella validation', exact: true })).toBeVisible();
   await expect(page.getByRole('link', { name: title, exact: true })).toBeVisible();
   await page.setViewportSize({ width: 1280, height: 850 });

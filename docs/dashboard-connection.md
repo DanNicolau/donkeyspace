@@ -6,7 +6,7 @@ there is no fallback facade presented as effective configuration.
 
 HTTP failures, network failures, non-JSON routing responses, invalid JSON and
 missing/invalid facade fields show an explicit error with an API-health link and
-retry action. Requests, including body reads, time out after ten seconds. A retry
+retry action. Requests, including body reads, time out after ten seconds. A connection retry refreshes both facade and configuration,
 returns to loading and cannot queue a second request while pending. Query
 cancellation aborts abandoned requests. Facade refreshes every thirty seconds;
 a refresh failure hides the previously loaded shell until a request succeeds.

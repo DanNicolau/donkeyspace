@@ -104,6 +104,36 @@ test('malformed configuration is visible without crashing or inventing settings'
   await expect(page.locator('.configuration-panel')).toContainText('test-policy.yml');
 });
 
+test('connection retry also recovers configuration after a whole-API outage', async ({ page }) => {
+  let fail = true;
+  await page.route(/\/api\/(facade|configuration)$/, (route) => fail ? route.fulfill({ status: 502, body: '' }) : route.continue());
+  await page.goto('/');
+  await unavailable(page);
+  fail = false;
+  const configuration = page.waitForResponse((response) => response.url().endsWith('/api/configuration') && response.status() === 200);
+  await page.getByRole('button', { name: 'Retry connection' }).click();
+  await configuration;
+  await ready(page);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('connection retry replaces an in-flight configuration request', async ({ page }) => {
+  let retry = false;
+  await page.route('**/api/facade', (route) => retry ? route.continue() : route.fulfill({ status: 502, body: '' }));
+  await page.route('**/api/configuration', async (route) => {
+    if (retry) await route.continue();
+    // Initial configuration never responds. Retry must abort and replace it.
+  });
+  await page.goto('/');
+  await unavailable(page);
+  retry = true;
+  const configuration = page.waitForResponse((response) => response.url().endsWith('/api/configuration') && response.status() === 200);
+  await page.getByRole('button', { name: 'Retry connection' }).click();
+  await configuration;
+  await ready(page);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
 test('rejects a configuration enum encoded as an array', async ({ page, request }) => {
   const valid = await (await request.get('/api/configuration')).json();
   await page.route('**/api/configuration', (route) => route.fulfill({ json: { ...valid, deployment_mode: ['minimal'] } }));

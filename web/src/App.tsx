@@ -34,11 +34,12 @@ const json = async <T,>(url: string, init?: RequestInit): Promise<T> => {
 const repositoryQuery = (repository: string) => repository ? `?repository=${encodeURIComponent(repository)}` : "";
 
 export function App() {
+  const queryClient = useQueryClient();
   const facadeQuery = useQuery({ queryKey: ["facade"], queryFn: loadFacade, retry: false, staleTime: 30_000, refetchInterval: 30_000 });
   const configurationQuery = useQuery({ queryKey: ["configuration"], queryFn: loadConfiguration, retry: false, staleTime: 30_000 });
   const facade = facadeQuery.isError ? undefined : facadeQuery.data;
   useEffect(() => { document.title = facade?.display_name ?? "Dashboard"; }, [facade?.display_name]);
-  if (!facade) return <DashboardConnection error={facadeQuery.error} retrying={facadeQuery.isFetching} retry={() => { void facadeQuery.refetch(); }} />;
+  if (!facade) return <DashboardConnection error={facadeQuery.error} retrying={facadeQuery.isFetching} retry={() => { void facadeQuery.refetch(); void queryClient.cancelQueries({ queryKey: ["configuration"], exact: true }).then(() => configurationQuery.refetch()); }} />;
   const path = window.location.pathname.replace(/\/$/, "") || "/";
   const detail = path.match(/^\/repositories\/([^/]+)\/([^/]+)\/issues\/(\d+)$/);
   const page = path === "/operations" ? "operations" : detail ? "detail" : "issues";
