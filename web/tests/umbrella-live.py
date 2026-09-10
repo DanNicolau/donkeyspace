@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from urllib.parse import quote
 
 SOURCE = Path(__file__).resolve().parents[2]
 REPO = "EPIC-BLOCKCHAIN/umbrella"
@@ -51,6 +52,8 @@ def main():
     containers, processes = [], []
     network = False
     issue = None
+    label = f"ds-dashboard-{RUN}"
+    label_created = False
     evidence = {"source": command("git", "-C", str(SOURCE), "rev-parse", "HEAD"),
                 "source_dirty": bool(command("git", "-C", str(SOURCE), "status", "--porcelain")),
                 "run": RUN, "result": "failed", "repository": REPO}
@@ -71,9 +74,15 @@ def main():
             return subprocess.run(["docker", "exec", db, "pg_isready", "-U", "postgres"], capture_output=True).returncode == 0
         wait(database_ready, "isolated database")
         policy = ROOT / "policy.yml"
-        # This checked-in policy is generic, has deny-by-default engagement,
-        # and the test issue has no allow label. No worker is started.
-        policy.write_text((SOURCE / ".donkeyspace/policy.yml").read_text() + '\nfacade:\n  display_name: "Umbrella validation"\n  tagline: "Isolated dashboard test"\n')
+        # Authorize only our unique label and authenticated test actor. Queue
+        # one triage record so the existing workflows endpoint includes it;
+        # never start a worker or execute agent code.
+        user = github("user")
+        policy_text = (SOURCE / ".donkeyspace/policy.yml").read_text()
+        assert '    - "ai"' in policy_text and '      allow: []' in policy_text
+        policy_text = policy_text.replace('    - "ai"', f'    - "{label}"')
+        policy_text = policy_text.replace('      allow: []', '      allow:\n        - type: user\n          login: ' + json.dumps(user["login"]))
+        policy.write_text(policy_text + '\nfacade:\n  display_name: "Umbrella validation"\n  tagline: "Isolated dashboard test"\n')
         secret = uuid.uuid4().hex
         env = {key: value for key, value in os.environ.items() if not key.startswith("DONKEYSPACE_")}
         env.update({"DONKEYSPACE_DEPLOYMENT_MODE": "generated", "DONKEYSPACE_DATABASE_URL": f"postgres://postgres:test-only@127.0.0.1:{port}/donkeyspace_dashboard_test",
@@ -102,8 +111,9 @@ def main():
         web_port = command("docker", "port", web, "80/tcp").split(":")[-1]
         origin = f"http://127.0.0.1:{web_port}"
         wait(lambda: health(origin), "production Nginx health proxy")
-        user = github("user")
-        issue = github(f"repos/{REPO}/issues", "POST", {"title": f"[Dashboard validation {RUN}] disposable API recovery scenario", "body": "Authorized bounded dashboard test using an isolated API and web image. No agent execution or implementation work is requested. This fresh issue will be closed after validation."})
+        github(f"repos/{REPO}/labels", "POST", {"name": label, "color": "888888", "description": "Disposable dashboard validation"})
+        label_created = True
+        issue = github(f"repos/{REPO}/issues", "POST", {"title": f"[Dashboard validation {RUN}] disposable API recovery scenario", "labels": [label], "body": "Authorized bounded dashboard test using an isolated API and web image. No agent execution or implementation work is requested. This fresh issue will be closed after validation."})
         evidence["issue_url"] = issue["html_url"]
         print("Test issue:", issue["html_url"], flush=True)
         payload = json.dumps({"action": "opened", "issue": issue, "repository": repository, "sender": user}).encode()
@@ -116,6 +126,10 @@ def main():
         with urllib.request.urlopen(origin + "/api/workflows", timeout=10) as response:
             workflows = json.load(response)
         assert len(workflows) == 1 and workflows[0]["issue_number"] == issue["number"]
+        with urllib.request.urlopen(origin + "/api/runs", timeout=10) as response:
+            runs = json.load(response)
+        assert len(runs) == 1 and runs[0]["status"] == "queued"
+        evidence["queued_job"] = runs[0]["id"]
         with (ROOT / "browser.log").open("w") as log:
             browser = subprocess.Popen(["node", str(SOURCE / "web/tests/live-browser.mjs"), origin, workflows[0]["issue_title"], str(ROOT)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
         processes.append(browser)
@@ -148,14 +162,19 @@ def main():
                 except subprocess.TimeoutExpired: process.kill(); process.wait()
         if issue:
             final = github(f"repos/{REPO}/issues/{issue['number']}", "PATCH", {"state": "closed", "state_reason": "not_planned"})
-            assert final["state"] == "closed" and final["labels"] == []
+            assert final["state"] == "closed"
+        if label_created:
+            # Deleting the scoped label also removes it from the closed issue.
+            command("gh", "api", f"repos/{REPO}/labels/{quote(label, safe='')}", "--method", "DELETE")
+        if issue:
+            assert github(f"repos/{REPO}/issues/{issue['number']}")["labels"] == []
         for container in reversed(containers):
             command("docker", "rm", "--force", container)
         if network: command("docker", "network", "rm", name)
         subprocess.run(["docker", "image", "rm", image], capture_output=True, timeout=30)
         evidence["issue_created"] = issue is not None
         evidence["issue_closed"] = issue is not None
-        evidence["cleanup"] = "API/browser stopped; test web/database containers, network and image removed; any created issue closed; no agents, labels, branches or PRs created; logs/screenshots retained"
+        evidence["cleanup"] = "API/browser stopped; test web/database containers, network and image removed; any created issue closed; scoped label removed; queued test work disposed with database; no agents executed or branches/PRs created; logs/screenshots retained"
         (ROOT / "evidence.json").write_text(json.dumps(evidence, indent=2))
         print("Evidence:", ROOT / "evidence.json", flush=True)
 

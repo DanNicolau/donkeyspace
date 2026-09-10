@@ -52,16 +52,17 @@ DONKEYSPACE_DASHBOARD_LIVE_TEST=1 python3 web/tests/umbrella-live.py
 ```
 
 This requires authenticated `gh`, Docker, and the installed Playwright browser.
-It creates one fresh, unlabelled umbrella issue; delivers signed GitHub snapshots
+It creates one fresh umbrella issue with a unique test label; delivers signed GitHub snapshots
 to an isolated API; and verifies the changed production dashboard with that real
 workflow. It stops the test API to verify the HTTP 502/error state, restarts it,
 and retries without reloading the page. It also verifies duplicate delivery,
-health JSON and mobile error presentation. No worker or agent runs, and no
+health JSON and mobile error presentation. One triage record is queued so the workflow appears in the existing API; no
+worker or agent runs, and no
 production configuration or historical workflow is changed.
 
 Logs, tested revisions, screenshots, scenario links and cleanup results are kept
 under `/tmp/donkeyspace-dashboard-live-<run>/`. The harness closes its fresh issue
-and removes its test processes, containers, network and image tag. Screenshots
+and removes its scoped label, test processes, containers, network and image tag. Screenshots
 below use only generic regression fixtures.
 
 ## Loading
