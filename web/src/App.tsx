@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
-type Facade = { display_name: string; tagline: string; issue_command: string; branch_prefix: string };
+import { loadConfiguration, loadFacade, type EffectiveConfiguration } from "./dashboard-api";
 type WorkflowTask = { job_id: string; role: string; role_display_name: string; task: string; task_display_name: string; work_item: string | null; status: string; outcome: string | null; summary: string | null; updated_at: string };
 type Publication = { id: number; commit_sha: string; commit_url: string | null; compare_url: string | null; zero_diff: boolean };
 type Approval = { target_task: string; target_work_item: string | null; purpose: string; trigger: string; approval_subject: string; result_summary: string; changed_files: { path: string; url: string }[]; proposed_publication: Publication | null; accepted_publication: Publication | null; projected_issues: { number?: number; url?: string; title?: string }[]; downstream_tasks: string[]; state: string; approve_command: string | null; revise_command: string | null };
@@ -13,15 +13,6 @@ type EventPage = { events: TimelineEvent[]; next_before_id: number | null };
 type Run = { id: string; role: string; status: string; result: { outcome?: string; summary?: string } | null; input?: { issue?: { number?: number; title?: string }; repository?: { full_name?: string } }; updated_at: string };
 type OutboundAction = { id: number; action_type: string; status: string; last_error: string | null; payload: { owner?: string; repo?: string; issue_number?: number }; created_at: string };
 type PollStatus = { enabled: boolean; running: boolean; pending_manual: boolean; configured_interval_seconds: number; last_completed_at: string | null; next_poll_at: string | null };
-type EffectiveConfiguration = {
-  deployment_mode: "generated" | "minimal";
-  policy_source: string;
-  facade: Facade;
-  github: { auth_mode: string; ingress_mode: string; repositories: string[] };
-  plugin: { id: string; flow: string } | null;
-  capabilities: string[];
-  warnings: string[];
-};
 type GitHubAppDelivery = { event: string | null; action: string | null; status: string | null; status_code: number | null; delivered_at: string | null };
 type GitHubIngressStatus = {
   configured_mode: string;
@@ -43,10 +34,11 @@ const json = async <T,>(url: string, init?: RequestInit): Promise<T> => {
 const repositoryQuery = (repository: string) => repository ? `?repository=${encodeURIComponent(repository)}` : "";
 
 export function App() {
-  const facadeQuery = useQuery({ queryKey: ["facade"], queryFn: () => json<Facade>("/api/facade"), staleTime: Infinity });
-  const configurationQuery = useQuery({ queryKey: ["configuration"], queryFn: () => json<EffectiveConfiguration>("/api/configuration"), staleTime: 30_000 });
-  const facade = facadeQuery.data ?? { display_name: "Agent Platform", tagline: "Agentic repository workflow", issue_command: "", branch_prefix: "agent" };
-  useEffect(() => { document.title = facade.display_name; }, [facade.display_name]);
+  const facadeQuery = useQuery({ queryKey: ["facade"], queryFn: loadFacade, retry: false, staleTime: 30_000, refetchInterval: 30_000 });
+  const configurationQuery = useQuery({ queryKey: ["configuration"], queryFn: loadConfiguration, retry: false, staleTime: 30_000 });
+  const facade = facadeQuery.isError ? undefined : facadeQuery.data;
+  useEffect(() => { document.title = facade?.display_name ?? "Dashboard"; }, [facade?.display_name]);
+  if (!facade) return <DashboardConnection error={facadeQuery.error} retrying={facadeQuery.isFetching} retry={() => { void facadeQuery.refetch(); }} />;
   const path = window.location.pathname.replace(/\/$/, "") || "/";
   const detail = path.match(/^\/repositories\/([^/]+)\/([^/]+)\/issues\/(\d+)$/);
   const page = path === "/operations" ? "operations" : detail ? "detail" : "issues";
@@ -54,8 +46,21 @@ export function App() {
     <header className="topbar"><div><h1>{facade.display_name}</h1><p>{facade.tagline}</p></div>
       <nav className="primary-nav" aria-label="Primary navigation"><a aria-current={page !== "operations" ? "page" : undefined} href="/">Issues</a><a aria-current={page === "operations" ? "page" : undefined} href="/operations">Operations</a><a href="/healthz">API health</a></nav>
     </header>
-    {configurationQuery.data?.warnings.map((warning) => <div className="configuration-warning" role="status" key={warning}><strong>{humanize(configurationQuery.data.deployment_mode)} deployment</strong><span>{warning}</span></div>)}
+    {configurationQuery.isError ? <div className="configuration-warning" role="alert"><div><strong>Configuration unavailable</strong><p>{configurationQuery.error.message} Check API availability and retry.</p></div><button disabled={configurationQuery.isFetching} onClick={() => { void configurationQuery.refetch(); }}>{configurationQuery.isFetching ? "Retrying…" : "Retry configuration"}</button></div> : null}
+    {!configurationQuery.isError && configurationQuery.data?.warnings.map((warning) => <div className="configuration-warning" role="status" key={warning}><strong>{humanize(configurationQuery.data.deployment_mode)} deployment</strong><span>{warning}</span></div>)}
     {page === "operations" ? <OperationsPage /> : detail ? <WorkflowDetail owner={decodeURIComponent(detail[1])} repo={decodeURIComponent(detail[2])} number={Number(detail[3])} /> : <IssuesPage />}
+  </main>;
+}
+
+function DashboardConnection({ error, retrying, retry }: { error: Error | null; retrying: boolean; retry: () => void }) {
+  return <main className="app-shell">
+    <header className="topbar"><div><h1>Dashboard</h1><p>Repository workflow monitoring</p></div><nav className="primary-nav" aria-label="Connection diagnostics"><a href="/healthz">API health</a></nav></header>
+    <section className="connection-panel" role={error ? "alert" : "status"} aria-live="polite" aria-busy={!error}>
+      <span className="connection-label">{error ? "Connection problem" : "Connecting"}</span>
+      <h2>{error ? "Dashboard unavailable" : "Loading dashboard configuration…"}</h2>
+      <p>{error ? error.message : "Waiting for the API before showing repository workflows and configuration."}</p>
+      {error ? <><p className="connection-hint">Check that the API is running and the web proxy can reach it, then retry.</p><button className="connection-retry" disabled={retrying} onClick={retry}>{retrying ? "Retrying…" : "Retry connection"}</button></> : null}
+    </section>
   </main>;
 }
 
@@ -214,14 +219,15 @@ function OperationsPage() {
   const [repository, setRepository] = useRepositorySelection();
   const runs = useQuery({ queryKey: ["runs", repository], queryFn: () => json<Run[]>(`/api/runs${repositoryQuery(repository)}`), refetchInterval: 10_000 });
   const actions = useQuery({ queryKey: ["outbound-actions", repository], queryFn: () => json<OutboundAction[]>(`/api/outbound-actions${repositoryQuery(repository)}`), refetchInterval: 10_000 });
-  const configuration = useQuery({ queryKey: ["configuration"], queryFn: () => json<EffectiveConfiguration>("/api/configuration"), staleTime: 30_000 });
+  const configuration = useQuery({ queryKey: ["configuration"], queryFn: loadConfiguration, retry: false, staleTime: 30_000 });
   const ingress = useQuery({ queryKey: ["ingress-status"], queryFn: () => json<GitHubIngressStatus>("/api/github-ingress/status"), refetchInterval: 30_000 });
-  return <><PageHeading title="Operations" subtitle="Ingress health, runtime configuration, raw jobs, and GitHub delivery diagnostics." picker={<RepositoryPicker value={repository} onChange={setRepository} />} /><ConfigurationPanel configuration={configuration.data} /><IngressPanel status={ingress.data} error={ingress.error} />
+  return <><PageHeading title="Operations" subtitle="Ingress health, runtime configuration, raw jobs, and GitHub delivery diagnostics." picker={<RepositoryPicker value={repository} onChange={setRepository} />} /><ConfigurationPanel configuration={configuration.isError ? undefined : configuration.data} error={configuration.isError} /><IngressPanel status={ingress.data} error={ingress.error} />
     <section className="panel"><PanelHeading title="Raw jobs" subtitle={repository || "All repositories"} /><div className="operations-list">{(runs.data ?? []).map((run) => <article key={run.id}><div><strong>{run.input?.issue?.title ?? "Untitled issue"}</strong><code>{run.id}</code><p>{run.result?.summary ?? `Issue #${run.input?.issue?.number ?? "?"}`}</p></div><div><StatusPill status={run.status} /><small>{run.role} · {run.result?.outcome ?? "pending"}</small></div></article>)}</div></section>
     <section className="panel"><PanelHeading title="GitHub action outbox" subtitle="Pending and completed writes" /><div className="operations-list">{(actions.data ?? []).map((action) => <article key={action.id}><div><strong>{action.action_type}</strong><p>{action.last_error ?? `${action.payload.owner ?? "?"}/${action.payload.repo ?? "?"} #${action.payload.issue_number ?? "?"}`}</p></div><StatusPill status={action.status} /></article>)}</div></section>
   </>;
 }
-function ConfigurationPanel({ configuration }: { configuration?: EffectiveConfiguration }) {
+function ConfigurationPanel({ configuration, error }: { configuration?: EffectiveConfiguration; error: boolean }) {
+  if (!configuration) return <section className="panel configuration-panel"><PanelHeading title="Effective configuration" subtitle={error ? "Configuration unavailable" : "Loading configuration…"} /><p className="empty-state">{error ? "Use Retry configuration above to request the server configuration again." : "Waiting for the server configuration."}</p></section>;
   return <section className="panel configuration-panel"><PanelHeading title="Effective configuration" subtitle={configuration ? `${humanize(configuration.deployment_mode)} deployment` : "Loading configuration…"} />
     <dl><div><dt>Policy</dt><dd>{configuration?.policy_source ?? "—"}</dd></div><div><dt>GitHub auth</dt><dd>{humanize(configuration?.github.auth_mode ?? "unknown")}</dd></div><div><dt>Ingress</dt><dd>{humanize(configuration?.github.ingress_mode ?? "unknown")}</dd></div><div><dt>Repositories</dt><dd>{configuration?.github.repositories.join(", ") || "None"}</dd></div><div><dt>Plugin</dt><dd>{configuration?.plugin ? `${configuration.plugin.id}:${configuration.plugin.flow}` : "Disabled"}</dd></div><div><dt>Capabilities</dt><dd>{configuration?.capabilities.map(humanize).join(", ") ?? "—"}</dd></div></dl>
   </section>;

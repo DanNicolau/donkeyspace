@@ -10,3 +10,6 @@
 # config directory points into the source tree. Compose defaults use the
 # checked-in non-secret placeholder instead.
 .donkeyspace/secrets/
+
+/web/test-results/
+/web/playwright-report/
