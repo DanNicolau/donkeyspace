@@ -89,13 +89,14 @@ def main():
         user = github("user")
         evidence["umbrella_revision"] = github(f"repos/{REPO}/commits/{repository['default_branch']}")["sha"]
         # Use the exact changed host binaries with their dynamic loader/libraries.
-        # The base image supplies curl via Node fetch for API readiness only.
+        # The base image supplies Node fetch for API readiness only.
         for binary in ("donkeyspace-api", "donkeyspace-worker"):
             shutil.copy2(SOURCE / "target/debug" / binary, context / binary)
             command("strip", str(context / binary))
         for library in ("ld-linux-x86-64.so.2", "libgcc_s.so.1", "libm.so.6", "libc.so.6"):
             shutil.copyfile(Path("/lib64") / library, context / library)
-        (context / "Dockerfile").write_text("FROM node:22-bookworm-slim\nCOPY --chmod=0755 . /tested/\n")
+        shutil.copyfile("/etc/pki/tls/certs/ca-bundle.crt", context / "ca-certificates.crt")
+        (context / "Dockerfile").write_text("FROM node:22-bookworm-slim\nCOPY --chmod=0755 . /tested/\nENV SSL_CERT_FILE=/tested/ca-certificates.crt\n")
         with (ROOT / "image-build.log").open("w") as log:
             subprocess.run(["docker", "build", "-t", image, str(context)], check=True,
                            timeout=180, stdout=log, stderr=subprocess.STDOUT)
