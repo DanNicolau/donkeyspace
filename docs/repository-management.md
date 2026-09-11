@@ -33,6 +33,10 @@ Unavailable repositories and unsupported owners fail before changing `instance.j
 Saving uses a lock and atomic rename; a repository edit based on stale configuration
 must be reloaded and retried.
 
+The updated CLI automatically migrates local instance configuration to version 8.
+Use the updated CLI for subsequent operations: older versions reject this format,
+which prevents them from silently discarding pending repository changes.
+
 ## Apply saved changes
 
 Repository edits **save only**. `list` reports that they await a controlled restart;

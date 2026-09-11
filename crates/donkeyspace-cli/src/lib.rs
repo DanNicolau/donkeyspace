@@ -19,7 +19,7 @@ mod repositories;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
 pub const DEFAULT_GITHUB_POLL_INTERVAL_SECONDS: u64 = 60;
@@ -394,7 +394,7 @@ impl Instance {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
-                5 | 6 => {
+                5..=7 => {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
@@ -2779,7 +2779,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for schema_version in [1, 2, 3, 4, 5, 6] {
+        for schema_version in 1..=7 {
             let directory =
                 env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
             fs::create_dir_all(&directory).unwrap();

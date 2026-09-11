@@ -575,6 +575,27 @@ mod tests {
     }
 
     #[test]
+    fn version_seven_upgrade_preserves_the_connection_and_access_settings() {
+        let fixture = Fixture::new(IngressMode::Polling {
+            interval_seconds: 137,
+        });
+        let mut old = serde_json::to_value(fixture.0.config()).unwrap();
+        old["schema_version"] = json!(7);
+        old.as_object_mut()
+            .unwrap()
+            .remove("repositories_pending_apply");
+        fs::write(fixture.0.config_path(), serde_json::to_vec(&old).unwrap()).unwrap();
+        let migrated = Instance::open(Some(fixture.0.directory.clone())).unwrap();
+        old["schema_version"] = json!(8);
+        old["repositories_pending_apply"] = json!(false);
+        assert_eq!(serde_json::to_value(migrated.config()).unwrap(), old);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(migrated.config_path()).unwrap()).unwrap(),
+            old
+        );
+    }
+
+    #[test]
     fn paused_restarting_and_unknown_consumers_require_controlled_apply() {
         for state in [
             "running",
