@@ -36,6 +36,7 @@ const HOME_ACTIONS: &[&str] = &[
     "Manage GitHub access",
     "Configure Codex",
     "Manage plugins",
+    "Manage repositories",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,7 @@ enum Screen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GitHubFlow {
+    Manage,
     Pending,
     Existing,
     Pat,
@@ -94,6 +96,7 @@ enum TaskResult {
         result: Result<Vec<GitHubRepository>, SetupError>,
     },
     SaveGitHub(Result<(), SetupError>),
+    SaveRepositories(Result<String, SetupError>),
     Access(Result<String, SetupError>),
     Codex(Result<(), SetupError>),
     Plugin(Result<String, SetupError>),
@@ -115,6 +118,7 @@ struct App {
     repositories: Vec<GitHubRepository>,
     repository_selected: Vec<bool>,
     repository_cursor: usize,
+    managed_original: Vec<String>,
     github_flow: GitHubFlow,
     pending: Option<PendingGitHubApp>,
     installation_id: Option<u64>,
@@ -180,6 +184,7 @@ impl App {
             repositories: vec![],
             repository_selected: vec![],
             repository_cursor: 0,
+            managed_original: vec![],
             github_flow: GitHubFlow::Pending,
             pending,
             installation_id: None,
@@ -394,7 +399,7 @@ fn spawn_operation(
     operation: &'static str,
 ) {
     tokio::task::spawn_blocking(move || {
-        let result = Instance::open(config_dir).and_then(|instance| match operation {
+        let result = Instance::open(config_dir).and_then(|mut instance| match operation {
             "start" => instance.start(),
             "stop" => instance.stop(),
             _ => unreachable!(),
@@ -422,6 +427,7 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
         | TaskResult::Stop(Err(error))
         | TaskResult::Manifest(Err(error))
         | TaskResult::SaveGitHub(Err(error))
+        | TaskResult::SaveRepositories(Err(error))
         | TaskResult::Access(Err(error))
         | TaskResult::Codex(Err(error))
         | TaskResult::Plugin(Err(error)) => app.error = Some(error.to_string()),
@@ -443,11 +449,48 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
         TaskResult::Repositories {
             flow,
             installation_id,
-            result: Ok(repositories),
+            result: Ok(mut repositories),
         } => {
             app.github_flow = flow;
             app.installation_id = installation_id;
-            app.repository_selected = vec![false; repositories.len()];
+            let configured = match Instance::open(app.config_dir.clone()) {
+                Ok(instance) => configured_github_repositories(&instance),
+                Err(error) => {
+                    app.error = Some(error.to_string());
+                    return;
+                }
+            };
+            app.managed_original = configured.clone();
+            if flow == GitHubFlow::Manage {
+                // Revoked installation access must never silently deselect a tracked repo.
+                for name in &configured {
+                    if !repositories
+                        .iter()
+                        .any(|repo| repo.full_name.eq_ignore_ascii_case(name))
+                    {
+                        if let Some((owner, repo)) = name.split_once('/') {
+                            repositories.push(GitHubRepository {
+                                owner: owner.into(),
+                                name: repo.into(),
+                                full_name: name.clone(),
+                                private: false,
+                            });
+                        }
+                    }
+                }
+            }
+            app.repository_selected = repositories
+                .iter()
+                .map(|repo| {
+                    configured
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&repo.full_name))
+                })
+                .collect();
+            app.confirm_remove = false;
+            app.notice = Some(
+                "Space toggles selection; Enter saves. Existing repositories are selected.".into(),
+            );
             app.repositories = repositories;
             app.repository_cursor = 0;
             app.screen = Screen::RepositorySelect;
@@ -458,6 +501,16 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
         TaskResult::Repositories {
             result: Err(error), ..
         } => app.error = Some(error.to_string()),
+        TaskResult::SaveRepositories(Ok(message)) => {
+            match Instance::open(app.config_dir.clone()) {
+                Ok(instance) => {
+                    app.begin_github_access(&instance);
+                    app.continue_setup_after_access = false;
+                }
+                Err(error) => app.error = Some(error.to_string()),
+            }
+            app.notice = Some(message);
+        }
         TaskResult::SaveGitHub(Ok(())) => {
             app.notice = Some("GitHub connection saved and validated.".into());
             let codex_connected = Instance::open(app.config_dir.clone())
@@ -477,7 +530,18 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
             }
         }
         TaskResult::Access(Ok(message)) => {
-            app.notice = Some(message);
+            let pending = Instance::open(app.config_dir.clone())
+                .ok()
+                .is_some_and(|instance| {
+                    instance
+                        .config()
+                        .is_some_and(|config| config.repositories_pending_apply)
+                });
+            app.notice = Some(if pending {
+                format!("{message} {}", crate::repositories::REPOSITORIES_SAVED)
+            } else {
+                message
+            });
             app.screen = Screen::GitHubAccessSubjects;
             app.selected = 0;
             app.confirm_remove = false;
@@ -712,6 +776,21 @@ fn handle_home(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskR
             },
             7 => app.begin_codex(),
             8 => app.begin_plugins(),
+            9 => {
+                app.busy = Some("Loading repositories using the saved GitHub connection…".into());
+                let config_dir = app.config_dir.clone();
+                tokio::spawn(async move {
+                    let result = match Instance::open(config_dir) {
+                        Ok(instance) => instance.accessible_repositories().await,
+                        Err(error) => Err(error),
+                    };
+                    let _ = sender.send(TaskResult::Repositories {
+                        flow: GitHubFlow::Manage,
+                        installation_id: None,
+                        result,
+                    });
+                });
+            }
             _ => {}
         },
         _ => {}
@@ -1245,18 +1324,29 @@ fn handle_advanced_form(
 
 fn handle_repositories(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSender<TaskResult>) {
     match key.code {
-        KeyCode::Esc => app.begin_github(),
+        KeyCode::Esc => {
+            if app.github_flow == GitHubFlow::Manage {
+                app.screen = Screen::Home;
+                app.confirm_remove = false;
+            } else {
+                app.begin_github();
+            }
+        }
         KeyCode::Up => app.repository_cursor = app.repository_cursor.saturating_sub(1),
         KeyCode::Down => {
             app.repository_cursor =
                 (app.repository_cursor + 1).min(app.repositories.len().saturating_sub(1));
         }
         KeyCode::Char(' ') => {
+            app.confirm_remove = false;
             if let Some(selected) = app.repository_selected.get_mut(app.repository_cursor) {
                 *selected = !*selected;
             }
         }
-        KeyCode::Enter => {
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if key.code == KeyCode::Char('y') && !app.confirm_remove {
+                return;
+            }
             let repositories = app
                 .repositories
                 .iter()
@@ -1266,6 +1356,41 @@ fn handle_repositories(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSend
                 .collect::<Vec<_>>();
             if repositories.is_empty() {
                 app.error = Some("Select at least one repository with Space.".into());
+                return;
+            }
+            if app.github_flow == GitHubFlow::Manage {
+                let removed: Vec<_> = app
+                    .managed_original
+                    .iter()
+                    .filter(|old| {
+                        !repositories
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(old))
+                    })
+                    .cloned()
+                    .collect();
+                if !removed.is_empty() && !(app.confirm_remove && key.code == KeyCode::Char('y')) {
+                    app.confirm_remove = true;
+                    app.notice = Some(format!(
+                        "Remove {}? Press y to confirm. After apply, future ingestion stops; history stays and work is not cancelled. Space changes selection; Esc discards.",
+                        removed.join(", ")
+                    ));
+                    return;
+                }
+                let config_dir = app.config_dir.clone();
+                let original = app.managed_original.clone();
+                app.busy = Some("Validating and saving repository selection…".into());
+                tokio::spawn(async move {
+                    let result = async {
+                        let mut instance = Instance::open(config_dir)?;
+                        if instance.repositories()? != original {
+                            return Err(SetupError::Config("repository selection changed; reload Manage repositories and retry".into()));
+                        }
+                        instance.set_repositories(repositories, true).await?;
+                        Ok(instance.repositories_status()?.to_string())
+                    }.await;
+                    let _ = sender.send(TaskResult::SaveRepositories(result));
+                });
                 return;
             }
             let owner = repositories[0].split_once('/').unwrap().0.to_string();
@@ -1288,6 +1413,7 @@ fn handle_repositories(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSend
                 let result = async {
                     let mut instance = Instance::open(config_dir)?;
                     match flow {
+                        GitHubFlow::Manage => unreachable!(),
                         GitHubFlow::Pending => {
                             instance
                                 .complete_pending_github_app(
@@ -1460,12 +1586,24 @@ fn parse_id(value: &str, label: &str) -> Result<u64, String> {
 
 fn render(frame: &mut Frame, app: &App, instance: &Instance) {
     let area = frame.area();
+    let message = app
+        .busy
+        .as_deref()
+        .or(app.error.as_deref())
+        .or(app.notice.as_deref())
+        .unwrap_or("");
+    let footer_height = (message
+        .chars()
+        .count()
+        .div_ceil(usize::from(area.width.max(1))) as u16
+        + 1)
+    .clamp(3, 8);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(footer_height),
         ])
         .split(area);
     frame.render_widget(
@@ -2224,6 +2362,7 @@ mod tests {
             repositories: vec![],
             repository_selected: vec![],
             repository_cursor: 0,
+            managed_original: vec![],
             github_flow: GitHubFlow::Pending,
             pending: None,
             installation_id: None,
@@ -2318,6 +2457,71 @@ mod tests {
             sender,
         );
         assert!(app.repository_selected[0]);
+    }
+
+    #[test]
+    fn managed_picker_preserves_revoked_repositories_and_preselects_current_configuration() {
+        let directory = std::env::temp_dir().join(format!(
+            "donkeyspace-picker-{}",
+            crate::random_hex(8).unwrap()
+        ));
+        let mut instance = Instance::open(Some(directory.clone())).unwrap();
+        instance
+            .init_with_ports(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+                RuntimeSource::LocalBuild,
+                None,
+                None,
+            )
+            .unwrap();
+        instance.config.as_mut().unwrap().github = Some(GitHubInstanceConfig::Pat {
+            token_file: directory.join("unused"),
+            repositories: vec!["owner/retained".into()],
+            ingress: IngressMode::polling(),
+        });
+        instance.save().unwrap();
+        let mut app = app(Screen::Home);
+        app.config_dir = Some(directory.clone());
+        apply_task_result(
+            &mut app,
+            TaskResult::Repositories {
+                flow: GitHubFlow::Manage,
+                installation_id: None,
+                result: Ok(vec![GitHubRepository {
+                    owner: "owner".into(),
+                    name: "new".into(),
+                    full_name: "owner/new".into(),
+                    private: false,
+                }]),
+            },
+        );
+        assert_eq!(app.repository_selected, [false, true]);
+        assert_eq!(app.repositories[1].full_name, "owner/retained");
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        app.repository_selected = vec![true, false];
+        handle_repositories(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            sender.clone(),
+        );
+        assert!(app.confirm_remove);
+        assert!(app.busy.is_none());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            Instance::open(Some(directory.clone()))
+                .unwrap()
+                .repositories()
+                .unwrap(),
+            ["owner/retained"]
+        );
+        handle_repositories(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            sender,
+        );
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.confirm_remove);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

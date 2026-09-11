@@ -15,10 +15,11 @@ use std::{
 use thiserror::Error;
 
 mod plugins;
+mod repositories;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
 pub const DEFAULT_GITHUB_POLL_INTERVAL_SECONDS: u64 = 60;
@@ -72,6 +73,8 @@ pub struct InstanceConfig {
     pub codex_home: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GitHubInstanceConfig>,
+    #[serde(default)]
+    pub repositories_pending_apply: bool,
     #[serde(default)]
     pub github_access: BTreeMap<String, Vec<GitHubAccessSubject>>,
     #[serde(default)]
@@ -364,14 +367,19 @@ pub struct PendingGitHubApp {
 pub struct Instance {
     directory: PathBuf,
     config: Option<InstanceConfig>,
+    saved_bytes: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl Instance {
     pub fn open(directory: Option<PathBuf>) -> Result<Self, SetupError> {
         let directory = directory.unwrap_or_else(default_config_directory);
         let path = directory.join(CONFIG_FILE);
-        let (config, migrated) = if path.exists() {
-            let bytes = fs::read(&path)?;
+        let saved_bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let (config, migrated) = if let Some(bytes) = &saved_bytes {
             let mut config: InstanceConfig = serde_json::from_slice(&bytes)?;
             let migrated = match config.schema_version {
                 1..=3 => {
@@ -386,7 +394,7 @@ impl Instance {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
-                5 | 6 => {
+                5..=7 => {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
@@ -402,7 +410,11 @@ impl Instance {
         } else {
             (None, false)
         };
-        let instance = Self { directory, config };
+        let instance = Self {
+            directory,
+            config,
+            saved_bytes: std::sync::Mutex::new(saved_bytes),
+        };
         if migrated {
             instance.save()?;
         }
@@ -464,6 +476,7 @@ impl Instance {
                 web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
                 codex_home: None,
                 github: None,
+                repositories_pending_apply: false,
                 github_access: BTreeMap::new(),
                 github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
@@ -1426,9 +1439,13 @@ impl Instance {
         Ok(())
     }
 
-    pub fn up(&self) -> Result<(), SetupError> {
+    pub fn up(&mut self) -> Result<(), SetupError> {
+        let _lock = self.configuration_lock()?;
+        self.require_unchanged_configuration(self.require_config()?)?;
+        self.ensure_repositories_can_start()?;
         self.ensure_start_ports_available()?;
         self.compose(&["up", "-d", "--build"], false)?;
+        self.mark_repositories_applied()?;
         self.print_endpoints()
     }
 
@@ -1467,9 +1484,13 @@ impl Instance {
         parse_compose_status(&output.stdout)
     }
 
-    pub fn start(&self) -> Result<(), SetupError> {
+    pub fn start(&mut self) -> Result<(), SetupError> {
+        let _lock = self.configuration_lock()?;
+        self.require_unchanged_configuration(self.require_config()?)?;
+        self.ensure_repositories_can_start()?;
         self.ensure_start_ports_available()?;
-        self.compose_captured(&["up", "-d", "--build"])
+        self.compose_captured(&["up", "-d", "--build"])?;
+        self.mark_repositories_applied()
     }
 
     pub fn stop(&self) -> Result<(), SetupError> {
@@ -1585,7 +1606,11 @@ impl Instance {
     }
 
     fn save_and_apply_github_access(&self) -> Result<(), SetupError> {
-        self.save()?;
+        let _lock = self.configuration_lock()?;
+        self.save_unlocked()?;
+        if self.require_config()?.repositories_pending_apply {
+            return Ok(());
+        }
         let running = self
             .deployment_status()
             .map(|status| status.service_running("api"))
@@ -1626,8 +1651,12 @@ impl Instance {
 
     fn compose_command(&self, arguments: &[&str]) -> Result<Command, SetupError> {
         let config = self.require_config()?;
-        self.write_compose_env(config)?;
-        self.write_plugin_runtime_files()?;
+        if !matches!(arguments.first(), Some(&"ps" | &"stop" | &"down"))
+            || !self.directory.join(GENERATED_ENV).exists()
+        {
+            self.write_compose_env(config)?;
+            self.write_plugin_runtime_files()?;
+        }
         let mut command = Command::new("docker");
         command
             .current_dir(&config.source_tree)
@@ -1741,12 +1770,26 @@ impl Instance {
     }
 
     fn save(&self) -> Result<(), SetupError> {
+        let _lock = self.configuration_lock()?;
+        self.save_unlocked()
+    }
+
+    fn save_unlocked(&self) -> Result<(), SetupError> {
         fs::create_dir_all(&self.directory)?;
         set_directory_mode(&self.directory)?;
+        if let Some(expected) = self.saved_bytes.lock().unwrap().as_ref() {
+            if fs::read(self.config_path())? != *expected {
+                return Err(SetupError::Config(
+                    "configuration changed while editing; reload and retry".into(),
+                ));
+            }
+        }
         let bytes = serde_json::to_vec_pretty(self.require_config()?)?;
         let temporary = self.directory.join(".instance.json.tmp");
         write_secret(&temporary, &bytes)?;
+        fs::File::open(&temporary)?.sync_all()?;
         fs::rename(temporary, self.config_path())?;
+        *self.saved_bytes.lock().unwrap() = Some(bytes);
         Ok(())
     }
 
@@ -2718,6 +2761,7 @@ mod tests {
                 repositories: vec!["owner/repo".into()],
                 ingress: IngressMode::polling(),
             }),
+            repositories_pending_apply: false,
             github_access: BTreeMap::from([("owner/repo".into(), Vec::new())]),
             github_approvers: BTreeMap::from([("owner/repo".into(), Vec::new())]),
             plugins: BTreeMap::new(),
@@ -2735,7 +2779,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for schema_version in [1, 2, 3, 4, 5, 6] {
+        for schema_version in 1..=7 {
             let directory =
                 env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
             fs::create_dir_all(&directory).unwrap();
@@ -2856,6 +2900,7 @@ mod tests {
                 repositories: vec!["acme/rtl".into(), "acme/dv".into()],
                 ingress: IngressMode::polling(),
             }),
+            repositories_pending_apply: false,
             github_access: BTreeMap::from([(
                 "old/repo".into(),
                 vec![GitHubAccessSubject::User {
@@ -2894,6 +2939,7 @@ mod tests {
             web_port: 5173,
             codex_home: None,
             github: None,
+            repositories_pending_apply: false,
             github_access: BTreeMap::new(),
             github_approvers: BTreeMap::new(),
             plugins: BTreeMap::new(),
@@ -2926,6 +2972,7 @@ mod tests {
             .as_nanos();
         let directory = env::temp_dir().join(format!("donkeyspace-port-env-test-{unique}"));
         let mut instance = Instance {
+            saved_bytes: std::sync::Mutex::new(None),
             directory: directory.clone(),
             config: Some(InstanceConfig {
                 schema_version: SCHEMA_VERSION,
@@ -2935,6 +2982,7 @@ mod tests {
                 web_port: 15_173,
                 codex_home: None,
                 github: None,
+                repositories_pending_apply: false,
                 github_access: BTreeMap::new(),
                 github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
@@ -2971,6 +3019,7 @@ mod tests {
         let directory = env::temp_dir().join(format!("donkeyspace-poll-env-test-{unique}"));
         fs::create_dir_all(&directory).unwrap();
         let mut instance = Instance {
+            saved_bytes: std::sync::Mutex::new(None),
             directory: directory.clone(),
             config: Some(InstanceConfig {
                 schema_version: SCHEMA_VERSION,
@@ -2984,6 +3033,7 @@ mod tests {
                     repositories: vec!["owner/repo".into()],
                     ingress: IngressMode::polling(),
                 }),
+                repositories_pending_apply: false,
                 github_access: BTreeMap::new(),
                 github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
@@ -3009,6 +3059,7 @@ mod tests {
         let directory = env::temp_dir().join(format!("donkeyspace-ingress-test-{unique}"));
         fs::create_dir_all(&directory).unwrap();
         let mut instance = Instance {
+            saved_bytes: std::sync::Mutex::new(None),
             directory: directory.clone(),
             config: Some(InstanceConfig {
                 schema_version: SCHEMA_VERSION,
@@ -3025,6 +3076,7 @@ mod tests {
                     repositories: vec!["owner/repo".into()],
                     ingress: IngressMode::polling(),
                 }),
+                repositories_pending_apply: false,
                 github_access: BTreeMap::new(),
                 github_approvers: BTreeMap::new(),
                 plugins: BTreeMap::new(),
