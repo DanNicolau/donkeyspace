@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Bounded saved-connection / Compose / webhook test, restricted to umbrella.
 
-Requires built CLI/API/worker binaries, Docker, gh authentication and a saved App
-installation with access to umbrella. Credential files are mounted read-only;
+Requires built CLI/API/worker binaries, Docker and saved gh authentication.
+Optionally set DONKEYSPACE_TEST_CONNECTION to an App instance with umbrella access.
+Credential files are mounted read-only;
 no production configuration or services are changed. No coding agent is run.
 """
 import hashlib
@@ -53,11 +54,19 @@ def wait(predicate, description, timeout=45):
 def main():
     assert os.environ.get("DONKEYSPACE_REPOSITORIES_LIVE_TEST") == "1"
     ROOT.mkdir(mode=0o700)
-    saved = Path(os.environ.get("DONKEYSPACE_TEST_CONNECTION", str(Path.home() / ".config/donkeyspace/instance.json")))
-    auth = json.loads(saved.read_text())["github"]
-    assert auth["mode"] == "app", "this scenario requires an existing App installation"
-    for key in ("private_key_file", "webhook_secret_file"):
-        assert Path(auth[key]).is_file()
+    if os.environ.get("DONKEYSPACE_TEST_CONNECTION"):
+        auth = json.loads(Path(os.environ["DONKEYSPACE_TEST_CONNECTION"]).read_text())["github"]
+        assert auth["mode"] == "app"
+        for key in ("private_key_file", "webhook_secret_file"):
+            assert Path(auth[key]).is_file()
+    else:
+        token_file = ROOT / "test-token"
+        token_file.write_text(command("gh", "auth", "token"))
+        token_file.chmod(0o600)
+        secret_file = ROOT / "test-secret"
+        secret_file.write_text(uuid.uuid4().hex)
+        secret_file.chmod(0o600)
+        auth = {"mode": "pat", "token_file": str(token_file), "webhook_secret_file": str(secret_file)}
     name = f"ds-repositories-{RUN}"
     image = name + ":test"
     config_dir = ROOT / "instance"
@@ -72,6 +81,8 @@ def main():
                 "repository": REPO, "original_repository": ORIGINAL, "result": "failed", "scenarios": []}
     env = {key: value for key, value in os.environ.items() if not key.startswith(("DONKEYSPACE_", "COMPOSE_"))}
     env["COMPOSE_PROJECT_NAME"] = name
+    if auth["mode"] == "pat":
+        env["DONKEYSPACE_GITHUB_TOKEN"] = Path(auth["token_file"]).read_text()
     cli = [str(SOURCE / "target/debug/donkeyspace"), "--config-dir", str(config_dir)]
 
     def run_cli(*args):
@@ -106,8 +117,12 @@ def main():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        connection = {key: auth[key] for key in ("mode", "app_id", "installation_id", "private_key_file", "webhook_secret_file")}
-        connection.update(repositories=[ORIGINAL], ingress={"kind": "webhook", "public_url": "https://hooks.example/test"})
+        if auth["mode"] == "app":
+            connection = {key: auth[key] for key in ("mode", "app_id", "installation_id", "private_key_file", "webhook_secret_file")}
+            connection["ingress"] = {"kind": "webhook", "public_url": "https://hooks.example/test"}
+        else:
+            connection = {"mode": "pat", "token_file": auth["token_file"], "ingress": {"kind": "polling", "interval_seconds": 137}}
+        connection["repositories"] = [ORIGINAL]
         configuration = {"schema_version": 7, "source_tree": str(fixture), "runtime_source": "local-build",
                          "api_port": port, "web_port": port + 1, "github": connection,
                          "github_access": {ORIGINAL: [{"type": "user", "login": user["login"]}]},
@@ -116,16 +131,18 @@ def main():
         (config_dir / "instance.json").write_text(json.dumps(configuration))
         (config_dir / "instance.json").chmod(0o600)
         common = {"DONKEYSPACE_DEPLOYMENT_MODE": "generated", "DONKEYSPACE_DATABASE_URL": "postgres://postgres:test-only@postgres:5432/repository_test",
-                  "DONKEYSPACE_POLICY_PATH": "/run/donkeyspace/policy.yml", "DONKEYSPACE_GITHUB_AUTH_MODE": "app",
-                  "DONKEYSPACE_GITHUB_APP_ID": "${DONKEYSPACE_GITHUB_APP_ID}", "DONKEYSPACE_GITHUB_INSTALLATION_ID": "${DONKEYSPACE_GITHUB_INSTALLATION_ID}",
-                  "DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE": "/run/secrets/github_private_key", "DONKEYSPACE_WEBHOOK_SECRET_FILE": "/run/secrets/github_webhook_secret",
+                  "DONKEYSPACE_POLICY_PATH": "/run/donkeyspace/policy.yml", "DONKEYSPACE_GITHUB_AUTH_MODE": auth["mode"],
+                  "DONKEYSPACE_WEBHOOK_SECRET_FILE": "/run/secrets/github_webhook_secret",
                   "DONKEYSPACE_GITHUB_REPOSITORIES": "${DONKEYSPACE_GITHUB_REPOSITORIES}", "DONKEYSPACE_GITHUB_INGRESS_MODE": "${DONKEYSPACE_GITHUB_INGRESS_MODE}",
                   "DONKEYSPACE_GITHUB_POLL_REPOSITORIES": "${DONKEYSPACE_GITHUB_POLL_REPOSITORIES}",
                   "DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS": "${DONKEYSPACE_GITHUB_POLL_INTERVAL_SECONDS}",
-                  "DONKEYSPACE_TRIAGE_PROVIDER": "deterministic", "RUST_LOG": "donkeyspace=info"}
-        mounts = ["${DONKEYSPACE_POLICY_SOURCE}:/run/donkeyspace/policy.yml:ro",
-                  "${DONKEYSPACE_GITHUB_PRIVATE_KEY_SOURCE}:/run/secrets/github_private_key:ro",
-                  "${DONKEYSPACE_WEBHOOK_SECRET_SOURCE}:/run/secrets/github_webhook_secret:ro"]
+                  "DONKEYSPACE_GITHUB_POLL_MAX_PAGES": "1", "DONKEYSPACE_TRIAGE_PROVIDER": "deterministic", "RUST_LOG": "donkeyspace=info"}
+        mounts = ["${DONKEYSPACE_POLICY_SOURCE}:/run/donkeyspace/policy.yml:ro", auth["webhook_secret_file"] + ":/run/secrets/github_webhook_secret:ro"]
+        if auth["mode"] == "app":
+            common.update(DONKEYSPACE_GITHUB_APP_ID="${DONKEYSPACE_GITHUB_APP_ID}", DONKEYSPACE_GITHUB_INSTALLATION_ID="${DONKEYSPACE_GITHUB_INSTALLATION_ID}", DONKEYSPACE_GITHUB_PRIVATE_KEY_FILE="/run/secrets/github_private_key")
+            mounts.append("${DONKEYSPACE_GITHUB_PRIVATE_KEY_SOURCE}:/run/secrets/github_private_key:ro")
+        else:
+            common["DONKEYSPACE_GITHUB_TOKEN"] = "${DONKEYSPACE_GITHUB_TOKEN}"
         services = {"postgres": {"image": "postgres:17", "environment": {"POSTGRES_PASSWORD": "test-only", "POSTGRES_DB": "repository_test"},
                                  "healthcheck": {"test": ["CMD", "pg_isready", "-U", "postgres"], "interval": "1s", "timeout": "2s", "retries": 30}}}
         for service in ("api", "worker"):
@@ -149,7 +166,7 @@ def main():
 
         def deliver(action, delivery=None):
             body = json.dumps({"action": action, "issue": issue, "repository": repository,
-                               "sender": user, "installation": {"id": auth["installation_id"]}}).encode()
+                               "sender": user, **({"installation": {"id": auth["installation_id"]}} if auth["mode"] == "app" else {})}).encode()
             secret = Path(auth["webhook_secret_file"]).read_bytes().strip()
             request = urllib.request.Request(base + "/webhooks/github", data=body, headers={"Content-Type": "application/json", "X-GitHub-Event": "issues",
                 "X-GitHub-Delivery": delivery or str(uuid.uuid4()), "X-Hub-Signature-256": "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()})
@@ -182,7 +199,7 @@ def main():
         assert api("/api/repositories") == [ORIGINAL], "save unexpectedly applied settings"
         refused = subprocess.run([*cli, "up"], env=env, capture_output=True, text=True, timeout=30)
         assert refused.returncode and "awaiting controlled" in refused.stderr
-        evidence["scenarios"].append("saved App reused; additive/idempotent selection; inaccessible add unchanged; live consumers unchanged before apply")
+        evidence["scenarios"].append("saved connection reused; additive/idempotent selection; inaccessible add unchanged; live consumers unchanged before apply")
         run_cli("configure", "repositories", "apply", "--confirm-drained")
         assert api("/api/repositories") == sorted([ORIGINAL, REPO])
         for service in ("api", "worker"):
@@ -199,7 +216,7 @@ def main():
         print("Test issue:", issue["html_url"], flush=True)
         assert deliver("opened") in (200, 202)
         assert sql("SELECT count(*) FROM jobs") == "0"
-        assert sql("SELECT disposition FROM engagement_decisions ORDER BY id DESC LIMIT 1") == "denied"
+        assert sql(f"SELECT disposition FROM engagement_decisions e JOIN workflow_items w ON w.id=e.workflow_item_id WHERE w.issue_number={issue['number']} ORDER BY e.id DESC LIMIT 1") == "denied"
         evidence["scenarios"].append("new repository ingestion persisted but deny-all prevented a job start")
         # Stop the real worker before granting starts. The test never executes agents.
         compose("stop", "worker")
@@ -223,7 +240,7 @@ def main():
         assert api("/api/repositories") == [ORIGINAL]
         assert deliver("opened") == 403
         assert sql("SELECT count(*) FROM jobs") == "1"
-        assert sql("SELECT count(*) FROM workflow_items") == "1"
+        assert sql(f"SELECT count(*) FROM workflow_items WHERE issue_number={issue['number']}") == "1"
         evidence["scenarios"].append("removal saved without cancelling queued work; explicit fixture closure then apply rejected new deliveries while retaining history")
         evidence["result"] = "passed"
     finally:
@@ -247,6 +264,8 @@ def main():
             command("docker", "image", "rm", image)
         except Exception as error:
             cleanup_errors.append(str(error))
+        for private_file in (ROOT / "test-token", ROOT / "test-secret"):
+            private_file.unlink(missing_ok=True)
         evidence["cleanup_errors"] = cleanup_errors
         (ROOT / "evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
         print("Evidence:", ROOT / "evidence.json", flush=True)
