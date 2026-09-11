@@ -202,20 +202,48 @@ impl Instance {
         let mut policy = Policy::from_yaml(&fs::read_to_string(&base_policy_path)?)
             .map_err(|error| SetupError::Config(error.to_string()))?;
         for (repository, subjects) in &config.github_access {
+            let key = policy
+                .workflow
+                .engagement
+                .repositories
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case(repository))
+                .cloned()
+                .unwrap_or_else(|| repository.clone());
             let rules = policy
                 .workflow
                 .engagement
                 .repositories
-                .entry(repository.clone())
+                .entry(key)
                 .or_insert_with(RepositoryEngagementPolicy::default);
             rules.default.allow = subjects.iter().map(|subject| subject.selector()).collect();
+            // Saved starter scopes are authoritative even if the base policy has
+            // a gate-specific allow list. Preserve label/block requirements.
+            for rule in [
+                &mut rules.initial,
+                &mut rules.needs_info_resume,
+                &mut rules.blocked_resume,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                rule.allow = subjects.iter().map(|subject| subject.selector()).collect();
+            }
         }
         for (repository, subjects) in &config.github_approvers {
+            let key = policy
+                .workflow
+                .engagement
+                .repositories
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case(repository))
+                .cloned()
+                .unwrap_or_else(|| repository.clone());
             let rules = policy
                 .workflow
                 .engagement
                 .repositories
-                .entry(repository.clone())
+                .entry(key)
                 .or_insert_with(RepositoryEngagementPolicy::default);
             rules.needs_human_resume.get_or_insert_default().allow =
                 subjects.iter().map(|subject| subject.selector()).collect();
@@ -403,6 +431,7 @@ mod tests {
             environment_files: BTreeMap::from([("API_TOKEN".into(), secret)]),
         };
         let instance = Instance {
+            saved_bytes: std::sync::Mutex::new(None),
             directory: directory.clone(),
             config: Some(InstanceConfig {
                 schema_version: crate::SCHEMA_VERSION,
@@ -412,6 +441,7 @@ mod tests {
                 web_port: 5173,
                 codex_home: None,
                 github: None,
+                repositories_pending_apply: false,
                 github_access: BTreeMap::from([(
                     "acme/rtl".into(),
                     vec![GitHubAccessSubject::User {

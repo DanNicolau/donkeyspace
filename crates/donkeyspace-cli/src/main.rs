@@ -76,6 +76,35 @@ enum ConfigureTarget {
     Ingress(IngressArgs),
     Facade(FacadeArgs),
     GithubAccess(GitHubAccessArgs),
+    Repositories(RepositoryArgs),
+}
+
+#[derive(Debug, Args)]
+struct RepositoryArgs {
+    #[command(subcommand)]
+    command: RepositoryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RepositoryCommand {
+    /// List saved repositories, or those accessible through the saved connection.
+    List {
+        #[arg(long)]
+        accessible: bool,
+    },
+    /// Add a repository without changing existing repositories or credentials.
+    Add { repository: String },
+    /// Stop future ingestion after apply; retain history and do not cancel work.
+    Remove {
+        repository: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Recreate API and worker together after you have drained active work.
+    Apply {
+        #[arg(long)]
+        confirm_drained: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -328,6 +357,51 @@ async fn run() -> Result<(), SetupError> {
             }
         },
         Command::Configure(args) => match args.target {
+            ConfigureTarget::Repositories(args) => {
+                match args.command {
+                    RepositoryCommand::List { accessible } => {
+                        if accessible {
+                            for repo in instance.accessible_repositories().await? {
+                                let selected = instance
+                                    .repositories()?
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(&repo.full_name));
+                                println!(
+                                    "[{}] {}",
+                                    if selected { "x" } else { " " },
+                                    repo.full_name
+                                );
+                            }
+                        } else {
+                            for repository in instance.repositories()? {
+                                println!("{repository}");
+                            }
+                        }
+                    }
+                    RepositoryCommand::Add { repository } => {
+                        if !instance.add_repository(&repository).await? {
+                            println!("Already tracked; unchanged.");
+                        }
+                    }
+                    RepositoryCommand::Remove {
+                        repository,
+                        confirm,
+                    } => {
+                        if instance.remove_repository(&repository, confirm)? {
+                            println!(
+                                "Removed from saved selection. Future ingestion stops after apply; history is retained and work is not cancelled."
+                            );
+                        } else {
+                            println!("Already untracked; unchanged.");
+                        }
+                    }
+                    RepositoryCommand::Apply { confirm_drained } => {
+                        instance.apply_repositories(confirm_drained)?;
+                        println!("Applied: API and worker recreated with the saved configuration.");
+                    }
+                }
+                println!("{}", instance.repositories_status()?);
+            }
             ConfigureTarget::Ports(args) => {
                 let stack_running = instance
                     .deployment_status()
@@ -444,6 +518,12 @@ async fn run() -> Result<(), SetupError> {
                         )
                         .await?;
                     println!("added {} to {}", subject.display_name(), args.repository);
+                    if instance
+                        .config()
+                        .is_some_and(|config| config.repositories_pending_apply)
+                    {
+                        println!("{}", instance.repositories_status()?);
+                    }
                 }
                 GitHubAccessCommand::Remove(subject) => {
                     let subject = subject.subject()?;
@@ -457,6 +537,12 @@ async fn run() -> Result<(), SetupError> {
                         subject.display_name(),
                         args.repository
                     );
+                    if instance
+                        .config()
+                        .is_some_and(|config| config.repositories_pending_apply)
+                    {
+                        println!("{}", instance.repositories_status()?);
+                    }
                     if instance
                         .github_access_for_scope(&args.repository, args.scope.into())?
                         .is_empty()
@@ -513,6 +599,37 @@ async fn run() -> Result<(), SetupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_commands_parse_explicit_confirmation_flags() {
+        for args in [
+            vec!["list"],
+            vec!["list", "--accessible"],
+            vec!["add", "owner/repo"],
+            vec!["remove", "owner/repo", "--confirm"],
+            vec!["apply", "--confirm-drained"],
+        ] {
+            let mut command = vec!["donkeyspace", "configure", "repositories"];
+            command.extend(args);
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+        let cli = Cli::try_parse_from([
+            "donkeyspace",
+            "configure",
+            "repositories",
+            "remove",
+            "owner/repo",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Configure(ConfigureArgs {
+                target: ConfigureTarget::Repositories(RepositoryArgs {
+                    command: RepositoryCommand::Remove { confirm: false, .. }
+                })
+            }))
+        ));
+    }
 
     #[test]
     fn parses_init_and_reconfigure_port_flags() {

@@ -14,6 +14,8 @@ It coordinates issue triage, clarification, agent implementation, automated chec
 
 ## Documentation
 
+- [Manage tracked repositories without reconnecting GitHub](docs/repository-management.md)
+
 - [Architecture, scope, and known limitations](docs/architecture.md)
 - [Default-lifecycle agent contract](docs/agent-contract.md)
 - [Default GitHub workflow](docs/github-workflow.md)
