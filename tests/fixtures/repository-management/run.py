@@ -156,6 +156,7 @@ def main():
         (fixture / "docker-compose.yml").write_text(json.dumps({"services": services}))
         # Generate only the isolated Compose inputs; never print credential configuration.
         run_cli("compose-config")
+        github(f"repos/{REPO}/labels", "POST", {"name": label, "color": "888888", "description": "Disposable repository-management validation"})
         started = True
         compose("up", "-d", "--wait", "--wait-timeout", "60")
         base = f"http://127.0.0.1:{port}"
@@ -209,7 +210,6 @@ def main():
             assert f"DONKEYSPACE_GITHUB_REPOSITORIES={ORIGINAL},{REPO}" in inspected["Config"]["Env"]
         evidence["scenarios"].append("actual Compose apply recreated healthy API and running worker with identical repository selection")
 
-        github(f"repos/{REPO}/labels", "POST", {"name": label, "color": "888888", "description": "Disposable repository-management validation"})
         issue = github(f"repos/{REPO}/issues", "POST", {"title": f"[Repository validation {RUN}] disposable ingestion scenario", "labels": [label],
             "body": "Authorized isolated repository-management validation. No coding agent should run. This fresh issue will be closed and its scoped labels removed after the test."})
         evidence["issue_url"] = issue["html_url"]
@@ -257,7 +257,7 @@ def main():
             except Exception as error:
                 cleanup_errors.append(str(error))
         try:
-            labels = github(f"repos/{REPO}/labels?per_page=100")
+            labels = [entry for page in json.loads(command("gh", "api", f"repos/{REPO}/labels?per_page=100", "--paginate", "--slurp")) for entry in page]
             for entry in labels:
                 if entry["name"] == label or entry["name"].startswith(label + ":"):
                     github(f"repos/{REPO}/labels/{entry['name']}", "DELETE")

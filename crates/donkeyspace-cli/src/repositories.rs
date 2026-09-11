@@ -1,6 +1,6 @@
 use super::*;
 
-pub const REPOSITORIES_SAVED: &str = "Saved; awaiting controlled API/worker restart. New repositories deny all starters and approvers. Configure trusted identities with `configure github-access`, then drain active work and run `configure repositories apply --confirm-drained`.";
+pub const REPOSITORIES_SAVED: &str = "Saved; awaiting controlled API/worker restart. New repositories start with empty starter/approver scopes. Configure trusted identities with `configure github-access`, then drain active work and run `configure repositories apply --confirm-drained`.";
 
 impl Instance {
     pub fn repositories(&self) -> Result<&[String], SetupError> {
@@ -244,7 +244,7 @@ impl Instance {
     pub(crate) fn ensure_repositories_can_start(&self) -> Result<(), SetupError> {
         if self.require_config()?.repositories_pending_apply {
             let status = self.deployment_status()?;
-            if status.service_running("api") || status.service_running("worker") {
+            if repositories_require_controlled_restart(&status) {
                 return Err(SetupError::Config(REPOSITORIES_SAVED.into()));
             }
         }
@@ -258,6 +258,16 @@ impl Instance {
         }
         Ok(())
     }
+}
+
+fn repositories_require_controlled_restart(status: &DeploymentStatus) -> bool {
+    status.services.iter().any(|service| {
+        matches!(service.name.as_str(), "api" | "worker")
+            && !matches!(
+                service.state.to_ascii_lowercase().as_str(),
+                "exited" | "created"
+            )
+    })
 }
 
 fn validate_repository_identity(repository: &str) -> Result<(), SetupError> {
@@ -562,6 +572,31 @@ mod tests {
         let mut fixture = Fixture::new(IngressMode::polling());
         assert!(!fixture.0.add_repository("OWNER/A").await.unwrap());
         assert!(!fixture.0.config().unwrap().repositories_pending_apply);
+    }
+
+    #[test]
+    fn paused_restarting_and_unknown_consumers_require_controlled_apply() {
+        for state in [
+            "running",
+            "paused",
+            "restarting",
+            "dead",
+            "unknown",
+            "exited",
+            "created",
+        ] {
+            let status = DeploymentStatus {
+                services: vec![ServiceStatus {
+                    name: "worker".into(),
+                    state: state.into(),
+                    health: None,
+                }],
+            };
+            assert_eq!(
+                repositories_require_controlled_restart(&status),
+                !matches!(state, "exited" | "created")
+            );
+        }
     }
 
     #[test]
