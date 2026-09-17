@@ -192,6 +192,20 @@ impl Instance {
         self.ensure_plugin_image(plugin, true)
     }
 
+    pub(crate) fn rebuild_active_plugin_with(
+        &self,
+        run: impl FnOnce(&mut Command) -> Result<(), SetupError>,
+    ) -> Result<(), SetupError> {
+        let config = self.require_config()?;
+        let Some(active) = &config.active_plugin else {
+            return Ok(());
+        };
+        let plugin = config.plugins.get(&active.id).ok_or_else(|| {
+            SetupError::Config(format!("plugin `{}` is not installed", active.id))
+        })?;
+        run(&mut plugin_build_command(plugin))
+    }
+
     pub(crate) fn plugin_overlay_path(&self) -> PathBuf {
         self.directory.join("plugin-compose.yml")
     }
@@ -373,14 +387,18 @@ impl Instance {
         {
             return Ok(());
         }
-        run_status(
-            Command::new("docker")
-                .arg("build")
-                .args(["--tag", &plugin.image, "--file"])
-                .arg(&plugin.dockerfile)
-                .arg(&plugin.build_context),
-        )
+        run_status(&mut plugin_build_command(plugin))
     }
+}
+
+fn plugin_build_command(plugin: &InstalledPlugin) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .arg("build")
+        .args(["--tag", &plugin.image, "--file"])
+        .arg(&plugin.dockerfile)
+        .arg(&plugin.build_context);
+    command
 }
 
 fn safe_id(value: &str) -> String {
@@ -402,8 +420,7 @@ mod tests {
     use crate::{GitHubAccessSubject, InstanceConfig, RuntimeSource};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn generated_runtime_selects_one_flow_without_serializing_secret_values() {
+    fn fixture() -> Instance {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -430,7 +447,7 @@ mod tests {
             flows: BTreeMap::from([("replacement".into(), PluginFlowClass::LifecycleReplacement)]),
             environment_files: BTreeMap::from([("API_TOKEN".into(), secret)]),
         };
-        let instance = Instance {
+        Instance {
             saved_bytes: std::sync::Mutex::new(None),
             directory: directory.clone(),
             config: Some(InstanceConfig {
@@ -467,7 +484,69 @@ mod tests {
                     branch_prefix: Some("deployment-agent".into()),
                 },
             }),
-        };
+        }
+    }
+
+    #[test]
+    fn startup_builds_active_plugin_and_propagates_build_failure() {
+        let mut instance = fixture();
+        let mut inactive = instance.config().unwrap().plugins["example.plugin"].clone();
+        inactive.id = "inactive.plugin".into();
+        inactive.image = "inactive:dev".into();
+        instance
+            .config
+            .as_mut()
+            .unwrap()
+            .plugins
+            .insert(inactive.id.clone(), inactive);
+        let plugin = &instance.config().unwrap().plugins["example.plugin"];
+        for fail in [false, true] {
+            let mut calls = 0;
+            let result = instance.rebuild_active_plugin_with(|command| {
+                calls += 1;
+                assert_eq!(command.get_program(), "docker");
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    vec![
+                        std::ffi::OsStr::new("build"),
+                        std::ffi::OsStr::new("--tag"),
+                        std::ffi::OsStr::new("example:dev"),
+                        std::ffi::OsStr::new("--file"),
+                        plugin.dockerfile.as_os_str(),
+                        plugin.build_context.as_os_str(),
+                    ]
+                );
+                if fail {
+                    Err(SetupError::Config("build failed".into()))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.is_err(), fail);
+        }
+        instance.config.as_mut().unwrap().active_plugin = None;
+        instance
+            .rebuild_active_plugin_with(|_| panic!("inactive plugins must not build"))
+            .unwrap();
+        fs::remove_dir_all(instance.directory).unwrap();
+    }
+
+    #[test]
+    fn startup_rejects_missing_active_plugin() {
+        let mut instance = fixture();
+        instance.config.as_mut().unwrap().plugins.clear();
+        let error = instance
+            .rebuild_active_plugin_with(|_| panic!("missing plugin must not build"))
+            .unwrap_err();
+        assert!(error.to_string().contains("is not installed"));
+        fs::remove_dir_all(instance.directory).unwrap();
+    }
+
+    #[test]
+    fn generated_runtime_selects_one_flow_without_serializing_secret_values() {
+        let instance = fixture();
+        let directory = &instance.directory;
         instance.write_plugin_runtime_files().unwrap();
         let overlay = fs::read_to_string(instance.plugin_overlay_path()).unwrap();
         let policy = fs::read_to_string(directory.join("effective-policy.yml")).unwrap();

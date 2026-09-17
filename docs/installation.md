@@ -316,8 +316,11 @@ donkeyspace plugin list
 ```
 
 The manifest's optional `installation` section tells Donkeyspace how to build
-the image and which environment inputs it accepts. Images are built only when
-missing; use `donkeyspace plugin rebuild ID` for an explicit rebuild. Supply
+the image and which environment inputs it accepts. Connecting builds the image
+if it is missing. CLI `up` and the TUI Start action rebuild the active plugin
+image before starting the stack, using Docker's build cache. A plugin build
+failure stops startup and reports the error. Inactive plugins are not rebuilt;
+use `donkeyspace plugin rebuild ID` for an explicit rebuild. Supply
 non-interactive values through private files, never command-line values:
 
 ```sh
