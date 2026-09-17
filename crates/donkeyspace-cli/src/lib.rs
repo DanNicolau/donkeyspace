@@ -1693,9 +1693,9 @@ impl Instance {
                 codex_home.display()
             ));
             // A connected Codex home is a host bind mount, not the named-volume
-            // default. Give it a private SELinux label so Codex credentials are
-            // readable inside the worker on enforcing hosts.
-            lines.push("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:Z".into());
+            // default. Both the worker and plugin containers use this home,
+            // so they need a shared SELinux label on enforcing hosts.
+            lines.push("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:z".into());
         }
         if let Some(github) = &config.github {
             match github {
@@ -3006,7 +3006,8 @@ mod tests {
             .write_compose_env(instance.config().unwrap())
             .unwrap();
         let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
-        assert!(environment.contains("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:Z\n"));
+        assert!(environment.contains("DONKEYSPACE_CODEX_HOME_SOURCE=/tmp/codex-home\n"));
+        assert!(environment.contains("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:z\n"));
         fs::remove_dir_all(directory).unwrap();
     }
 

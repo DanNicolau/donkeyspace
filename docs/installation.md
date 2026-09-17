@@ -224,7 +224,8 @@ credentials are stored outside the source tree by default, and
 The Compose files label host bind mounts for container access on
 SELinux-enforcing Fedora, RHEL, CentOS Stream, Rocky Linux, and AlmaLinux
 hosts. Policy and plugin paths use the shared `z` label because both the API
-and worker mount them. A host-backed Codex home uses the private `Z` label and
+and worker mount them. A host-backed Codex home also uses the shared `z` label
+because the worker and plugin job containers mount the same directory, and
 the setup CLI configures it automatically. Named volumes require no relabeling.
 Do not add `z` or `Z` to the Docker socket mount.
 
@@ -262,10 +263,28 @@ their existing trusted identities into both independent lists.
 entirely with Codex. `--method api-key` reads a hidden prompt and pipes the key
 to `codex login --with-api-key`; Donkeyspace does not persist the key. Both
 branches finish with `codex login status`. Setup records only the Codex home
-directory path so Compose can mount the CLI-owned credentials into the worker;
+directory path (including a custom `CODEX_HOME`) so Compose and plugin job
+containers mount the same CLI-owned credentials at `/root/.codex`;
 Donkeyspace never reads or copies the OAuth/API credentials. These are the two local sign-in
 methods described by the
 [official Codex authentication documentation](https://learn.chatgpt.com/docs/auth).
+
+After upgrading an existing deployment, run `donkeyspace up` with the updated
+CLI and source tree to regenerate the configuration and rebuild/recreate the
+worker. This replaces the old plugin-job credential volume selection with the
+configured Codex home. A plain container restart does not apply mount or
+environment changes. No credential copying is required.
+
+Once the stack shares that directory, signing into another account in the same
+Codex home takes effect for newly launched Codex processes without a stack
+restart. Changing the home directory itself requires `donkeyspace up` to apply
+the new mount. Already-running Codex processes may retain their previous login.
+
+For manual Compose deployments, set `DONKEYSPACE_CODEX_HOME_SOURCE` to an
+absolute host directory and use `DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:z` on
+SELinux hosts. With no source configured, both the worker and plugin jobs use
+the `donkeyspace-codex-home` named volume. Standalone workers still accept the
+legacy `DONKEYSPACE_CODEX_VOLUME` setting when no explicit source is provided.
 
 Direct OpenAI-compatible triage settings remain an advanced runtime option and
 are not required during setup.

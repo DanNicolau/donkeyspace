@@ -100,11 +100,15 @@ async fn run_container_until(
         ]);
         docker.args(["--workdir", "/workspace"]);
     }
-    if let Ok(volume) = env::var("DONKEYSPACE_CODEX_VOLUME") {
-        docker.args([
-            "--mount",
-            &format!("type=volume,src={volume},dst=/root/.codex"),
-        ]);
+    let codex_source = env::var("DONKEYSPACE_CODEX_HOME_SOURCE").ok();
+    let legacy_codex_volume = env::var("DONKEYSPACE_CODEX_VOLUME").ok();
+    let codex_mount_suffix = env::var("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX").ok();
+    if let Some(mount) = codex_home_mount(
+        codex_source.as_deref(),
+        legacy_codex_volume.as_deref(),
+        codex_mount_suffix.as_deref(),
+    )? {
+        docker.args(["--volume", &mount]);
     }
     if let Ok(source) = env::var("DONKEYSPACE_OSS_TOOLS_PATH") {
         let source = source.trim();
@@ -192,6 +196,42 @@ async fn run_container_until(
     }
 }
 
+// Resolve Docker-host paths, not paths inside the worker. The legacy volume is
+// supported for standalone workers, but must never override an explicit source.
+fn codex_home_mount(
+    source: Option<&str>,
+    legacy_volume: Option<&str>,
+    suffix: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(source) = source.or(legacy_volume) else {
+        return Ok(None);
+    };
+    let is_bind = Path::new(source).is_absolute();
+    let valid_volume = source
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && source
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
+    if source.contains([':', '\n', '\r', '\0']) || (!is_bind && !valid_volume) {
+        return Err(
+            "Codex credential source must be an absolute host path or a Docker volume name; check DONKEYSPACE_CODEX_HOME_SOURCE (or legacy DONKEYSPACE_CODEX_VOLUME)".into(),
+        );
+    }
+    let suffix = match suffix.unwrap_or("") {
+        "" => "",
+        // Older setup versions emitted :Z. Sharing the home requires :z so a
+        // new job cannot revoke access for the worker or concurrent jobs.
+        ":z" | ":Z" => ":z",
+        _ => return Err("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX must be empty or :z".into()),
+    };
+    Ok(Some(format!(
+        "{source}:/root/.codex{}",
+        if is_bind { suffix } else { "" }
+    )))
+}
+
 fn execution_labels(execution: &ContainerExecution) -> Vec<(&'static str, String)> {
     let mut labels = vec![
         ("donkeyspace.execution-id", execution.id.to_string()),
@@ -214,6 +254,124 @@ fn execution_labels(execution: &ContainerExecution) -> Vec<(&'static str, String
 mod tests {
     use super::*;
     use std::{path::PathBuf, time::Duration};
+
+    #[test]
+    fn configured_codex_home_overrides_legacy_credentials() {
+        assert_eq!(
+            codex_home_mount(
+                Some("/home/user/custom codex"),
+                Some("old-personal-credentials"),
+                Some(":z"),
+            )
+            .unwrap(),
+            Some("/home/user/custom codex:/root/.codex:z".into()),
+        );
+    }
+
+    #[test]
+    fn codex_named_volume_defaults_and_legacy_workers_remain_supported() {
+        for (source, legacy) in [
+            (Some("donkeyspace-codex-home"), None),
+            (None, Some("donkeyspace-codex-home")),
+        ] {
+            assert_eq!(
+                codex_home_mount(source, legacy, None).unwrap(),
+                Some("donkeyspace-codex-home:/root/.codex".into()),
+            );
+        }
+        assert_eq!(codex_home_mount(None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn codex_bind_mounts_share_selinux_labels() {
+        for suffix in [":z", ":Z"] {
+            assert_eq!(
+                codex_home_mount(Some("/custom/codex"), None, Some(suffix)).unwrap(),
+                Some("/custom/codex:/root/.codex:z".into()),
+            );
+        }
+        assert_eq!(
+            codex_home_mount(Some("/custom/codex"), None, None).unwrap(),
+            Some("/custom/codex:/root/.codex".into()),
+        );
+    }
+
+    #[test]
+    fn invalid_codex_source_does_not_fall_back_to_another_account() {
+        for source in [
+            "",
+            "./codex",
+            "~/codex",
+            "path/relative",
+            "/codex:ro",
+            "/codex\n",
+        ] {
+            assert!(
+                codex_home_mount(Some(source), Some("old-credentials"), None).is_err(),
+                "accepted invalid source {source:?}",
+            );
+        }
+        assert!(codex_home_mount(Some("/codex"), None, Some(":ro")).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Docker Compose CLI (no daemon or credentials needed)"]
+    fn compose_worker_and_plugin_jobs_resolve_the_same_codex_source() {
+        let compose = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker-compose.yml");
+        for source in [None, Some("/tmp/custom codex home")] {
+            let mut command = std::process::Command::new("docker");
+            command
+                .args(["compose", "--env-file", "/dev/null", "-f"])
+                .arg(&compose)
+                .args(["config", "--format", "json"])
+                .env("DONKEYSPACE_DEPLOYMENT_MODE", "minimal")
+                .env_remove("DONKEYSPACE_CODEX_HOME_SOURCE")
+                .env_remove("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX")
+                .env("DONKEYSPACE_CODEX_VOLUME", "stale-personal-volume");
+            if let Some(source) = source {
+                command
+                    .env("DONKEYSPACE_CODEX_HOME_SOURCE", source)
+                    .env("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX", ":z");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "Compose configuration failed");
+            let config: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let worker = &config["services"]["worker"];
+            let mount = worker["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|mount| mount["target"] == "/root/.codex")
+                .unwrap();
+            let resolved_source = if mount["type"] == "volume" {
+                config["volumes"][mount["source"].as_str().unwrap()]["name"]
+                    .as_str()
+                    .unwrap()
+            } else {
+                assert_eq!(mount["bind"]["selinux"], "z");
+                mount["source"].as_str().unwrap()
+            };
+            let environment = &worker["environment"];
+            assert_eq!(
+                environment["DONKEYSPACE_CODEX_HOME_SOURCE"],
+                resolved_source
+            );
+            let plugin_mount = codex_home_mount(
+                environment["DONKEYSPACE_CODEX_HOME_SOURCE"].as_str(),
+                Some("stale-personal-volume"),
+                environment["DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX"].as_str(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                plugin_mount,
+                format!(
+                    "{resolved_source}:/root/.codex{}",
+                    if source.is_some() { ":z" } else { "" },
+                ),
+            );
+        }
+    }
 
     fn fixture_execution(root: &Path) -> ContainerExecution {
         let id = Uuid::now_v7();
@@ -311,6 +469,8 @@ mod tests {
             for key in [
                 "DONKEYSPACE_WORKSPACE_VOLUME",
                 "DONKEYSPACE_CODEX_VOLUME",
+                "DONKEYSPACE_CODEX_HOME_SOURCE",
+                "DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX",
                 "DONKEYSPACE_OSS_TOOLS_PATH",
                 "DONKEYSPACE_TECH_PATH",
             ] {
