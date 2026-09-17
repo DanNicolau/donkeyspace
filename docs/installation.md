@@ -259,6 +259,18 @@ their existing trusted identities into both independent lists.
 
 ## Codex
 
+The CLI overview and **Configure Codex** screen show the configured login's
+email and plan. API-key logins are identified as such without displaying the
+key; Codex does not provide an account email for that login method. The
+configuration screen also shows the Codex home and supports **R** to refresh.
+Account details refresh after login and every 30 seconds. Failed lookups show
+`account unavailable` instead of claiming the account is connected.
+
+The lookup uses Codex's local `account/read` endpoint with the configured
+`CODEX_HOME`. It reads saved account metadata without requesting a token
+refresh or starting an agent run; it does not verify network access or identify
+credentials retained by already-running jobs.
+
 `connect codex --method chatgpt` runs `codex login` and leaves the browser flow
 entirely with Codex. `--method api-key` reads a hidden prompt and pipes the key
 to `codex login --with-api-key`; Donkeyspace does not persist the key. Both
