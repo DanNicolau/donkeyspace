@@ -1,3 +1,4 @@
+use crate::codex_account::{self, CodexAccount};
 use crate::{
     CheckLevel, DEFAULT_API_PORT, DEFAULT_WEB_PORT, DeploymentStatus, DoctorReport,
     GitHubAccessScope, GitHubAccessSubject, GitHubInstanceConfig, IngressMode, Instance,
@@ -38,6 +39,8 @@ const HOME_ACTIONS: &[&str] = &[
     "Manage plugins",
     "Manage repositories",
 ];
+
+const CODEX_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -99,6 +102,10 @@ enum TaskResult {
     SaveRepositories(Result<String, SetupError>),
     Access(Result<String, SetupError>),
     Codex(Result<(), SetupError>),
+    CodexAccount {
+        generation: u64,
+        account: CodexAccount,
+    },
     Plugin(Result<String, SetupError>),
 }
 
@@ -130,6 +137,11 @@ struct App {
     pat: Option<String>,
     should_quit: bool,
     last_refresh: Instant,
+    codex_home: Option<PathBuf>,
+    codex_account: CodexAccount,
+    codex_generation: u64,
+    codex_refresh_pending: bool,
+    codex_last_refresh: Instant,
 }
 
 impl App {
@@ -196,6 +208,21 @@ impl App {
             pat: None,
             should_quit: false,
             last_refresh: Instant::now() - Duration::from_secs(3),
+            codex_home: instance
+                .config()
+                .and_then(|config| config.codex_home.clone()),
+            codex_account: if instance
+                .config()
+                .and_then(|config| config.codex_home.as_ref())
+                .is_some()
+            {
+                CodexAccount::Checking
+            } else {
+                CodexAccount::NotConfigured
+            },
+            codex_generation: 0,
+            codex_refresh_pending: false,
+            codex_last_refresh: Instant::now() - CODEX_REFRESH_INTERVAL,
         })
     }
 
@@ -222,6 +249,18 @@ impl App {
         self.screen = Screen::CodexMethod;
         self.selected = 0;
         self.reset_messages();
+        self.refresh_codex_account();
+    }
+
+    fn refresh_codex_account(&mut self) {
+        self.codex_generation += 1;
+        self.codex_refresh_pending = false;
+        self.codex_last_refresh = Instant::now() - CODEX_REFRESH_INTERVAL;
+        self.codex_account = if self.codex_home.is_some() {
+            CodexAccount::Checking
+        } else {
+            CodexAccount::NotConfigured
+        };
     }
 
     fn begin_github_access(&mut self, instance: &Instance) {
@@ -357,6 +396,30 @@ pub async fn run(config_dir: Option<PathBuf>) -> Result<(), SetupError> {
 
     loop {
         let current = Instance::open(app.config_dir.clone())?;
+        let codex_home = current
+            .config()
+            .and_then(|config| config.codex_home.clone());
+        if app.codex_home != codex_home {
+            app.codex_home = codex_home;
+            app.refresh_codex_account();
+        }
+        if app.busy.is_none()
+            && !app.codex_refresh_pending
+            && app.codex_last_refresh.elapsed() >= CODEX_REFRESH_INTERVAL
+            && let Some(home) = app.codex_home.clone()
+        {
+            app.codex_refresh_pending = true;
+            app.codex_last_refresh = Instant::now();
+            let generation = app.codex_generation;
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let account = codex_account::read_account(&home).await;
+                let _ = sender.send(TaskResult::CodexAccount {
+                    generation,
+                    account,
+                });
+            });
+        }
         terminal
             .terminal
             .draw(|frame| render(frame, &app, &current))?;
@@ -414,8 +477,20 @@ fn spawn_operation(
 }
 
 fn apply_task_result(app: &mut App, result: TaskResult) {
-    app.busy = None;
+    // Account refreshes run independently of foreground setup operations.
+    if !matches!(&result, TaskResult::CodexAccount { .. }) {
+        app.busy = None;
+    }
     match result {
+        TaskResult::CodexAccount {
+            generation,
+            account,
+        } => {
+            if generation == app.codex_generation {
+                app.codex_account = account;
+                app.codex_refresh_pending = false;
+            }
+        }
         TaskResult::Status(Ok(status)) => app.status = status,
         TaskResult::Status(Err(error)) => app.error = Some(error.to_string()),
         TaskResult::Doctor(Ok(report)) => {
@@ -547,6 +622,7 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
             app.confirm_remove = false;
         }
         TaskResult::Codex(Ok(())) => {
+            app.refresh_codex_account();
             app.notice = Some("Codex authentication verified.".into());
             app.screen = Screen::Doctor;
             app.doctor = None;
@@ -1482,6 +1558,7 @@ fn handle_codex_method(
     sender: mpsc::UnboundedSender<TaskResult>,
 ) -> Result<(), SetupError> {
     match key.code {
+        KeyCode::Char('r') => app.refresh_codex_account(),
         KeyCode::Up => app.selected = app.selected.saturating_sub(1),
         KeyCode::Down => app.selected = (app.selected + 1).min(2),
         KeyCode::Esc => app.show_home(),
@@ -1736,13 +1813,7 @@ fn render(frame: &mut Frame, app: &App, instance: &Instance) {
                 "Enter validate and save  Tab next  Esc back\nRunning APIs are recreated automatically so changes apply to new events.",
             );
         }
-        Screen::CodexMethod => render_menu(
-            frame,
-            vertical[1],
-            "Connect Codex",
-            &["ChatGPT browser login", "OpenAI project API key", "Back"],
-            app.selected,
-        ),
+        Screen::CodexMethod => render_codex(frame, vertical[1], app),
         Screen::CodexApiKey => render_form(
             frame,
             vertical[1],
@@ -1836,17 +1907,7 @@ fn render_home(frame: &mut Frame, area: Rect, app: &App, instance: &Instance) {
                 None => "not connected",
             }
         )),
-        Line::from(format!(
-            "Codex         {}",
-            if config
-                .and_then(|config| config.codex_home.as_ref())
-                .is_some()
-            {
-                "connected"
-            } else {
-                "not connected"
-            }
-        )),
+        Line::from(format!("Codex         {}", app.codex_account)),
         Line::from(format!(
             "Ingress       {}",
             if app.polling_warning(instance) {
@@ -2095,6 +2156,46 @@ fn render_plugins(frame: &mut Frame, area: Rect, app: &App, instance: &Instance)
         )
         .style(Style::default().fg(Color::Yellow)),
         Rect::new(area.x + 4, area.y + area.height.saturating_sub(4), area.width.saturating_sub(8), 3),
+    );
+}
+
+fn render_codex(frame: &mut Frame, area: Rect, app: &App) {
+    let home = app
+        .codex_home
+        .as_ref()
+        .map(|home| home.display().to_string())
+        .unwrap_or_else(|| "not configured".into());
+    let details = format!(
+        "Account: {}\nCodex home: {home}\nR refresh account",
+        app.codex_account
+    );
+    let width = usize::from(area.width.saturating_sub(2).max(1));
+    let height = details
+        .lines()
+        .map(|line| line.chars().count().div_ceil(width))
+        .sum::<usize>()
+        + 2;
+    let rows = Layout::vertical([
+        Constraint::Length(height.min(10) as u16),
+        Constraint::Min(5),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(details)
+            .block(
+                Block::default()
+                    .title(" Configured Codex login ")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true }),
+        rows[0],
+    );
+    render_menu(
+        frame,
+        rows[1],
+        "Connect Codex",
+        &["ChatGPT browser login", "OpenAI project API key", "Back"],
+        app.selected,
     );
 }
 
@@ -2374,6 +2475,11 @@ mod tests {
             pat: None,
             should_quit: false,
             last_refresh: Instant::now(),
+            codex_home: None,
+            codex_account: CodexAccount::NotConfigured,
+            codex_generation: 0,
+            codex_refresh_pending: false,
+            codex_last_refresh: Instant::now(),
         }
     }
 
@@ -2529,7 +2635,11 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("donkeyspace-tui-render-{}", std::process::id()));
         let instance = Instance::open(Some(directory)).unwrap();
-        for (screen, width) in [(Screen::Home, 80), (Screen::GitHubPat, 42)] {
+        for (screen, width) in [
+            (Screen::Home, 80),
+            (Screen::GitHubPat, 42),
+            (Screen::CodexMethod, 42),
+        ] {
             let backend = TestBackend::new(width, 24);
             let mut terminal = Terminal::new(backend).unwrap();
             let app = app(screen);
@@ -2537,6 +2647,66 @@ mod tests {
                 .draw(|frame| render(frame, &app, &instance))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn codex_account_is_visible_on_home_and_configuration_screens() {
+        let instance =
+            Instance::open(Some(std::env::temp_dir().join("donkeyspace-codex-render"))).unwrap();
+        for screen in [Screen::Home, Screen::CodexMethod] {
+            let mut app = app(screen);
+            app.codex_home = Some("/custom/codex".into());
+            app.codex_account = CodexAccount::ChatGpt {
+                email: Some("work@example.com".into()),
+                plan: "business".into(),
+            };
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &app, &instance))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("work@example.com"));
+            assert!(rendered.contains("Business"));
+            if screen == Screen::CodexMethod {
+                assert!(rendered.contains("/custom/codex"));
+                assert!(rendered.contains("R refresh account"));
+            }
+        }
+    }
+
+    #[test]
+    fn account_refresh_does_not_interrupt_setup_or_restore_a_previous_login() {
+        let mut app = app(Screen::CodexMethod);
+        app.codex_home = Some("/custom/codex".into());
+        app.busy = Some("Authenticating Codex…".into());
+        app.refresh_codex_account();
+        apply_task_result(
+            &mut app,
+            TaskResult::CodexAccount {
+                generation: 0,
+                account: CodexAccount::ChatGpt {
+                    email: Some("old@example.com".into()),
+                    plan: "pro".into(),
+                },
+            },
+        );
+        assert_eq!(app.codex_account, CodexAccount::Checking);
+        let generation = app.codex_generation;
+        apply_task_result(
+            &mut app,
+            TaskResult::CodexAccount {
+                generation,
+                account: CodexAccount::ApiKey,
+            },
+        );
+        assert_eq!(app.codex_account, CodexAccount::ApiKey);
+        assert!(app.busy.is_some());
     }
 
     #[test]

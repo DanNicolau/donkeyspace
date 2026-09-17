@@ -14,6 +14,7 @@ use std::{
 };
 use thiserror::Error;
 
+mod codex_account;
 mod plugins;
 mod repositories;
 pub mod tui;
