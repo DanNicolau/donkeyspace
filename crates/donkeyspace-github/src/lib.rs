@@ -891,7 +891,10 @@ impl GitHubClient {
     ) -> Result<BTreeMap<String, GitHubProjectedIssue>, GitHubClientError> {
         let mut projected = BTreeMap::<String, (i64, i64)>::new();
         for item in work_items {
-            if let Some(issue) = self.find_projected_work_item(owner, repo, &item.id).await? {
+            if let Some(issue) = self
+                .find_projected_work_item(owner, repo, parent_issue_number, &item.id)
+                .await?
+            {
                 projected.insert(item.id.clone(), (issue.id, issue.number));
                 continue;
             }
@@ -949,26 +952,44 @@ impl GitHubClient {
         &self,
         owner: &str,
         repo: &str,
+        parent_issue_number: i64,
         work_item: &str,
     ) -> Result<Option<GitHubProjectedIssue>, GitHubClientError> {
-        let issues: Value = self
+        let mut page: Page<Value> = self
             .client
             .get(
                 format!("/repos/{owner}/{repo}/issues?state=all&per_page=100"),
                 None::<&()>,
             )
             .await?;
-        let marker = format!("<!-- donkeyspace-work-item-id:{work_item} -->");
-        Ok(issues.as_array().into_iter().flatten().find_map(|issue| {
-            issue
-                .get("body")
-                .and_then(Value::as_str)
-                .filter(|body| body.contains(&marker))?;
-            Some(GitHubProjectedIssue {
-                id: issue.get("id")?.as_i64()?,
-                number: issue.get("number")?.as_i64()?,
-            })
-        }))
+        loop {
+            for issue in &page.items {
+                if issue.get("pull_request").is_some() {
+                    continue;
+                }
+                let Some(body) = issue.get("body").and_then(Value::as_str) else {
+                    continue;
+                };
+                if projected_work_item_matches(body, parent_issue_number, work_item) {
+                    return Ok(Some(GitHubProjectedIssue {
+                        id: issue["id"].as_i64().ok_or_else(|| {
+                            GitHubClientError::InvalidResponse(
+                                "matched work-item issue has no id".into(),
+                            )
+                        })?,
+                        number: issue["number"].as_i64().ok_or_else(|| {
+                            GitHubClientError::InvalidResponse(
+                                "matched work-item issue has no number".into(),
+                            )
+                        })?,
+                    }));
+                }
+            }
+            let Some(next_page) = self.client.get_page(&page.next).await? else {
+                return Ok(None);
+            };
+            page = next_page;
+        }
     }
 
     pub async fn update_projected_work_item(
@@ -1216,6 +1237,30 @@ fn github_error_status(error: &octocrab::Error) -> Option<u16> {
     }
 }
 
+fn projected_work_item_matches(body: &str, parent_issue_number: i64, work_item: &str) -> bool {
+    // A block name is local to its parent lifecycle, not a repository-wide
+    // issue identity. Restrict matching to metadata before the specification.
+    let header = body.split("\nSpecification path:").next().unwrap_or(body);
+    let item_marker = format!("<!-- donkeyspace-work-item-id:{work_item} -->");
+    if !header
+        .lines()
+        .any(|line| line == "<!-- donkeyspace-work-item -->")
+        || !header.lines().any(|line| line == item_marker)
+    {
+        return false;
+    }
+    if let Some(parent_marker) = header
+        .lines()
+        .find(|line| line.starts_with("<!-- donkeyspace-parent-issue:"))
+    {
+        return parent_marker == format!("<!-- donkeyspace-parent-issue:{parent_issue_number} -->");
+    }
+    // Preserve retry recovery for issues created before the parent marker was
+    // added. Compare the complete line so #5 cannot accidentally match #50.
+    let legacy_parent = format!("Parent lifecycle issue: #{parent_issue_number}");
+    header.lines().any(|line| line == legacy_parent)
+}
+
 fn projected_work_item_body(parent_issue_number: i64, item: &GitHubWorkItem) -> String {
     let mut checkpoint = if item.accepted {
         String::from("Status: **Accepted**\n")
@@ -1240,7 +1285,7 @@ fn projected_work_item_body(parent_issue_number: i64, item: &GitHubWorkItem) -> 
         ));
     }
     format!(
-        "<!-- donkeyspace-work-item -->\n<!-- donkeyspace-work-item-id:{} -->\n\nParent lifecycle issue: #{parent_issue_number}\n\n{checkpoint}\nSpecification path: `{}`\n\n{}",
+        "<!-- donkeyspace-work-item -->\n<!-- donkeyspace-work-item-id:{} -->\n<!-- donkeyspace-parent-issue:{parent_issue_number} -->\n\nParent lifecycle issue: #{parent_issue_number}\n\n{checkpoint}\nSpecification path: `{}`\n\n{}",
         item.id, item.spec, item.body
     )
 }
@@ -1262,11 +1307,11 @@ mod tests {
     use super::{
         GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubWorkItem, SignatureError, branch_url,
         commit_url, compare_url, file_url, parse_app_webhook_status, parse_repository,
-        projected_work_item_body, select_installation_id, validate_installation_response,
-        validate_members_permission_response, verify_signature,
+        projected_work_item_body, projected_work_item_matches, select_installation_id,
+        validate_installation_response, validate_members_permission_response, verify_signature,
     };
     use hmac::{Hmac, Mac};
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use jsonwebtoken::EncodingKey;
     use octocrab::{AuthState, OctocrabBuilder, auth::AppAuth};
     use serde_json::json;
@@ -1275,7 +1320,7 @@ mod tests {
         collections::HashMap,
         convert::Infallible,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -1327,9 +1372,177 @@ mod tests {
         );
 
         assert!(body.contains("Parent lifecycle issue: #58"));
+        assert!(body.contains("<!-- donkeyspace-parent-issue:58 -->"));
         assert!(body.contains("Specification path: `docs/divider/spec.md`"));
         assert!(body.contains("Specification version: 1.1.0"));
         assert!(body.contains("Signed division."));
+    }
+
+    fn projection_fixture() -> GitHubWorkItem {
+        GitHubWorkItem {
+            id: "counter".into(),
+            spec: "docs/counter/spec.md".into(),
+            body: "New specification".into(),
+            depends_on: Vec::new(),
+            proposed_commit: None,
+            proposed_commit_url: None,
+            proposed_compare_url: None,
+            accepted_commit: None,
+            accepted: false,
+        }
+    }
+
+    #[test]
+    fn projected_work_item_identity_requires_exact_parent_and_item() {
+        let body = projected_work_item_body(50, &projection_fixture());
+        for body in [
+            body.clone(),
+            body.replace("<!-- donkeyspace-parent-issue:50 -->\n", ""),
+        ] {
+            assert!(projected_work_item_matches(&body, 50, "counter"));
+            assert!(!projected_work_item_matches(&body, 5, "counter"));
+            assert!(!projected_work_item_matches(&body, 50, "other"));
+            assert!(!projected_work_item_matches(
+                &format!("{body}\nParent lifecycle issue: #5"),
+                5,
+                "counter"
+            ));
+        }
+        // An explicit parent marker takes precedence over stale display text.
+        assert!(!projected_work_item_matches(
+            &body.replace("Parent lifecycle issue: #50", "Parent lifecycle issue: #5"),
+            5,
+            "counter"
+        ));
+        assert!(!projected_work_item_matches(
+            "<!-- donkeyspace-work-item-id:counter -->",
+            5,
+            "counter"
+        ));
+    }
+
+    #[tokio::test]
+    async fn independent_lifecycles_create_separate_issues_and_retries_reuse_their_own() {
+        let old_body = projected_work_item_body(2, &projection_fixture())
+            .replace("<!-- donkeyspace-parent-issue:2 -->\n", "");
+        let issues = Arc::new(Mutex::new(vec![
+            json!({"id":103,"number":3,"state":"closed","body":old_body}),
+        ]));
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let service_issues = Arc::clone(&issues);
+        let service_links = Arc::clone(&links);
+        let service = service_fn(move |request: http::Request<octocrab::OctoBody>| {
+            let issues = Arc::clone(&service_issues);
+            let links = Arc::clone(&service_links);
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                let payload = request.into_body().collect().await.unwrap().to_bytes();
+                let (status, body) = if method == http::Method::GET {
+                    assert_eq!(path, "/repos/example/project/issues");
+                    (200, json!(*issues.lock().unwrap()))
+                } else if path == "/repos/example/project/issues" {
+                    assert_eq!(method, http::Method::POST);
+                    let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let mut issues = issues.lock().unwrap();
+                    let number = 6 + issues.len();
+                    let issue = json!({"id":100+number,"number":number,"state":"open","body":payload["body"]});
+                    issues.push(issue.clone());
+                    (201, issue)
+                } else {
+                    assert_eq!(method, http::Method::POST);
+                    assert!(path.ends_with("/sub_issues"));
+                    let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    links
+                        .lock()
+                        .unwrap()
+                        .push((path, payload["sub_issue_id"].as_i64().unwrap()));
+                    (201, json!({}))
+                };
+                Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(Full::new(bytes::Bytes::from(body.to_string())))
+                        .unwrap(),
+                )
+            }
+        });
+        let client = GitHubClient {
+            client: OctocrabBuilder::new_empty()
+                .with_service(service)
+                .with_auth(AuthState::None)
+                .build()
+                .unwrap(),
+        };
+        for parent in [5, 6, 5, 6] {
+            let projected = client
+                .project_work_items("example", "project", parent, &[projection_fixture()])
+                .await
+                .unwrap();
+            assert_eq!(projected["counter"].number, parent + 2);
+        }
+        let issues = issues.lock().unwrap();
+        assert_eq!(issues.len(), 3);
+        assert_eq!(issues[0]["body"], old_body);
+        assert_eq!(issues[0]["state"], "closed");
+        assert_eq!(
+            *links.lock().unwrap(),
+            vec![
+                ("/repos/example/project/issues/5/sub_issues".into(), 107),
+                ("/repos/example/project/issues/6/sub_issues".into(), 108),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn projected_work_item_lookup_paginates_and_preserves_legacy_retry_identity() {
+        for fail_second_page in [false, true] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let request_count = Arc::clone(&requests);
+            let body = projected_work_item_body(5, &projection_fixture())
+                .replace("<!-- donkeyspace-parent-issue:5 -->\n", "");
+            let service = service_fn(move |request: http::Request<octocrab::OctoBody>| {
+                let index = request_count.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                async move {
+                    assert_eq!(request.method(), http::Method::GET);
+                    let response = if index == 0 {
+                        assert_eq!(request.uri().query(), Some("state=all&per_page=100"));
+                        http::Response::builder().status(200)
+                            .header(http::header::LINK, "<https://api.github.com/repos/example/project/issues?state=all&per_page=100&page=2>; rel=\"next\"")
+                            // GitHub's issue listing also includes pull requests.
+                            .body(Full::new(bytes::Bytes::from(json!([{"id":99,"number":99,"body":body,"pull_request":{}}]).to_string())))
+                    } else {
+                        assert_eq!(request.uri().query(), Some("state=all&per_page=100&page=2"));
+                        http::Response::builder()
+                            .status(if fail_second_page { 403 } else { 200 })
+                            .body(Full::new(bytes::Bytes::from(if fail_second_page {
+                                json!({"message":"Forbidden"}).to_string()
+                            } else {
+                                json!([{"id":107,"number":7,"state":"closed","body":body}])
+                                    .to_string()
+                            })))
+                    };
+                    Ok::<_, Infallible>(response.unwrap())
+                }
+            });
+            let client = GitHubClient {
+                client: OctocrabBuilder::new_empty()
+                    .with_service(service)
+                    .with_auth(AuthState::None)
+                    .build()
+                    .unwrap(),
+            };
+            let result = client
+                .project_work_items("example", "project", 5, &[projection_fixture()])
+                .await;
+            if fail_second_page {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap()["counter"].number, 7);
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[test]
