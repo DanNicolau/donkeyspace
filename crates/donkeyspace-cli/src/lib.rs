@@ -1441,13 +1441,28 @@ impl Instance {
     }
 
     pub fn up(&mut self) -> Result<(), SetupError> {
+        self.start_stack(false)?;
+        self.print_endpoints()
+    }
+
+    fn start_stack(&mut self, captured: bool) -> Result<(), SetupError> {
         let _lock = self.configuration_lock()?;
         self.require_unchanged_configuration(self.require_config()?)?;
         self.ensure_repositories_can_start()?;
         self.ensure_start_ports_available()?;
-        self.compose(&["up", "-d", "--build"], false)?;
-        self.mark_repositories_applied()?;
-        self.print_endpoints()
+        self.rebuild_active_plugin_with(|command| {
+            if captured {
+                run_captured(command)
+            } else {
+                run_status(command)
+            }
+        })?;
+        if captured {
+            self.compose_captured(&["up", "-d", "--build"])?;
+        } else {
+            self.compose(&["up", "-d", "--build"], false)?;
+        }
+        self.mark_repositories_applied()
     }
 
     pub fn down(&self) -> Result<(), SetupError> {
@@ -1486,12 +1501,7 @@ impl Instance {
     }
 
     pub fn start(&mut self) -> Result<(), SetupError> {
-        let _lock = self.configuration_lock()?;
-        self.require_unchanged_configuration(self.require_config()?)?;
-        self.ensure_repositories_can_start()?;
-        self.ensure_start_ports_available()?;
-        self.compose_captured(&["up", "-d", "--build"])?;
-        self.mark_repositories_applied()
+        self.start_stack(true)
     }
 
     pub fn stop(&self) -> Result<(), SetupError> {
@@ -1594,16 +1604,7 @@ impl Instance {
 
     fn compose_captured(&self, arguments: &[&str]) -> Result<(), SetupError> {
         let mut command = self.compose_command(arguments)?;
-        let description = describe_command(&command);
-        let output = command.output()?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(SetupError::Command {
-                command: description,
-                detail,
-            });
-        }
-        Ok(())
+        run_captured(&mut command)
     }
 
     fn save_and_apply_github_access(&self) -> Result<(), SetupError> {
@@ -2349,6 +2350,18 @@ fn read_secret(prompt: &str) -> Result<String, SetupError> {
     let _ = Command::new("stty").arg("echo").status();
     eprintln!();
     result
+}
+
+fn run_captured(command: &mut Command) -> Result<(), SetupError> {
+    let description = describe_command(command);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(SetupError::Command {
+            command: description,
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn run_status(command: &mut Command) -> Result<(), SetupError> {
