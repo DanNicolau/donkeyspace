@@ -199,6 +199,7 @@ pub async fn publish_attempt(
         "agent.stderr.log",
         "run-input.json",
         "run-result.json",
+        "result-contract.json",
         "required-checks.json",
     ] {
         copy_diagnostic_file(
@@ -523,6 +524,11 @@ async fn queue_status_comment(
                 .map(|wave| format!("Wave {wave}: "))
                 .unwrap_or_default();
             lines.push(format!("- {wave}{}{}", event.summary, source));
+            if event.event_type == "task_failed"
+                && let Some(reason) = event.reason.as_deref()
+            {
+                lines.push(format!("\n{}\n", truncate(reason, 3000)));
+            }
         }
     }
     if let Some(pull_request_url) = publications.iter().find_map(|publication| {
@@ -981,7 +987,12 @@ fn collect_child_task_diagnostics(
             let target = diagnostic_root
                 .join(target_name)
                 .join(safe_segment(&task_name));
-            for name in ["run-result.json", "agent.stdout.log", "agent.stderr.log"] {
+            for name in [
+                "run-result.json",
+                "result-contract.json",
+                "agent.stdout.log",
+                "agent.stderr.log",
+            ] {
                 copy_diagnostic_file(
                     &source_diagnostics.join(name),
                     &target.join(name),
@@ -1278,6 +1289,16 @@ mod tests {
         .unwrap();
         fs::write(task_diagnostics.join("agent.stdout.log"), "DV complete\n").unwrap();
         fs::write(task_diagnostics.join("agent.stderr.log"), "").unwrap();
+        let correction = json!({
+            "accepted": true,
+            "rejected_result": {"resources_used": ["docs", "runtime description"]},
+            "corrections": [{"response": {"resources_used": ["docs"]}}]
+        });
+        fs::write(
+            task_diagnostics.join("result-contract.json"),
+            correction.to_string(),
+        )
+        .unwrap();
 
         let mut budget = DiagnosticBudget::default();
         let mut manifest = Vec::new();
@@ -1305,7 +1326,17 @@ mod tests {
             .unwrap(),
             "DV complete\n"
         );
-        assert_eq!(budget.files, 3);
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &fs::read_to_string(
+                    diagnostic_root.join("child-tasks/0300-dv-counter_detect/result-contract.json")
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            correction
+        );
+        assert_eq!(budget.files, 4);
 
         fs::remove_dir_all(root).unwrap();
     }
