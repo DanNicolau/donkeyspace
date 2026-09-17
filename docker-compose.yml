@@ -64,7 +64,10 @@ services:
       DONKEYSPACE_LLM_API_KEY: ${DONKEYSPACE_LLM_API_KEY:-}
       DONKEYSPACE_WORKSPACE_ROOT: /workspaces
       DONKEYSPACE_WORKSPACE_VOLUME: donkeyspace-workspaces
-      DONKEYSPACE_CODEX_VOLUME: donkeyspace-codex-home
+      # Pass the same source mounted below to plugin job containers. The
+      # default is the Docker volume's actual name, not its Compose alias.
+      DONKEYSPACE_CODEX_HOME_SOURCE: ${DONKEYSPACE_CODEX_HOME_SOURCE:-donkeyspace-codex-home}
+      DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX: ${DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX:-}
       DONKEYSPACE_OSS_TOOLS_PATH: ${DONKEYSPACE_OSS_TOOLS_PATH:-}
       DONKEYSPACE_TECH_PATH: ${DONKEYSPACE_TECH_PATH:-}
       DONKEYSPACE_REPO_CONTEXT_MAX_BYTES: ${DONKEYSPACE_REPO_CONTEXT_MAX_BYTES:-20000}
