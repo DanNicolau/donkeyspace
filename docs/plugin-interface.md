@@ -477,6 +477,13 @@ push, apply labels, open pull requests, or edit outside the filtered workspace.
 
 ## GitHub relationship projection
 
+Work-item issue identity is scoped to the repository, parent lifecycle issue,
+and work-item ID. Retries and revisions reuse issues from the same parent;
+another lifecycle using the same block name creates its own issue, even if an
+earlier lifecycle's work-item issue is still open. Closed historical issues
+retain their original specification and parent. Existing issues without the
+parent identity marker remain reusable only when their recorded parent matches.
+
 When `project_github_issues: true`, donkeyspace creates one GitHub sub-issue per
 work item and projects registry dependencies as native blocked-by
 relationships. Generated issues are marked so their webhooks cannot recursively
