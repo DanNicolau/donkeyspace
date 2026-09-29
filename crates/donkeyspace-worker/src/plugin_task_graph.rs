@@ -1,12 +1,7 @@
 use donkeyspace_core::{PluginFlow, PluginTaskScope, PluginWorkItem};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TaskKey {
-    pub work_item: Option<String>,
-    pub task: String,
-}
+pub use donkeyspace_core::TaskKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -140,6 +135,15 @@ impl TaskGraph {
     }
 
     pub fn restart_from(&mut self, key: &TaskKey) -> Result<Vec<TaskKey>, String> {
+        let invalidated = self.affected_by(key)?;
+        for invalidated_key in &invalidated {
+            self.set_state(invalidated_key, TaskState::Waiting)?;
+        }
+        Ok(invalidated)
+    }
+
+    /// Shared by repair scheduling and the human revision preview.
+    pub fn affected_by(&self, key: &TaskKey) -> Result<Vec<TaskKey>, String> {
         if !self.states.contains_key(key) {
             return Err(format!("task graph has no task `{key:?}`"));
         }
@@ -157,9 +161,6 @@ impl TaskGraph {
             if invalidated.len() == before {
                 break;
             }
-        }
-        for invalidated_key in &invalidated {
-            self.set_state(invalidated_key, TaskState::Waiting)?;
         }
         Ok(invalidated.into_iter().collect())
     }

@@ -1,3 +1,4 @@
+use crate::Outcome;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
@@ -143,5 +144,17 @@ mod tests {
         let state = normalize_workflow_labels(&labels, &state_labels());
 
         assert!(matches!(state, LabelState::Conflict(labels) if labels.len() == 2));
+    }
+}
+
+pub fn workflow_state_for_outcome(outcome: Outcome) -> WorkflowState {
+    match outcome {
+        Outcome::Ready => WorkflowState::Ready,
+        Outcome::NeedsInfo => WorkflowState::NeedsInfo,
+        Outcome::Implemented => WorkflowState::PrOpen,
+        Outcome::Reviewed => WorkflowState::PrOpen,
+        Outcome::NeedsChanges => WorkflowState::PrOpen,
+        Outcome::NeedsHuman => WorkflowState::NeedsHuman,
+        Outcome::Blocked | Outcome::Failed => WorkflowState::Blocked,
     }
 }

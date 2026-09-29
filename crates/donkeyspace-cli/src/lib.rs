@@ -15,12 +15,13 @@ use std::{
 use thiserror::Error;
 
 mod codex_account;
+mod codex_auth;
 mod plugins;
 mod repositories;
 pub mod tui;
 pub use plugins::{PluginConnectOptions, PluginEnvironmentInput};
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_WEB_PORT: u16 = 5173;
 pub const DEFAULT_GITHUB_POLL_INTERVAL_SECONDS: u64 = 60;
@@ -72,6 +73,8 @@ pub struct InstanceConfig {
     pub web_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_auth_method: Option<CodexLoginMethod>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GitHubInstanceConfig>,
     #[serde(default)]
@@ -240,9 +243,11 @@ pub struct ConnectGitHubOptions {
     pub pat: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CodexLoginMethod {
+    #[serde(rename = "chatgpt")]
     ChatGpt,
+    #[serde(rename = "api-key")]
     ApiKey,
 }
 
@@ -365,6 +370,16 @@ pub struct PendingGitHubApp {
     webhook_secret_file: PathBuf,
 }
 
+/// Release a configuration or credential lock when the operation ends, even
+/// when a subprocess holds a duplicate descriptor.
+pub(crate) struct OperationLock(fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 pub struct Instance {
     directory: PathBuf,
     config: Option<InstanceConfig>,
@@ -395,7 +410,7 @@ impl Instance {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
-                5..=7 => {
+                5..=8 => {
                     config.schema_version = SCHEMA_VERSION;
                     true
                 }
@@ -476,6 +491,7 @@ impl Instance {
                 api_port: api_port.unwrap_or(DEFAULT_API_PORT),
                 web_port: web_port.unwrap_or(DEFAULT_WEB_PORT),
                 codex_home: None,
+                codex_auth_method: None,
                 github: None,
                 repositories_pending_apply: false,
                 github_access: BTreeMap::new(),
@@ -1101,57 +1117,6 @@ impl Instance {
         Ok(())
     }
 
-    pub fn connect_codex(&mut self, method: CodexLoginMethod) -> Result<(), SetupError> {
-        self.require_config()?;
-        match method {
-            CodexLoginMethod::ChatGpt => run_status(Command::new("codex").arg("login"))?,
-            CodexLoginMethod::ApiKey => {
-                let key = read_secret("OpenAI project API key: ")?;
-                self.run_codex_api_key_login(&key)?;
-            }
-        }
-        self.finish_codex_connection()
-    }
-
-    pub fn connect_codex_api_key(&mut self, key: &str) -> Result<(), SetupError> {
-        self.require_config()?;
-        self.run_codex_api_key_login(key)?;
-        self.finish_codex_connection()
-    }
-
-    pub fn codex_login_status(&self) -> Result<(), SetupError> {
-        check_command("codex", &["login", "status"])
-    }
-
-    fn run_codex_api_key_login(&self, key: &str) -> Result<(), SetupError> {
-        if key.trim().is_empty() {
-            return Err(SetupError::Config("API key cannot be empty".into()));
-        }
-        let mut child = Command::new("codex")
-            .args(["login", "--with-api-key"])
-            .stdin(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(key.trim().as_bytes())?;
-        let status = child.wait()?;
-        if !status.success() {
-            return Err(SetupError::Command {
-                command: "codex login --with-api-key".into(),
-                detail: status.to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    fn finish_codex_connection(&mut self) -> Result<(), SetupError> {
-        run_status(Command::new("codex").args(["login", "status"]))?;
-        self.config.as_mut().unwrap().codex_home = Some(default_codex_home());
-        self.save()
-    }
-
     pub async fn doctor_report(&self) -> Result<DoctorReport, SetupError> {
         let config = self.require_config()?;
         let mut checks = vec![
@@ -1397,10 +1362,9 @@ impl Instance {
                 });
             }
         }
-        checks.push(command_doctor_check(
-            "Codex authentication",
-            "codex",
-            &["login", "status"],
+        checks.push(doctor_result(
+            "Codex automation authentication",
+            self.codex_login_status(),
         ));
         checks.push(match self.deployment_status() {
             Ok(status) => DoctorCheck {
@@ -1689,15 +1653,13 @@ impl Instance {
                 self.directory.join("effective-policy.yml").display()
             ),
         ];
-        if let Some(codex_home) = &config.codex_home {
+        if let Some((home, method)) = self.codex_connection(config)? {
             lines.push(format!(
-                "DONKEYSPACE_CODEX_HOME_SOURCE={}",
-                codex_home.display()
+                "DONKEYSPACE_CODEX_AUTH_SOURCE={}",
+                home.join("auth.json").display()
             ));
-            // A connected Codex home is a host bind mount, not the named-volume
-            // default. Both the worker and plugin containers use this home,
-            // so they need a shared SELinux label on enforcing hosts.
-            lines.push("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:z".into());
+            lines.push(format!("DONKEYSPACE_CODEX_AUTH_METHOD={}", method.name()));
+            lines.push("DONKEYSPACE_CODEX_AUTH_MOUNT_SUFFIX=:z".into());
         }
         if let Some(github) = &config.github {
             match github {
@@ -1887,13 +1849,6 @@ fn default_config_directory() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config/donkeyspace")
-}
-
-fn default_codex_home() -> PathBuf {
-    env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
 fn validate_owner(owner: &str) -> Result<(), SetupError> {
@@ -2770,6 +2725,7 @@ mod tests {
             api_port: 8080,
             web_port: 5173,
             codex_home: None,
+            codex_auth_method: None,
             github: Some(GitHubInstanceConfig::Pat {
                 token_file: "/config/secrets/github-pat".into(),
                 repositories: vec!["owner/repo".into()],
@@ -2793,7 +2749,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        for schema_version in 1..=7 {
+        for schema_version in 1..=8 {
             let directory =
                 env::temp_dir().join(format!("donkeyspace-schema-test-{unique}-{schema_version}"));
             fs::create_dir_all(&directory).unwrap();
@@ -2909,6 +2865,7 @@ mod tests {
             api_port: 8080,
             web_port: 5173,
             codex_home: None,
+            codex_auth_method: None,
             github: Some(GitHubInstanceConfig::Pat {
                 token_file: "/secret".into(),
                 repositories: vec!["acme/rtl".into(), "acme/dv".into()],
@@ -2952,6 +2909,7 @@ mod tests {
             api_port: 8080,
             web_port: 5173,
             codex_home: None,
+            codex_auth_method: None,
             github: None,
             repositories_pending_apply: false,
             github_access: BTreeMap::new(),
@@ -2995,6 +2953,7 @@ mod tests {
                 api_port: 18_080,
                 web_port: 15_173,
                 codex_home: None,
+                codex_auth_method: None,
                 github: None,
                 repositories_pending_apply: false,
                 github_access: BTreeMap::new(),
@@ -3016,12 +2975,26 @@ mod tests {
         assert!(!environment.contains("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX"));
 
         instance.config.as_mut().unwrap().codex_home = Some("/tmp/codex-home".into());
+        assert!(
+            instance
+                .write_compose_env(instance.config().unwrap())
+                .is_err()
+        );
+        let home = directory.join("codex-automation");
+        write_secret(&home.join("auth.json"), b"synthetic-auth").unwrap();
+        instance.config.as_mut().unwrap().codex_home = Some(home.clone());
+        instance.config.as_mut().unwrap().codex_auth_method = Some(CodexLoginMethod::ApiKey);
         instance
             .write_compose_env(instance.config().unwrap())
             .unwrap();
         let environment = fs::read_to_string(directory.join(GENERATED_ENV)).unwrap();
-        assert!(environment.contains("DONKEYSPACE_CODEX_HOME_SOURCE=/tmp/codex-home\n"));
-        assert!(environment.contains("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:z\n"));
+        assert!(environment.contains(&format!(
+            "DONKEYSPACE_CODEX_AUTH_SOURCE={}\n",
+            home.join("auth.json").display()
+        )));
+        assert!(environment.contains("DONKEYSPACE_CODEX_AUTH_METHOD=api-key\n"));
+        assert!(environment.contains("DONKEYSPACE_CODEX_AUTH_MOUNT_SUFFIX=:z\n"));
+        assert!(!environment.contains("synthetic-auth"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3043,6 +3016,7 @@ mod tests {
                 api_port: 8080,
                 web_port: 5173,
                 codex_home: None,
+                codex_auth_method: None,
                 github: Some(GitHubInstanceConfig::Pat {
                     token_file: "/tmp/token".into(),
                     repositories: vec!["owner/repo".into()],
@@ -3083,6 +3057,7 @@ mod tests {
                 api_port: 8080,
                 web_port: 5173,
                 codex_home: None,
+                codex_auth_method: None,
                 github: Some(GitHubInstanceConfig::App {
                     app_id: 1,
                     installation_id: 2,

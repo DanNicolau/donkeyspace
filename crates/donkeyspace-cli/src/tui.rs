@@ -208,14 +208,8 @@ impl App {
             pat: None,
             should_quit: false,
             last_refresh: Instant::now() - Duration::from_secs(3),
-            codex_home: instance
-                .config()
-                .and_then(|config| config.codex_home.clone()),
-            codex_account: if instance
-                .config()
-                .and_then(|config| config.codex_home.as_ref())
-                .is_some()
-            {
+            codex_home: instance.connected_codex_home(),
+            codex_account: if instance.connected_codex_home().is_some() {
                 CodexAccount::Checking
             } else {
                 CodexAccount::NotConfigured
@@ -396,9 +390,7 @@ pub async fn run(config_dir: Option<PathBuf>) -> Result<(), SetupError> {
 
     loop {
         let current = Instance::open(app.config_dir.clone())?;
-        let codex_home = current
-            .config()
-            .and_then(|config| config.codex_home.clone());
+        let codex_home = current.connected_codex_home();
         if app.codex_home != codex_home {
             app.codex_home = codex_home;
             app.refresh_codex_account();
@@ -590,8 +582,7 @@ fn apply_task_result(app: &mut App, result: TaskResult) {
             app.notice = Some("GitHub connection saved and validated.".into());
             let codex_connected = Instance::open(app.config_dir.clone())
                 .ok()
-                .and_then(|instance| instance.config().cloned())
-                .and_then(|config| config.codex_home)
+                .and_then(|instance| instance.connected_codex_home())
                 .is_some();
             match Instance::open(app.config_dir.clone()) {
                 Ok(instance) => {
@@ -1448,7 +1439,7 @@ fn handle_repositories(app: &mut App, key: KeyEvent, sender: mpsc::UnboundedSend
                 if !removed.is_empty() && !(app.confirm_remove && key.code == KeyCode::Char('y')) {
                     app.confirm_remove = true;
                     app.notice = Some(format!(
-                        "Remove {}? Press y to confirm. After apply, future ingestion stops; history stays and work is not cancelled. Space changes selection; Esc discards.",
+                        "Remove {}? Press y to confirm. After apply, future ingestion stops; history stays and outstanding work is cancelled. Space changes selection; Esc discards.",
                         removed.join(", ")
                     ));
                     return;

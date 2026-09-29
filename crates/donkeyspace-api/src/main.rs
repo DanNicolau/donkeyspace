@@ -1,3 +1,6 @@
+mod ingress;
+use ingress::*;
+
 use axum::{
     Json, Router,
     body::Bytes,
@@ -7,6 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use donkeyspace_core::repository::RepositoryName as PolledRepository;
 use donkeyspace_core::{
     AgentRole, DeploymentMode, EngagementGate, EngagementSelector, LabelState, PluginManifest,
     Policy, WorkflowState, normalize_workflow_labels,
@@ -22,11 +26,10 @@ use donkeyspace_db::{
     list_lifecycle_events, list_open_managed_pull_requests_for_base,
     list_projected_work_items_for_run, list_recent_engagement_decisions,
     list_recent_outbound_actions, list_recent_outbound_actions_for_repository, list_workflows,
-    pending_outbound_comment_exists, record_engagement_decision, record_lifecycle_event,
-    record_state_transition, record_webhook_delivery, repair_job_exists_for_pr_base,
-    requeue_failed_job, resume_latest_paused_job, retry_agent_publication,
-    retry_projected_work_items, reviewer_job_exists_for_pr_head, upsert_pull_request,
-    upsert_repository, webhook_delivery_exists,
+    pending_outbound_comment_exists, record_engagement_decision, record_webhook_delivery,
+    repair_job_exists_for_pr_base, requeue_failed_job, resume_latest_paused_job,
+    retry_agent_publication, retry_projected_work_items, reviewer_job_exists_for_pr_head,
+    upsert_pull_request, upsert_repository, webhook_delivery_exists,
 };
 use donkeyspace_github::{
     GitHubAuthMode, GitHubClient, GitHubClientError, GitHubCredentialProvider, file_url,
@@ -124,12 +127,6 @@ struct WorkflowEventsQuery {
 
 fn default_event_level() -> String {
     "milestone".into()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PolledRepository {
-    owner: String,
-    name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +319,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         plugin = configuration.plugin.as_ref().map(|plugin| plugin.id.as_str()).unwrap_or("disabled"),
         "effective runtime configuration validated"
     );
+    // Apply the same selection before accepting ingress, including re-addition.
+    // This prevents a fresh authorized delivery racing the worker's first poll.
+    if let Some(pool) = &pool
+        && !configured_repositories.is_empty()
+    {
+        donkeyspace_db::repository_retirement::reconcile(pool, &configured_repositories).await?;
+    }
     let state = Arc::new(AppState {
         configuration,
         webhook_secret,
@@ -534,12 +538,6 @@ impl GitHubPollController {
         };
         self.notify.notify_one();
         already_pending
-    }
-}
-
-impl PolledRepository {
-    fn full_name(&self) -> String {
-        format!("{}/{}", self.owner, self.name)
     }
 }
 
@@ -799,25 +797,7 @@ struct GitHubRepositoryPollOutcome {
 }
 
 fn parse_polled_repositories(value: &str) -> Result<Vec<PolledRepository>, String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            let (owner, name) = entry.split_once('/').ok_or_else(|| {
-                format!("invalid github polling repository `{entry}`; expected owner/name")
-            })?;
-            if owner.is_empty() || name.is_empty() || name.contains('/') {
-                return Err(format!(
-                    "invalid github polling repository `{entry}`; expected owner/name"
-                ));
-            }
-            Ok(PolledRepository {
-                owner: owner.to_string(),
-                name: name.to_string(),
-            })
-        })
-        .collect()
+    PolledRepository::parse_list(value)
 }
 
 fn parse_repository_query(value: Option<&str>) -> Result<Option<(String, String)>, String> {
@@ -1102,11 +1082,7 @@ fn effective_configuration(
     polled.sort_unstable_by_key(|repository| repository.to_ascii_lowercase());
     polled.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
 
-    let plugin_selection = policy.lifecycle.plugin.as_ref().or(policy
-        .agents
-        .developer
-        .plugin
-        .as_ref());
+    let plugin_selection = policy.lifecycle.plugin.as_ref();
     if deployment_mode == DeploymentMode::Minimal
         && (input.github_auth.is_some()
             || input.ingress_mode != "disabled"
@@ -1178,7 +1154,7 @@ fn effective_configuration(
     if plugin.is_some() {
         capabilities.push("plugin".into());
     }
-    let warnings = if deployment_mode == DeploymentMode::Minimal {
+    let mut warnings = if deployment_mode == DeploymentMode::Minimal {
         vec!["Intentional minimal mode: GitHub ingress and plugins are disabled.".into()]
     } else if input.github_auth.is_none() {
         vec!["GitHub is not connected; repository automation is disabled.".into()]
@@ -1187,6 +1163,7 @@ fn effective_configuration(
     };
     let facade = policy.facade.resolve();
     let issue_command = facade.issue_command();
+    warnings.extend(policy.migration_warnings.clone());
     Ok(EffectiveConfigurationResponse {
         deployment_mode,
         policy_source: input.policy_source.into(),
@@ -1318,7 +1295,7 @@ async fn api_workflows(
     };
     let mut summaries = Vec::with_capacity(workflows.len());
     for workflow in workflows {
-        match workflow_summary(pool, workflow).await {
+        match workflow_summary(pool, workflow, &state.policy.facade.resolve()).await {
             Ok(summary) => summaries.push(summary),
             Err(error) => {
                 tracing::error!(%error, "failed to build workflow summary");
@@ -1361,7 +1338,7 @@ async fn api_workflow(
         )
             .into_response();
     };
-    match workflow_summary(pool, workflow).await {
+    match workflow_summary(pool, workflow, &state.policy.facade.resolve()).await {
         Ok(summary) => Json(summary).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to build workflow detail");
@@ -1445,14 +1422,41 @@ async fn api_workflow_events(
 async fn workflow_summary(
     pool: &PgPool,
     workflow: donkeyspace_db::WorkflowOverviewRecord,
+    facade: &donkeyspace_core::Facade,
 ) -> Result<WorkflowSummary, donkeyspace_db::DbError> {
     let jobs = list_jobs_for_workflow_item(pool, workflow.id).await?;
     let coordinator_id = workflow.latest_job_id;
+    let checkpoint = if let Some(id) = coordinator_id {
+        donkeyspace_db::lifecycle_checkpoints::load(pool, id).await?
+    } else {
+        None
+    };
+    let revision_targets = if workflow.current_state.as_deref() == Some("needs_human")
+        && workflow.latest_job_status.as_deref() == Some("paused")
+        && let Some(checkpoint) = &checkpoint
+        && !checkpoint.completed
+    {
+        donkeyspace_core::approval::revision_previews(&checkpoint.state, facade)
+    } else {
+        Vec::new()
+    };
     let publications = if let Some(coordinator_id) = coordinator_id {
         list_agent_publications_for_run(pool, coordinator_id, None).await?
     } else {
         Vec::new()
     };
+    let blockers = donkeyspace_db::workflow_blockers::project(
+        workflow.current_state.as_deref(),
+        jobs.iter().find(|job| Some(job.id) == coordinator_id),
+        checkpoint
+            .as_ref()
+            .filter(|checkpoint| !checkpoint.completed)
+            .map(|checkpoint| &checkpoint.state),
+        &jobs,
+        &publications,
+        facade,
+        |sha, path| donkeyspace_github::file_url(&workflow.owner, &workflow.repository, sha, path),
+    );
     let projected_work_items = if let Some(coordinator_id) = coordinator_id {
         list_projected_work_items_for_run(pool, coordinator_id).await?
     } else {
@@ -1577,105 +1581,119 @@ async fn workflow_summary(
         .iter()
         .filter(|item| item.sync_status == "pending")
         .count();
-    let approval_sync_missing = pending_approval.is_some() && publication.is_none();
+    let approval_sync_missing = (pending_approval.is_some()
+        || approval_requests
+            .iter()
+            .any(|request| request.state == "pending"))
+        && publication.is_none();
     let sync_ready = failed.is_empty()
         && projection_failed.is_none()
         && pending + projection_pending == 0
         && !approval_sync_missing;
     let pending_approval = pending_approval.filter(|_| sync_ready);
-    let approvals = pending_approval.as_ref().map_or_else(Vec::new, |reason| {
-        let durable = approval_requests
-            .iter()
-            .filter(|request| request.state == "pending")
-            .map(|request| {
-                let proposed = request
-                    .proposed_publication_id
-                    .and_then(|id| publications.iter().find(|publication| publication.id == id));
-                let accepted = request
-                    .accepted_publication_id
-                    .and_then(|id| publications.iter().find(|publication| publication.id == id));
-                ApprovalSummary {
-                    target_task: request.target_task.clone(),
-                    target_work_item: request.target_work_item.clone(),
-                    purpose: request.purpose.clone(),
-                    trigger: request.trigger.clone(),
-                    approval_subject: request.approval_subject.clone(),
-                    result_summary: request.result_summary.clone(),
-                    changed_files: proposed.map_or_else(Vec::new, |publication| {
-                        approval_files(&workflow, publication)
-                    }),
-                    proposed_publication: proposed.map(PublicationSummary::from),
-                    accepted_publication: accepted.map(PublicationSummary::from),
-                    projected_issues: request
-                        .projected_issues
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|issue| {
-                            Some(ApprovalIssue {
-                                number: issue.get("number")?.as_i64()?,
-                                work_item: issue.get("work_item")?.as_str()?.into(),
-                                url: format!(
-                                    "https://github.com/{}/{}/issues/{}",
-                                    workflow.owner,
-                                    workflow.repository,
-                                    issue.get("number")?.as_i64()?
-                                ),
+    let approvals = (sync_ready && workflow.current_state.as_deref() == Some("needs_human"))
+        .then(|| {
+            let durable = approval_requests
+                .iter()
+                .filter(|request| request.state == "pending")
+                .map(|request| {
+                    let commands = donkeyspace_core::TaskKey {
+                        task: request.target_task.clone(),
+                        work_item: request.target_work_item.clone(),
+                    }
+                    .approval_commands(facade);
+                    let proposed = request.proposed_publication_id.and_then(|id| {
+                        publications.iter().find(|publication| publication.id == id)
+                    });
+                    let accepted = request.accepted_publication_id.and_then(|id| {
+                        publications.iter().find(|publication| publication.id == id)
+                    });
+                    ApprovalSummary {
+                        target_task: request.target_task.clone(),
+                        target_work_item: request.target_work_item.clone(),
+                        purpose: request.purpose.clone(),
+                        trigger: request.trigger.clone(),
+                        approval_subject: request.approval_subject.clone(),
+                        result_summary: request.result_summary.clone(),
+                        changed_files: proposed.map_or_else(Vec::new, |publication| {
+                            approval_files(&workflow, publication)
+                        }),
+                        proposed_publication: proposed.map(PublicationSummary::from),
+                        accepted_publication: accepted.map(PublicationSummary::from),
+                        projected_issues: request
+                            .projected_issues
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|issue| {
+                                Some(ApprovalIssue {
+                                    number: issue.get("number")?.as_i64()?,
+                                    work_item: issue.get("work_item")?.as_str()?.into(),
+                                    url: format!(
+                                        "https://github.com/{}/{}/issues/{}",
+                                        workflow.owner,
+                                        workflow.repository,
+                                        issue.get("number")?.as_i64()?
+                                    ),
+                                })
                             })
-                        })
-                        .collect(),
-                    downstream_tasks: request
-                        .downstream_tasks
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(Into::into)
-                        .collect(),
-                    state: request.state.clone(),
-                    approve_command: approval_command(reason, "approve"),
-                    revise_command: approval_command(reason, "revise"),
-                }
-            })
-            .collect::<Vec<_>>();
-        if !durable.is_empty() {
-            return durable;
-        }
-        vec![ApprovalSummary {
-            target_task: "workflow".into(),
-            target_work_item: None,
-            purpose: "accept_result".into(),
-            trigger: "required".into(),
-            approval_subject: first_paragraph(reason),
-            result_summary: workflow.latest_summary.clone().unwrap_or_default(),
-            changed_files: publication.map_or_else(Vec::new, |publication| {
-                approval_files(&workflow, publication)
-            }),
-            proposed_publication: publication.map(PublicationSummary::from),
-            accepted_publication: None,
-            projected_issues: projected_work_items
-                .iter()
-                .filter_map(|item| {
-                    item.issue_number.map(|number| ApprovalIssue {
-                        number,
-                        work_item: item.work_item.clone(),
-                        url: format!(
-                            "https://github.com/{}/{}/issues/{number}",
-                            workflow.owner, workflow.repository
-                        ),
-                    })
+                            .collect(),
+                        downstream_tasks: request
+                            .downstream_tasks
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(Into::into)
+                            .collect(),
+                        state: request.state.clone(),
+                        approve_command: Some(commands.approve),
+                        revise_command: Some(commands.revise),
+                    }
                 })
-                .collect(),
-            downstream_tasks: tasks
-                .iter()
-                .filter(|task| task.status == "waiting")
-                .map(|task| task.task.clone())
-                .collect(),
-            state: "pending".into(),
-            approve_command: approval_command(reason, "approve"),
-            revise_command: approval_command(reason, "revise"),
-        }]
-    });
+                .collect::<Vec<_>>();
+            if !durable.is_empty() {
+                return durable;
+            }
+            let Some(reason) = pending_approval.as_ref() else {
+                return Vec::new();
+            };
+            vec![ApprovalSummary {
+                target_task: "workflow".into(),
+                target_work_item: None,
+                purpose: "accept_result".into(),
+                trigger: "required".into(),
+                approval_subject: first_paragraph(reason),
+                result_summary: workflow.latest_summary.clone().unwrap_or_default(),
+                changed_files: publication.map_or_else(Vec::new, |publication| {
+                    approval_files(&workflow, publication)
+                }),
+                proposed_publication: publication.map(PublicationSummary::from),
+                accepted_publication: None,
+                projected_issues: projected_work_items
+                    .iter()
+                    .filter_map(|item| {
+                        item.issue_number.map(|number| ApprovalIssue {
+                            number,
+                            work_item: item.work_item.clone(),
+                            url: format!(
+                                "https://github.com/{}/{}/issues/{number}",
+                                workflow.owner, workflow.repository
+                            ),
+                        })
+                    })
+                    .collect(),
+                downstream_tasks: tasks
+                    .iter()
+                    .filter(|task| task.status == "waiting")
+                    .map(|task| task.task.clone())
+                    .collect(),
+                state: "pending".into(),
+                approve_command: None,
+                revise_command: None,
+            }]
+        })
+        .unwrap_or_default();
     let external_sync = ExternalSyncSummary {
         status: if !failed.is_empty()
             || projection_failed.is_some()
@@ -1701,6 +1719,8 @@ async fn workflow_summary(
     };
     let no_pr_reason = if pull_request_url.is_some() {
         None
+    } else if let Some(blocker) = blockers.first() {
+        Some(blocker.preview())
     } else if let Some(reason) = &pending_approval {
         Some(first_paragraph(reason))
     } else if let Some(task) = tasks.iter().find(|task| task.status == "running") {
@@ -1745,6 +1765,8 @@ async fn workflow_summary(
         summary: workflow.latest_summary,
         pending_approval,
         approvals,
+        revision_targets,
+        blockers,
         external_sync,
         tasks,
         pull_request_number: workflow.pull_request_number,
@@ -2030,8 +2052,42 @@ async fn api_retry_run(
             .into_response();
     };
 
+    // A resumed lifecycle owns immutable state under the coordinator UUID.
+    // Copying its input to a new job strands its approvals and checkpoint.
+    if job.input.get("donkeyspace_lifecycle_coordinator") == Some(&json!(true)) {
+        match donkeyspace_db::lifecycle_checkpoints::load(pool, job.id).await {
+            Ok(Some(_)) => {
+                return match donkeyspace_db::lifecycle_checkpoints::retry_failed(pool, job.id).await {
+                    Ok(Some(retry)) => Json(retry).into_response(),
+                    Ok(None) => (StatusCode::CONFLICT, Json(ApiError::new(
+                        "lifecycle checkpoint is not eligible for retry or the workflow already has active work",
+                    ))).into_response(),
+                    Err(error) => {
+                        tracing::error!(%error, %id, "failed to retry lifecycle checkpoint");
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError::new("failed to retry lifecycle checkpoint"))).into_response()
+                    }
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, %id, "failed to load lifecycle checkpoint for retry");
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiError::new("lifecycle checkpoint cannot be resumed")),
+                )
+                    .into_response();
+            }
+        }
+    }
     match create_retry_job(pool, Some(workflow_item_id), job.id, &job.role, &job.input).await {
-        Ok(retry_job) => Json(retry_job).into_response(),
+        Ok(retry_job) if retry_job.status == "queued" => Json(retry_job).into_response(),
+        Ok(_) => (
+            StatusCode::CONFLICT,
+            Json(ApiError::new(
+                "run belongs to a cancelled workflow generation; start fresh authorized work",
+            )),
+        )
+            .into_response(),
         Err(error) => {
             tracing::error!(%error, %id, "failed to create retry job");
             (
@@ -2248,7 +2304,17 @@ async fn github_webhook(
         }
         Err(error) => {
             tracing::error!(%error, event, delivery, "failed to process github webhook");
-            StatusCode::INTERNAL_SERVER_ERROR
+            if matches!(
+                error.downcast_ref::<donkeyspace_db::DbError>(),
+                Some(donkeyspace_db::DbError::StaleAdmission)
+            ) || error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 }
@@ -2312,12 +2378,7 @@ fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
         env::var("DONKEYSPACE_POLICY_PATH").unwrap_or_else(|_| ".donkeyspace/policy.yml".into());
     let raw = fs::read_to_string(&path)?;
     let mut policy = Policy::from_yaml(&raw)?;
-    if let Some(selection) = policy.lifecycle.plugin.as_ref().or(policy
-        .agents
-        .developer
-        .plugin
-        .as_ref())
-    {
+    if let Some(selection) = policy.lifecycle.plugin.as_ref() {
         let manifest = PluginManifest::from_path(&selection.manifest_path)?;
         policy.facade = manifest.facade.overlay(&policy.facade);
     }
@@ -2341,1140 +2402,6 @@ fn lifecycle_start_role(policy: &Policy) -> Result<Option<String>, Box<dyn std::
         .into());
     }
     Ok(Some(flow.tasks[&flow.start].role.clone()))
-}
-
-async fn persist_github_webhook(
-    pool: &PgPool,
-    state: &AppState,
-    event: &str,
-    delivery: &str,
-    body: &[u8],
-) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
-    match event {
-        "issues" | "issue_comment" => {
-            persist_issue_webhook(pool, state, event, delivery, body).await
-        }
-        "pull_request" => {
-            persist_pull_request_webhook(pool, &state.policy, event, delivery, body).await
-        }
-        "push" => persist_push_webhook(pool, &state.policy, event, delivery, body).await,
-        _ => {
-            let payload: Value = serde_json::from_slice(body)?;
-            let inserted = record_webhook_delivery(pool, None, delivery, event, &payload).await?;
-            Ok(if inserted.is_some() {
-                WebhookPersistOutcome::Ignored
-            } else {
-                WebhookPersistOutcome::Duplicate
-            })
-        }
-    }
-}
-
-async fn persist_issue_webhook(
-    pool: &PgPool,
-    app_state: &AppState,
-    event: &str,
-    delivery: &str,
-    body: &[u8],
-) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
-    let policy = &app_state.policy;
-    let payload: GitHubIssueWebhook = serde_json::from_slice(body)?;
-    let mut payload_value: Value = serde_json::from_slice(body)?;
-    let repository_id = upsert_repository(
-        pool,
-        &RepositoryInput {
-            installation_external_id: payload
-                .installation
-                .as_ref()
-                .map(|value| value.id.to_string()),
-            installation_account_login: payload
-                .installation
-                .as_ref()
-                .map(|_| payload.repository.owner.login.clone()),
-            provider: "github".to_string(),
-            owner: payload.repository.owner.login.clone(),
-            name: payload.repository.name.clone(),
-            default_branch: payload.repository.default_branch.clone(),
-        },
-    )
-    .await?;
-
-    if webhook_delivery_exists(pool, delivery).await? {
-        return Ok(WebhookPersistOutcome::Duplicate);
-    }
-
-    let labels = payload
-        .issue
-        .labels
-        .iter()
-        .map(|label| label.name.clone())
-        .collect::<Vec<_>>();
-    let label_state = normalize_workflow_labels(&labels, &policy.workflow.state_labels);
-    let label_state_name = match &label_state {
-        LabelState::None => None,
-        LabelState::One(label) => Some(label.state.to_string()),
-        LabelState::Conflict(_) => Some(WorkflowState::NeedsHuman.to_string()),
-    };
-    let previous_state =
-        get_workflow_item_state(pool, repository_id, &payload.issue.id.to_string()).await?;
-    let was_finished = previous_state.as_deref() == Some("finished");
-    let current_state = label_state_name.or(previous_state);
-    // GitHub issue timestamps have second precision. Verify lifecycle edges
-    // against GitHub so a delayed event from the same second cannot close a
-    // reopened workflow or reopen an issue that is currently closed.
-    if (matches!(payload.action.as_str(), "opened" | "closed" | "reopened")
-        || payload.issue.state == "closed"
-        || was_finished)
-        && let Some(auth) = &app_state.github_auth
-    {
-        let currently_closed = auth
-            .client()
-            .issue_is_closed(
-                &payload.repository.owner.login,
-                &payload.repository.name,
-                payload.issue.number,
-            )
-            .await?;
-        if currently_closed != (payload.issue.state == "closed") {
-            return Ok(WebhookPersistOutcome::Ignored);
-        }
-    }
-
-    let Some(workflow_item_id) = donkeyspace_db::cancellation::observe_issue(
-        pool,
-        &donkeyspace_db::cancellation::IssueObservation {
-            issue: &WorkflowItemInput {
-                repository_id,
-                provider_issue_id: payload.issue.id.to_string(),
-                issue_number: payload.issue.number,
-                provider_state: payload.issue.state.clone(),
-                current_state: current_state.clone(),
-                current_labels: labels.clone(),
-            },
-            updated_at: payload.issue.updated_at,
-            close_reason: payload.issue.state_reason.as_deref(),
-            owner: &payload.repository.owner.login,
-            repo: &payload.repository.name,
-            state_labels: policy.workflow.state_labels.values().cloned().collect(),
-        },
-    )
-    .await?
-    else {
-        return Ok(WebhookPersistOutcome::Ignored);
-    };
-    // Closure is convergent and committed before delivery deduplication, so a
-    // failed persistence attempt can be retried without losing cancellation.
-    let inserted =
-        record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
-    let Some(webhook_delivery_id) = inserted else {
-        return Ok(WebhookPersistOutcome::Duplicate);
-    };
-
-    let current_state =
-        get_workflow_item_state(pool, repository_id, &payload.issue.id.to_string()).await?;
-    if payload.issue.state == "closed" {
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    if matches!(label_state, LabelState::Conflict(_)) {
-        record_state_transition(
-            pool,
-            workflow_item_id,
-            None,
-            None,
-            WorkflowState::NeedsHuman.as_str(),
-            "conflicting ai workflow labels detected",
-        )
-        .await?;
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let facade_command = policy.facade.resolve().command;
-    if !should_queue_triage(
-        event,
-        &payload.action,
-        &payload.issue.state,
-        current_state.as_deref(),
-        payload.comment.as_ref(),
-        payload.label.as_ref().map(|label| label.name.as_str()),
-        (&policy.workflow.allow_labels, &facade_command),
-    ) {
-        tracing::info!(
-            event,
-            action = payload.action,
-            issue_number = payload.issue.number,
-            current_state = current_state.as_deref().unwrap_or("none"),
-            "webhook did not queue triage"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let human_approval = if current_state.as_deref() == Some("needs_human") {
-        payload.comment.as_ref().and_then(|comment| {
-            parse_human_approval_command(&comment.body, &policy.facade.resolve().command)
-        })
-    } else {
-        None
-    };
-
-    let gate = engagement_gate(event, current_state.as_deref())
-        .ok_or("queueable github event has no engagement gate")?;
-    let managed_resource = if let Some(comment) = &payload.comment {
-        let registered = match comment.id {
-            Some(comment_id) => {
-                github_managed_resource_exists(
-                    pool,
-                    repository_id,
-                    "issue_comment",
-                    &comment_id.to_string(),
-                )
-                .await?
-            }
-            None => false,
-        };
-        let pending = match payload_value
-            .pointer("/comment/body")
-            .and_then(Value::as_str)
-        {
-            Some(body) => pending_outbound_comment_exists(pool, workflow_item_id, body).await?,
-            None => false,
-        };
-        registered || pending
-    } else {
-        let created_by_this_app = app_state
-            .github_auth
-            .as_ref()
-            .and_then(GitHubCredentialProvider::app_id)
-            .zip(payload.issue.performed_via_github_app.as_ref())
-            .is_some_and(|(configured, actual)| configured == actual.id);
-        (is_projected_work_item(&payload.issue.body) && created_by_this_app)
-            || github_managed_resource_exists(
-                pool,
-                repository_id,
-                "issue",
-                &payload.issue.id.to_string(),
-            )
-            .await?
-    };
-    if managed_resource {
-        record_engagement_decision(
-            pool,
-            &EngagementDecisionInput {
-                webhook_delivery_id,
-                workflow_item_id: Some(workflow_item_id),
-                gate: gate.as_str().into(),
-                disposition: "system_generated".into(),
-                actor: payload
-                    .sender
-                    .as_ref()
-                    .and_then(|actor| serde_json::to_value(actor).ok()),
-                matched_selector: None,
-                reason: "platform-managed GitHub resource cannot trigger agent work".into(),
-            },
-        )
-        .await?;
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let automation_decision = policy.automation_decision_for_labels(&labels);
-    if !automation_decision.is_allowed() {
-        record_engagement_decision(
-            pool,
-            &EngagementDecisionInput {
-                webhook_delivery_id,
-                workflow_item_id: Some(workflow_item_id),
-                gate: gate.as_str().into(),
-                disposition: "denied".into(),
-                actor: payload
-                    .sender
-                    .as_ref()
-                    .and_then(|actor| serde_json::to_value(actor).ok()),
-                matched_selector: None,
-                reason: automation_decision.reason(),
-            },
-        )
-        .await?;
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let authorization = authorize_engagement(app_state, gate, &labels, &payload).await;
-    let audit = record_engagement_decision(
-        pool,
-        &EngagementDecisionInput {
-            webhook_delivery_id,
-            workflow_item_id: Some(workflow_item_id),
-            gate: gate.as_str().into(),
-            disposition: if authorization.allowed {
-                "allowed"
-            } else {
-                "denied"
-            }
-            .into(),
-            actor: payload
-                .sender
-                .as_ref()
-                .and_then(|actor| serde_json::to_value(actor).ok()),
-            matched_selector: authorization.matched_selector.clone(),
-            reason: authorization.reason.clone(),
-        },
-    )
-    .await?;
-    if !authorization.allowed {
-        tracing::info!(
-            event,
-            action = payload.action,
-            issue_number = payload.issue.number,
-            reason = authorization.reason,
-            "engagement authorization denied agent work"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-    if let Value::Object(map) = &mut payload_value {
-        map.insert(
-            "donkeyspace_ingress".into(),
-            json!({
-                "delivery_id": delivery,
-                "source": ingress_source(delivery),
-                "event": event,
-            }),
-        );
-        map.insert(
-            "donkeyspace_engagement".into(),
-            json!({
-                "decision_id": audit.id,
-                "gate": gate.as_str(),
-                "actor": payload.sender,
-                "matched_selector": authorization.matched_selector,
-                "reason": authorization.reason,
-            }),
-        );
-        if let Some(action) = human_approval.clone() {
-            map.insert(
-                "donkeyspace_human_decision".into(),
-                serde_json::to_value(action).expect("approval action serializes"),
-            );
-        }
-    }
-
-    if policy.lifecycle.plugin.is_some()
-        && let Value::Object(map) = &mut payload_value
-    {
-        map.insert(
-            "donkeyspace_lifecycle_coordinator".into(),
-            Value::Bool(true),
-        );
-    }
-
-    if active_job_exists_for_workflow_item(pool, workflow_item_id).await? {
-        tracing::info!(
-            event,
-            action = payload.action,
-            issue_number = payload.issue.number,
-            "active workflow job already exists; duplicate trigger ignored"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    if gate == EngagementGate::NeedsHumanResume
-        && let Some(job) = resume_latest_paused_job(pool, workflow_item_id, &payload_value).await?
-    {
-        let (event_type, summary) = match human_approval.as_ref() {
-            Some(HumanApprovalAction::Approve { target }) => (
-                "approval_received",
-                format!(
-                    "Approval accepted{}.",
-                    target
-                        .as_deref()
-                        .map(|target| format!(" for {target}"))
-                        .unwrap_or_default()
-                ),
-            ),
-            Some(HumanApprovalAction::Revise { target, .. }) => (
-                "revision_received",
-                format!(
-                    "Revision requested{}.",
-                    target
-                        .as_deref()
-                        .map(|target| format!(" for {target}"))
-                        .unwrap_or_default()
-                ),
-            ),
-            None => (
-                "workflow_resumed",
-                "Authorized feedback resumed the workflow.".into(),
-            ),
-        };
-        record_ingress_lifecycle_event(
-            pool,
-            workflow_item_id,
-            Some(job.id),
-            delivery,
-            event_type,
-            &summary,
-            payload.sender.as_ref().map(|sender| sender.login.as_str()),
-        )
-        .await?;
-        record_state_transition(
-            pool,
-            workflow_item_id,
-            Some(job.id),
-            current_state.as_deref(),
-            "lifecycle_resumed",
-            &format!(
-                "resumed paused plugin lifecycle from authorized github event; engagement decision {}",
-                audit.id
-            ),
-        )
-        .await?;
-        return Ok(WebhookPersistOutcome::Queued(Box::new(job)));
-    }
-
-    let lifecycle_role = lifecycle_start_role(policy)?;
-    let initial_role = lifecycle_role.unwrap_or_else(|| AgentRole::Triage.as_str().to_string());
-    let job = create_job(pool, Some(workflow_item_id), &initial_role, &payload_value).await?;
-    record_ingress_lifecycle_event(
-        pool,
-        workflow_item_id,
-        Some(job.id),
-        delivery,
-        "issue_received",
-        "Issue accepted for agent work.",
-        payload.sender.as_ref().map(|sender| sender.login.as_str()),
-    )
-    .await?;
-    record_state_transition(
-        pool,
-        workflow_item_id,
-        Some(job.id),
-        current_state.as_deref(),
-        &format!("{initial_role}_queued"),
-        &format!(
-            "queued {initial_role} job from github webhook; engagement decision {}",
-            audit.id
-        ),
-    )
-    .await?;
-
-    Ok(WebhookPersistOutcome::Queued(Box::new(job)))
-}
-
-fn ingress_source(delivery: &str) -> &'static str {
-    if delivery.starts_with("github-poll:") {
-        "poll"
-    } else {
-        "webhook"
-    }
-}
-
-async fn record_ingress_lifecycle_event(
-    pool: &PgPool,
-    workflow_item_id: i64,
-    coordinator_job_id: Option<Uuid>,
-    delivery: &str,
-    event_type: &str,
-    summary: &str,
-    actor: Option<&str>,
-) -> Result<(), donkeyspace_db::DbError> {
-    record_lifecycle_event(
-        pool,
-        &LifecycleEventInput {
-            workflow_item_id,
-            coordinator_job_id,
-            job_id: coordinator_job_id,
-            dedupe_key: Some(format!("ingress:{delivery}:{event_type}")),
-            event_type: event_type.into(),
-            level: "milestone".into(),
-            source: ingress_source(delivery).into(),
-            actor: actor.map(Into::into),
-            wave: None,
-            attempt: None,
-            role: None,
-            role_display_name: None,
-            task: None,
-            task_display_name: None,
-            work_item: None,
-            status: None,
-            outcome: None,
-            summary: summary.into(),
-            reason: None,
-            handoff_target: None,
-            links: json!([]),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-fn is_projected_work_item(body: &str) -> bool {
-    body.contains("<!-- donkeyspace-work-item -->")
-}
-
-async fn persist_pull_request_webhook(
-    pool: &PgPool,
-    policy: &Policy,
-    event: &str,
-    delivery: &str,
-    body: &[u8],
-) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
-    let payload: GitHubPullRequestWebhook = serde_json::from_slice(body)?;
-    let payload_value: Value = serde_json::from_slice(body)?;
-    let repository_id = upsert_repository(
-        pool,
-        &RepositoryInput {
-            installation_external_id: payload
-                .installation
-                .as_ref()
-                .map(|value| value.id.to_string()),
-            installation_account_login: payload
-                .installation
-                .as_ref()
-                .map(|_| payload.repository.owner.login.clone()),
-            provider: "github".to_string(),
-            owner: payload.repository.owner.login.clone(),
-            name: payload.repository.name.clone(),
-            default_branch: payload.repository.default_branch.clone(),
-        },
-    )
-    .await?;
-
-    let inserted =
-        record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
-    if inserted.is_none() {
-        return Ok(WebhookPersistOutcome::Duplicate);
-    }
-
-    let branch_prefix = &policy.facade.resolve().branch_prefix;
-    let managed = pull_request_is_managed(&payload.pull_request, branch_prefix);
-    let linked_issue_number = payload
-        .pull_request
-        .body
-        .as_deref()
-        .and_then(extract_linked_issue_number)
-        .or_else(|| {
-            issue_number_from_managed_branch(&payload.pull_request.head.ref_name, branch_prefix)
-        });
-    let workflow_item = match linked_issue_number {
-        Some(issue_number) => {
-            get_workflow_item_by_issue_number(pool, repository_id, issue_number).await?
-        }
-        None => None,
-    };
-
-    let pull_request_state =
-        normalized_pull_request_state(&payload.pull_request.state, payload.pull_request.merged);
-    upsert_pull_request(
-        pool,
-        &PullRequestInput {
-            repository_id,
-            workflow_item_id: workflow_item.as_ref().map(|item| item.id),
-            provider_pr_id: payload.pull_request.id.to_string(),
-            pr_number: payload.pull_request.number,
-            title: payload.pull_request.title.clone(),
-            html_url: payload.pull_request.html_url.clone(),
-            state: pull_request_state.into(),
-            head_ref: payload.pull_request.head.ref_name.clone(),
-            head_sha: Some(payload.pull_request.head.sha.clone()),
-            base_ref: payload.pull_request.base.ref_name.clone(),
-            base_sha: Some(payload.pull_request.base.sha.clone()),
-            managed_by_donkeyspace: managed,
-        },
-    )
-    .await?;
-
-    let Some(workflow_item) = workflow_item else {
-        tracing::info!(
-            action = payload.action,
-            pr_number = payload.pull_request.number,
-            "pull request webhook did not match a known workflow item"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    };
-    let linked_issue_number = linked_issue_number
-        .expect("a matched pull request workflow item has a linked issue number");
-    let workflow_state = if managed {
-        match pull_request_state {
-            "open" => Some(WorkflowState::PrOpen.as_str()),
-            "merged" => Some("pr_merged"),
-            "closed" => Some("pr_closed"),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let actions = if managed {
-        pull_request_label_actions(
-            policy,
-            &payload.repository.owner.login,
-            &payload.repository.name,
-            linked_issue_number,
-            pull_request_state,
-        )
-    } else {
-        Vec::new()
-    };
-    let Some(generation) = donkeyspace_db::cancellation::apply_pull_request_effects(
-        pool,
-        workflow_item.id,
-        &payload.pull_request.id.to_string(),
-        workflow_state,
-        &actions,
-    )
-    .await?
-    else {
-        return Ok(WebhookPersistOutcome::Ignored);
-    };
-
-    if policy.lifecycle.plugin.is_some()
-        || !should_queue_reviewer(
-            &payload.action,
-            &payload.pull_request.state,
-            payload.pull_request.draft,
-            managed,
-            policy.agents.reviewer.enabled,
-        )
-    {
-        tracing::info!(
-            action = payload.action,
-            pr_number = payload.pull_request.number,
-            managed,
-            "pull request webhook did not queue reviewer"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    if reviewer_job_exists_for_pr_head(
-        pool,
-        workflow_item.id,
-        payload.pull_request.number,
-        Some(&payload.pull_request.head.sha),
-    )
-    .await?
-    {
-        tracing::info!(
-            pr_number = payload.pull_request.number,
-            head_sha = payload.pull_request.head.sha,
-            "reviewer job already exists for pull request head"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let Some(mut job_input) = latest_workflow_job_input(pool, workflow_item.id).await? else {
-        tracing::info!(
-            pr_number = payload.pull_request.number,
-            "pull request webhook found workflow item without reusable job input"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    };
-    // Closure/reopen may occur after PR effects commit. Preserve admission's
-    // generation even if the reusable input now belongs to a newer workflow.
-    job_input["donkeyspace_workflow_generation"] = json!(generation);
-    attach_pull_request_input(&mut job_input, payload_value["pull_request"].clone());
-
-    let job = create_job(
-        pool,
-        Some(workflow_item.id),
-        AgentRole::Reviewer.as_str(),
-        &job_input,
-    )
-    .await?;
-    record_state_transition(
-        pool,
-        workflow_item.id,
-        Some(job.id),
-        workflow_item.current_state.as_deref(),
-        "reviewer_queued",
-        "queued reviewer job from pull request webhook",
-    )
-    .await?;
-
-    Ok(WebhookPersistOutcome::Queued(Box::new(job)))
-}
-
-async fn persist_push_webhook(
-    pool: &PgPool,
-    policy: &Policy,
-    event: &str,
-    delivery: &str,
-    body: &[u8],
-) -> Result<WebhookPersistOutcome, Box<dyn std::error::Error>> {
-    let payload: GitHubPushWebhook = serde_json::from_slice(body)?;
-    let payload_value: Value = serde_json::from_slice(body)?;
-    let repository_id = upsert_repository(
-        pool,
-        &RepositoryInput {
-            installation_external_id: payload
-                .installation
-                .as_ref()
-                .map(|value| value.id.to_string()),
-            installation_account_login: payload
-                .installation
-                .as_ref()
-                .map(|_| payload.repository.owner.login.clone()),
-            provider: "github".to_string(),
-            owner: payload.repository.owner.login,
-            name: payload.repository.name,
-            default_branch: payload.repository.default_branch.clone(),
-        },
-    )
-    .await?;
-
-    let inserted =
-        record_webhook_delivery(pool, Some(repository_id), delivery, event, &payload_value).await?;
-    if inserted.is_none() {
-        return Ok(WebhookPersistOutcome::Duplicate);
-    }
-    if policy.lifecycle.plugin.is_some() {
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let Some(branch) = payload.git_ref.strip_prefix("refs/heads/") else {
-        return Ok(WebhookPersistOutcome::Ignored);
-    };
-    if branch != payload.repository.default_branch {
-        tracing::info!(
-            branch,
-            default_branch = payload.repository.default_branch,
-            "push webhook ignored for non-default branch"
-        );
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-
-    let candidates = list_open_managed_pull_requests_for_base(pool, repository_id, branch).await?;
-    let mut queued = None;
-
-    for pull_request in candidates {
-        if repair_job_exists_for_pr_base(
-            pool,
-            pull_request.workflow_item_id,
-            pull_request.pr_number,
-            pull_request.head_sha.as_deref(),
-            Some(&payload.after),
-        )
-        .await?
-        {
-            continue;
-        }
-
-        let Some(mut job_input) =
-            latest_workflow_job_input(pool, pull_request.workflow_item_id).await?
-        else {
-            continue;
-        };
-        attach_pull_request_input(
-            &mut job_input,
-            json!({
-                "number": pull_request.pr_number,
-                "title": pull_request.title,
-                "body": null,
-                "html_url": pull_request.html_url,
-                "state": pull_request.state,
-                "draft": false,
-                "head": {
-                    "ref": pull_request.head_ref,
-                    "sha": pull_request.head_sha,
-                },
-                "base": {
-                    "ref": pull_request.base_ref,
-                    "sha": payload.after,
-                },
-            }),
-        );
-
-        let job = create_job(
-            pool,
-            Some(pull_request.workflow_item_id),
-            AgentRole::Repair.as_str(),
-            &job_input,
-        )
-        .await?;
-        record_state_transition(
-            pool,
-            pull_request.workflow_item_id,
-            Some(job.id),
-            Some(WorkflowState::PrOpen.as_str()),
-            "repair_queued",
-            "queued repair check after base branch push",
-        )
-        .await?;
-        queued.get_or_insert(job);
-    }
-
-    Ok(queued
-        .map(|job| WebhookPersistOutcome::Queued(Box::new(job)))
-        .unwrap_or(WebhookPersistOutcome::Ignored))
-}
-
-fn should_queue_triage(
-    event: &str,
-    action: &str,
-    issue_state: &str,
-    current_state: Option<&str>,
-    comment: Option<&GitHubComment>,
-    changed_label: Option<&str>,
-    workflow: (&[String], &str),
-) -> bool {
-    let (allow_labels, facade_command) = workflow;
-    if issue_state == "closed" {
-        return false;
-    }
-
-    if current_state == Some("needs_human") {
-        return event == "issue_comment"
-            && action == "created"
-            && comment.is_some_and(|comment| {
-                parse_human_approval_command(&comment.body, facade_command).is_some()
-            });
-    }
-
-    match (event, action) {
-        ("issues", "opened" | "edited" | "reopened") => true,
-        ("issues", "labeled") => {
-            changed_label
-                .map(|label| allow_labels.iter().any(|allowed| allowed == label))
-                .unwrap_or(false)
-                && matches!(current_state, None | Some("needs_info" | "blocked"))
-        }
-        ("issue_comment", "created" | "edited") => {
-            matches!(
-                current_state,
-                Some(state) if matches!(state, "needs_info" | "blocked")
-            ) && comment.is_some()
-        }
-        _ => false,
-    }
-}
-
-fn parse_human_approval_command(body: &str, facade_command: &str) -> Option<HumanApprovalAction> {
-    let mut lines = body.lines();
-    let first = lines.find(|line| !line.trim().is_empty())?.trim();
-    let mut parts = first.split_whitespace();
-    if parts.next()? != format!("/{facade_command}") {
-        return None;
-    }
-    let action = parts.next()?;
-    let target = parts.next().map(str::to_string);
-    if parts.next().is_some()
-        || target
-            .as_deref()
-            .is_some_and(|value| !valid_approval_target(value))
-    {
-        return None;
-    }
-    match action {
-        "approve" => Some(HumanApprovalAction::Approve { target }),
-        "revise" => {
-            let feedback = lines.collect::<Vec<_>>().join("\n").trim().to_string();
-            (!feedback.is_empty()).then_some(HumanApprovalAction::Revise { target, feedback })
-        }
-        _ => None,
-    }
-}
-
-fn valid_approval_target(value: &str) -> bool {
-    value == "all"
-        || (!value.is_empty()
-            && value.matches('/').count() <= 1
-            && value.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
-            }))
-}
-
-fn engagement_gate(event: &str, current_state: Option<&str>) -> Option<EngagementGate> {
-    match current_state {
-        Some("needs_info") => Some(EngagementGate::NeedsInfoResume),
-        Some("blocked") => Some(EngagementGate::BlockedResume),
-        Some("needs_human") => Some(EngagementGate::NeedsHumanResume),
-        _ if event == "issues" => Some(EngagementGate::Initial),
-        _ => None,
-    }
-}
-
-#[derive(Debug)]
-struct AuthorizationDecision {
-    allowed: bool,
-    reason: String,
-    matched_selector: Option<Value>,
-}
-
-async fn authorize_engagement(
-    state: &AppState,
-    gate: EngagementGate,
-    labels: &[String],
-    payload: &GitHubIssueWebhook,
-) -> AuthorizationDecision {
-    let Some(actor) = payload.sender.as_ref() else {
-        return AuthorizationDecision {
-            allowed: false,
-            reason: "github event is missing sender identity".into(),
-            matched_selector: None,
-        };
-    };
-    if actor.login.trim().is_empty() {
-        return AuthorizationDecision {
-            allowed: false,
-            reason: "github event sender identity has no login".into(),
-            matched_selector: None,
-        };
-    }
-    if payload
-        .comment
-        .as_ref()
-        .is_some_and(|comment| comment.id.is_none())
-    {
-        return AuthorizationDecision {
-            allowed: false,
-            reason: "github comment event is missing comment identity".into(),
-            matched_selector: None,
-        };
-    }
-    let repository = format!(
-        "{}/{}",
-        payload.repository.owner.login, payload.repository.name
-    );
-    let rule = state
-        .policy
-        .workflow
-        .engagement
-        .rule(gate, Some(&repository));
-    let missing_labels = rule
-        .required_labels
-        .iter()
-        .filter(|required| !labels.iter().any(|label| label == *required))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing_labels.is_empty() {
-        return AuthorizationDecision {
-            allowed: false,
-            reason: format!(
-                "missing required engagement labels: {}",
-                missing_labels.join(", ")
-            ),
-            matched_selector: None,
-        };
-    }
-
-    let (content_actor, content_association) = match payload.comment.as_ref() {
-        Some(comment) => (comment.user.as_ref(), comment.author_association.as_deref()),
-        None => (
-            payload.issue.user.as_ref(),
-            payload.issue.author_association.as_deref(),
-        ),
-    };
-    let author_association = if content_actor
-        .is_some_and(|content_actor| actor.login.eq_ignore_ascii_case(&content_actor.login))
-    {
-        content_association
-    } else {
-        None
-    };
-    let performed_app = payload
-        .comment
-        .as_ref()
-        .and_then(|comment| comment.performed_via_github_app.as_ref())
-        .or(payload.issue.performed_via_github_app.as_ref());
-    let mut failures = Vec::new();
-
-    for selector in &rule.allow {
-        let result: Result<bool, String> = match selector {
-            EngagementSelector::TokenOwner => Ok(state
-                .github_token_owner
-                .as_ref()
-                .map(|login| login.eq_ignore_ascii_case(&actor.login))
-                .unwrap_or(false)),
-            EngagementSelector::AnyUser => Ok(actor.kind.as_deref() == Some("User")),
-            EngagementSelector::User { login } => Ok(
-                actor.kind.as_deref() == Some("User") && actor.login.eq_ignore_ascii_case(login)
-            ),
-            EngagementSelector::IssueAuthor => Ok(payload
-                .issue
-                .user
-                .as_ref()
-                .is_some_and(|author| actor.login.eq_ignore_ascii_case(&author.login))),
-            EngagementSelector::RepositoryOwner => Ok(payload.repository.owner.kind.as_deref()
-                != Some("Organization")
-                && actor
-                    .login
-                    .eq_ignore_ascii_case(&payload.repository.owner.login)),
-            EngagementSelector::RepositoryOrganizationMember => {
-                if payload.repository.owner.kind.as_deref() != Some("Organization") {
-                    Ok(false)
-                } else {
-                    verify_organization_member(state, &payload.repository.owner.login, &actor.login)
-                        .await
-                }
-            }
-            EngagementSelector::OrganizationMember { organization } => {
-                verify_organization_member(state, organization, &actor.login).await
-            }
-            EngagementSelector::TeamMember {
-                organization,
-                team_slug,
-            } => verify_team_member(state, organization, team_slug, &actor.login).await,
-            EngagementSelector::AuthorAssociation { association } => {
-                Ok(author_association == Some(association.as_str()))
-            }
-            EngagementSelector::CollaboratorPermission { minimum } => {
-                verify_collaborator_permission(
-                    state,
-                    &payload.repository.owner.login,
-                    &payload.repository.name,
-                    &actor.login,
-                )
-                .await
-                .map(|actual| permission_rank(&actual) >= permission_rank(minimum))
-            }
-            EngagementSelector::Bot { login } => {
-                Ok(actor.kind.as_deref() == Some("Bot") && actor.login.eq_ignore_ascii_case(login))
-            }
-            EngagementSelector::GitHubApp { id, slug } => Ok(performed_app
-                .map(|app| {
-                    id.map(|expected| app.id == expected).unwrap_or(false)
-                        || slug
-                            .as_ref()
-                            .map(|expected| app.slug.eq_ignore_ascii_case(expected))
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false)),
-        };
-
-        match result {
-            Ok(true) => {
-                return AuthorizationDecision {
-                    allowed: true,
-                    reason: format!("actor matched engagement selector `{selector:?}`"),
-                    matched_selector: serde_json::to_value(selector).ok(),
-                };
-            }
-            Ok(false) => failures.push(format!("`{selector:?}` did not match")),
-            Err(error) => failures.push(format!("`{selector:?}` could not be verified: {error}")),
-        }
-    }
-
-    AuthorizationDecision {
-        allowed: false,
-        reason: if failures.is_empty() {
-            "engagement rule has no allowed identities".into()
-        } else {
-            failures.join("; ")
-        },
-        matched_selector: None,
-    }
-}
-
-async fn verify_organization_member(
-    state: &AppState,
-    organization: &str,
-    actor: &str,
-) -> Result<bool, String> {
-    let key = format!("org:{organization}:{actor}").to_ascii_lowercase();
-    if let Some(value) = verification_cache_get(state, &key).await {
-        return Ok(value == "true");
-    }
-    let result = match &state.github_auth {
-        Some(provider) => provider
-            .client()
-            .organization_member(organization, actor)
-            .await
-            .map_err(|error| error.to_string()),
-        None => Err("github credentials are unavailable".into()),
-    }?;
-    verification_cache_put(state, key, result.to_string()).await;
-    Ok(result)
-}
-
-async fn verify_team_member(
-    state: &AppState,
-    organization: &str,
-    team_slug: &str,
-    actor: &str,
-) -> Result<bool, String> {
-    let key = format!("team:{organization}:{team_slug}:{actor}").to_ascii_lowercase();
-    if let Some(value) = verification_cache_get(state, &key).await {
-        return Ok(value == "true");
-    }
-    let result = match &state.github_auth {
-        Some(provider) => provider
-            .client()
-            .team_member(organization, team_slug, actor)
-            .await
-            .map_err(|error| error.to_string()),
-        None => Err("github credentials are unavailable".into()),
-    }?;
-    verification_cache_put(state, key, result.to_string()).await;
-    Ok(result)
-}
-
-async fn verify_collaborator_permission(
-    state: &AppState,
-    owner: &str,
-    repo: &str,
-    actor: &str,
-) -> Result<String, String> {
-    let key = format!("permission:{owner}:{repo}:{actor}").to_ascii_lowercase();
-    if let Some(value) = verification_cache_get(state, &key).await {
-        return Ok(value);
-    }
-    let result = match &state.github_auth {
-        Some(provider) => provider
-            .client()
-            .collaborator_permission(owner, repo, actor)
-            .await
-            .map_err(|error| error.to_string()),
-        None => Err("github credentials are unavailable".into()),
-    }?;
-    verification_cache_put(state, key, result.clone()).await;
-    Ok(result)
-}
-
-async fn verification_cache_get(state: &AppState, key: &str) -> Option<String> {
-    let cache = state.verification_cache.lock().await;
-    cache.get(key).and_then(|(created_at, value)| {
-        (created_at.elapsed() < Duration::from_secs(300)).then(|| value.clone())
-    })
-}
-
-async fn verification_cache_put(state: &AppState, key: String, value: String) {
-    let mut cache = state.verification_cache.lock().await;
-    if cache.len() >= 1_024 {
-        cache.retain(|_, (created_at, _)| created_at.elapsed() < Duration::from_secs(300));
-        if cache.len() >= 1_024
-            && let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (created_at, _))| *created_at)
-                .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest);
-        }
-    }
-    cache.insert(key, (Instant::now(), value));
-}
-
-fn permission_rank(permission: &str) -> u8 {
-    match permission {
-        "admin" => 5,
-        "maintain" => 4,
-        "write" | "push" => 3,
-        "triage" => 2,
-        "read" | "pull" => 1,
-        _ => 0,
-    }
-}
-
-fn should_queue_reviewer(
-    action: &str,
-    pr_state: &str,
-    draft: bool,
-    managed: bool,
-    reviewer_enabled: bool,
-) -> bool {
-    reviewer_enabled
-        && managed
-        && pr_state == "open"
-        && !draft
-        && matches!(
-            action,
-            "opened" | "synchronize" | "reopened" | "ready_for_review"
-        )
 }
 
 fn can_retry_job(job: &JobRecord) -> bool {
@@ -3775,6 +2702,8 @@ struct WorkflowSummary {
     summary: Option<String>,
     pending_approval: Option<String>,
     approvals: Vec<ApprovalSummary>,
+    revision_targets: Vec<donkeyspace_core::approval::RevisionPreview>,
+    blockers: Vec<donkeyspace_db::workflow_blockers::Blocker>,
     external_sync: ExternalSyncSummary,
     tasks: Vec<WorkflowTaskSummary>,
     pull_request_number: Option<i64>,
@@ -3842,14 +2771,6 @@ struct ExternalSyncSummary {
     status: String,
     pending_operations: usize,
     last_error: Option<String>,
-}
-
-fn approval_command(reason: &str, verb: &str) -> Option<String> {
-    reason.lines().find_map(|line| {
-        let command = line.trim().trim_matches('`');
-        (command.starts_with('/') && command.split_whitespace().nth(1) == Some(verb))
-            .then(|| command.to_string())
-    })
 }
 
 fn approval_files(
@@ -3971,7 +2892,7 @@ mod tests {
         );
     }
 
-    fn engagement_state(selectors: Vec<EngagementSelector>) -> AppState {
+    pub(super) fn engagement_state(selectors: Vec<EngagementSelector>) -> AppState {
         let mut policy =
             Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
         policy.workflow.engagement.default.allow = selectors;
@@ -4814,3 +3735,6 @@ mod tests {
         )));
     }
 }
+
+#[cfg(test)]
+mod ingress_tests;

@@ -1,3 +1,26 @@
+#[cfg(test)]
+mod clarification_tests;
+#[cfg(test)]
+mod lifecycle_tests;
+mod projection;
+#[cfg(test)]
+mod retention_tests;
+#[cfg(test)]
+mod revision_tests;
+#[cfg(test)]
+mod shared_repair_tests;
+use projection::*;
+mod execution;
+use execution::*;
+mod approvals;
+use approvals::*;
+mod checkpoint;
+use checkpoint::*;
+mod tracking;
+use tracking::*;
+mod publication;
+use publication::*;
+
 use donkeyspace_core::{
     Confidence, Outcome, PluginApprovalMode, PluginArtifact, PluginArtifactType, PluginFlow,
     PluginFlowSelection, PluginManifest, PluginParameter, PluginResourceAssignment,
@@ -5,12 +28,10 @@ use donkeyspace_core::{
     PluginWorkItem, PluginWorkItemRegistry, Risk, RunResult, TestResult, TestStatus,
 };
 use donkeyspace_db::{
-    ApprovalRequestInput, JobRecord, LifecycleEventInput, PgPool, ProjectedWorkItemInput,
-    complete_job, create_waiting_job, fail_job, get_job, list_agent_publications_for_run,
-    list_projected_work_items_for_run, mark_projected_work_item_applied,
-    record_github_managed_resource_for_workflow_item, record_lifecycle_event, start_waiting_job,
-    supersede_job, transition_approval_request, upsert_approval_request,
-    upsert_projected_work_item,
+    ApprovalRequestInput, JobRecord, LifecycleEventInput, PgPool, ProjectedWorkItemInput, fail_job,
+    get_job, list_agent_publications_for_run, list_projected_work_items_for_run,
+    mark_projected_work_item_applied, record_github_managed_resource_for_workflow_item,
+    record_lifecycle_event, supersede_job, upsert_projected_work_item,
 };
 use donkeyspace_github::{GitHubClient, GitHubWorkItem};
 use futures::future::join_all;
@@ -33,99 +54,10 @@ use crate::publication::{
 
 pub struct LifecycleTracking<'a> {
     pub pool: &'a PgPool,
+    pub policy: &'a donkeyspace_core::Policy,
     pub coordinator: &'a JobRecord,
     pub github: Option<&'a GitHubClient>,
     pub publication: Option<PublicationContext<'a>>,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn record_plugin_task_event(
-    tracking: Option<&LifecycleTracking<'_>>,
-    manifest: &PluginManifest,
-    flow: &PluginFlow,
-    key: &TaskKey,
-    job_id: Option<Uuid>,
-    event_type: &str,
-    level: &str,
-    status: Option<&str>,
-    outcome: Option<&str>,
-    summary: &str,
-    reason: Option<&str>,
-    handoff_target: Option<&str>,
-    wave: Option<u32>,
-    attempt: Option<u32>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(tracking) = tracking else {
-        return Ok(());
-    };
-    let Some(workflow_item_id) = tracking.coordinator.workflow_item_id else {
-        return Ok(());
-    };
-    let task = &flow.tasks[&key.task];
-    let role = &manifest.roles[&task.role];
-    let identity = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        tracking.coordinator.id,
-        event_type,
-        key.task,
-        key.work_item.as_deref().unwrap_or("workflow"),
-        job_id.map_or_else(|| "-".into(), |value| value.to_string()),
-        wave.map_or_else(|| "-".into(), |value| value.to_string()),
-        attempt.map_or_else(|| "-".into(), |value| value.to_string()),
-    );
-    record_lifecycle_event(
-        tracking.pool,
-        &LifecycleEventInput {
-            workflow_item_id,
-            coordinator_job_id: Some(tracking.coordinator.id),
-            job_id,
-            dedupe_key: Some(identity),
-            event_type: event_type.into(),
-            level: level.into(),
-            source: "worker".into(),
-            actor: None,
-            wave: wave.map(|value| value as i32),
-            attempt: attempt.map(|value| value as i32),
-            role: Some(task.role.clone()),
-            role_display_name: role
-                .display_name
-                .clone()
-                .or_else(|| Some(task.role.clone())),
-            task: Some(key.task.clone()),
-            task_display_name: task.display_name.clone().or_else(|| Some(key.task.clone())),
-            work_item: key.work_item.clone(),
-            status: status.map(Into::into),
-            outcome: outcome.map(Into::into),
-            summary: concise_event_text(summary),
-            reason: reason.map(concise_event_text),
-            handoff_target: handoff_target.map(Into::into),
-            links: json!([]),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-fn concise_event_text(value: &str) -> String {
-    let value = value.split("\n\n").next().unwrap_or(value).trim();
-    let mut shortened = value.chars().take(600).collect::<String>();
-    if value.chars().count() > 600 {
-        shortened.push('…');
-    }
-    shortened
-}
-
-fn outcome_name(outcome: Outcome) -> &'static str {
-    match outcome {
-        Outcome::Ready => "ready",
-        Outcome::Implemented => "implemented",
-        Outcome::Reviewed => "reviewed",
-        Outcome::NeedsInfo => "needs_info",
-        Outcome::NeedsChanges => "needs_changes",
-        Outcome::NeedsHuman => "needs_human",
-        Outcome::Blocked => "blocked",
-        Outcome::Failed => "failed",
-    }
 }
 
 pub fn configured_pull_request_title(
@@ -145,201 +77,6 @@ pub fn configured_pull_request_title(
         .replace("{issue_number}", &issue_number.to_string())
         .replace("{issue_title}", &publication_issue_title(issue_input));
     Ok(Some(limit_publication_title(&title)))
-}
-
-fn checkpoint_commit_title(
-    flow: &PluginFlow,
-    keys: &[TaskKey],
-    issue_input: &Value,
-    issue_number: i64,
-) -> Option<String> {
-    let mut tags = Vec::new();
-    let mut descriptions = Vec::new();
-    let mut work_items = Vec::new();
-    for key in keys {
-        let task = &flow.tasks[&key.task];
-        if let Some(tag) = &task.publication_tag
-            && !tags.contains(tag)
-        {
-            tags.push(tag.clone());
-        }
-        let description = task.display_name.as_deref().unwrap_or(&key.task);
-        if !descriptions.iter().any(|value| value == description) {
-            descriptions.push(description.to_string());
-        }
-        if let Some(work_item) = &key.work_item
-            && !work_items.contains(work_item)
-        {
-            work_items.push(work_item.clone());
-        }
-    }
-    if tags.is_empty() {
-        return None;
-    }
-    let tags = tags
-        .iter()
-        .map(|tag| format!("[{tag}]"))
-        .collect::<String>();
-    let subject = if work_items.is_empty() {
-        publication_issue_title(issue_input)
-    } else {
-        work_items.join(", ")
-    };
-    Some(limit_publication_title(&format!(
-        "{tags} {}: {subject} (#{issue_number})",
-        descriptions.join(" + ")
-    )))
-}
-
-fn publication_issue_title(issue_input: &Value) -> String {
-    let value = issue_input
-        .pointer("/issue/title")
-        .and_then(Value::as_str)
-        .unwrap_or("Implementation");
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        "Implementation".into()
-    } else {
-        normalized
-    }
-}
-
-fn limit_publication_title(value: &str) -> String {
-    const MAX_CHARS: usize = 240;
-    let value = value.trim();
-    if value.chars().count() <= MAX_CHARS {
-        return value.to_string();
-    }
-    let mut shortened = value.chars().take(MAX_CHARS - 1).collect::<String>();
-    shortened.push('…');
-    shortened
-}
-
-async fn record_flow_event(
-    tracking: Option<&LifecycleTracking<'_>>,
-    event_type: &str,
-    level: &str,
-    summary: &str,
-    reason: Option<&str>,
-    wave: Option<u32>,
-    dedupe_suffix: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(tracking) = tracking else {
-        return Ok(());
-    };
-    let Some(workflow_item_id) = tracking.coordinator.workflow_item_id else {
-        return Ok(());
-    };
-    record_lifecycle_event(
-        tracking.pool,
-        &LifecycleEventInput {
-            workflow_item_id,
-            coordinator_job_id: Some(tracking.coordinator.id),
-            job_id: Some(tracking.coordinator.id),
-            dedupe_key: Some(format!(
-                "{}:{event_type}:{dedupe_suffix}",
-                tracking.coordinator.id
-            )),
-            event_type: event_type.into(),
-            level: level.into(),
-            source: "worker".into(),
-            actor: None,
-            wave: wave.map(|value| value as i32),
-            attempt: None,
-            role: None,
-            role_display_name: None,
-            task: None,
-            task_display_name: None,
-            work_item: None,
-            status: None,
-            outcome: None,
-            summary: concise_event_text(summary),
-            reason: reason.map(concise_event_text),
-            handoff_target: None,
-            links: json!([]),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-const CHECKPOINT_VERSION: u32 = 4;
-const MAX_RESOURCE_FILES: usize = 1_024;
-const MAX_RESOURCE_BYTES: u64 = 32 * 1024 * 1024;
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-struct MaterializedResource {
-    id: String,
-    source: PluginResourceSource,
-    source_path: String,
-    root: String,
-    available: bool,
-    inventory: Vec<String>,
-    digest: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct TrackedJobCheckpoint {
-    key: TaskKey,
-    job_id: Uuid,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct HandoffCheckpoint {
-    work_item: Option<String>,
-    from: String,
-    to: String,
-    count: u32,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ApprovalTrigger {
-    Required,
-    AgentRequested,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct PendingApproval {
-    key: TaskKey,
-    trigger: ApprovalTrigger,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-enum HumanDecision {
-    Approve {
-        target: Option<String>,
-    },
-    Revise {
-        target: Option<String>,
-        feedback: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct LifecycleCheckpoint {
-    version: u32,
-    attempt: u32,
-    accumulated_tests: Vec<TestResult>,
-    previous: Vec<Value>,
-    aggregate_risk: Risk,
-    aggregate_confidence: Confidence,
-    last_result: RunResult,
-    completed_keys: Vec<TaskKey>,
-    tracked_jobs: Vec<TrackedJobCheckpoint>,
-    handoffs: Vec<HandoffCheckpoint>,
-    projected_issues: BTreeMap<String, i64>,
-    closed_projected_issues: BTreeSet<String>,
-    resume_target: TaskKey,
-    #[serde(default)]
-    pending_approvals: Vec<PendingApproval>,
-    #[serde(default)]
-    start_approved: bool,
-    #[serde(default)]
-    revision_targets: Vec<TaskKey>,
-    #[serde(default)]
-    active_work_items: Vec<String>,
 }
 
 pub async fn run(
@@ -364,313 +101,18 @@ pub async fn run(
     )
     .await?;
     let issue_input = &enriched_input;
-    if flow.replaces_default_lifecycle {
-        return run_work_item_lifecycle(
-            selection,
-            &manifest,
-            flow,
-            repo_path,
-            workspace_path,
-            issue_input,
-            tracking,
-            &parameters,
-            plugin_root,
-        )
-        .await;
-    }
-    let max_handoffs = selection
-        .max_handoffs_per_edge
-        .unwrap_or(flow.max_handoffs_per_edge);
-    let mut handoffs = BTreeMap::<(String, String), u32>::new();
-    let mut stage_name = flow.start.clone();
-    let mut attempt = 0u32;
-    let mut accumulated_tests = Vec::<TestResult>::new();
-    let mut previous = Vec::<Value>::new();
-
-    loop {
-        attempt += 1;
-        if attempt > 64 {
-            return Err("plugin flow exceeded 64 stage attempts".into());
-        }
-        let stage = flow
-            .tasks
-            .get(&stage_name)
-            .ok_or("plugin stage disappeared after validation")?;
-        let agent = manifest
-            .roles
-            .get(&stage.role)
-            .ok_or("plugin agent disappeared after validation")?;
-        let stage_root = workspace_path
-            .join("plugin-stages")
-            .join(format!("{attempt:02}-{stage_name}"));
-        let stage_repo = stage_root.join("repo");
-        fs::create_dir_all(&stage_repo)?;
-        let declared_read = expand_templates(&stage.read, &parameters, None)?;
-        let declared_write = expand_templates(&stage.write, &parameters, None)?;
-        let (read_roots, write_roots) = resolve_access(
-            selection,
-            &stage_name,
-            &declared_read,
-            &declared_write,
-            &parameters,
-            &manifest.parameters,
-        )?;
-        let diagnostics = expand_artifacts(&stage.diagnostics, &parameters, None)?;
-        if let Some(diagnostic) = diagnostics.iter().find(|diagnostic| {
-            !covered(&diagnostic.path, &read_roots) && !covered(&diagnostic.path, &write_roots)
-        }) {
-            return Err(format!(
-                "stage `{stage_name}` diagnostic `{}` is outside its declared roots",
-                diagnostic.path
-            )
-            .into());
-        }
-        for root in read_roots.iter().chain(&write_roots) {
-            copy_root(repo_path, &stage_repo, root)?;
-        }
-
-        let donkeyspace = stage_root.join(".donkeyspace");
-        fs::create_dir_all(&donkeyspace)?;
-        let input_path = donkeyspace.join("run-input.json");
-        let result_path = donkeyspace.join("run-result.json");
-        let resources = materialize_resources(
-            &manifest,
-            &stage.role,
-            stage,
-            plugin_root,
-            repo_path,
-            &stage_root,
-            &parameters,
-        )?;
-        let selected_mcp = agent
-            .mcp_servers
-            .iter()
-            .filter_map(|name| manifest.mcp_servers.get(name).map(|server| (name, server)))
-            .collect::<BTreeMap<_, _>>();
-        fs::write(
-            &input_path,
-            serde_json::to_vec_pretty(&json!({
-                "run_id": issue_input.pointer("/run_id"),
-                "role": stage.role,
-                "plugin": {"id": manifest.id, "flow": selection.flow, "task": stage_name, "attempt": attempt},
-                "issue": issue_input.pointer("/issue").unwrap_or(issue_input),
-                "repository": issue_input.pointer("/repository"),
-                "workspace": {"repo_path": "repo", "result_path": ".donkeyspace/run-result.json", "read": read_roots, "write": write_roots},
-                "parameters": parameters,
-                "resources": resources,
-                "previous_stages": previous,
-                "mcp_servers": selected_mcp,
-            }))?,
-        )?;
-
-        let image = agent
-            .image
-            .as_deref()
-            .unwrap_or(&manifest.runtime.default_image);
-        let output = match run_container(
-            image,
-            &agent.command,
-            &stage_root,
-            &selection.environment,
-            &agent.environment,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                publish_serial_stage_attempt(
-                    tracking.as_ref(),
-                    selection,
-                    &stage_name,
-                    stage.publication_tag.as_deref(),
-                    attempt,
-                    &stage_root,
-                    repo_path,
-                    &write_roots,
-                    &diagnostics,
-                    None,
-                    &error.to_string(),
-                )
-                .await;
-                return Err(error);
-            }
-        };
-        write_agent_log(&donkeyspace.join("agent.stdout.log"), &output.stdout)?;
-        write_agent_log(&donkeyspace.join("agent.stderr.log"), &output.stderr)?;
-        let stage_execution = async {
-            if !output.status.success() {
-                return Err(format!(
-                    "plugin stage `{stage_name}` exited {:?}: {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )
-                .into());
-            }
-            let raw = fs::read_to_string(&result_path)?;
-            let mut stage_result: PluginTaskResult = serde_json::from_str(&raw)?;
-            validate_resources_used(&stage_result.resources_used, &resources)?;
-            validate_changed_files(&stage_result.result.changed_files, &write_roots)?;
-            if is_publishable(stage_result.result.outcome) {
-                verify_resources(&stage_root, &resources)?;
-                validate_artifacts(
-                    &stage_repo,
-                    &expand_artifacts(&stage.artifacts, &parameters, None)?,
-                    &write_roots,
-                )?;
-                let validator_results = run_validators(
-                    &stage.validators,
-                    image,
-                    &stage_root,
-                    &selection.environment,
-                    &agent.environment,
-                )
-                .await?;
-                apply_validator_results(&mut stage_result.result, validator_results);
-            }
-            stage_result.result.validate_for_orchestration()?;
-            Ok::<_, Box<dyn std::error::Error>>(stage_result)
-        }
-        .await;
-        let stage_result = match stage_execution {
-            Ok(stage_result) => stage_result,
-            Err(error) => {
-                publish_serial_stage_attempt(
-                    tracking.as_ref(),
-                    selection,
-                    &stage_name,
-                    stage.publication_tag.as_deref(),
-                    attempt,
-                    &stage_root,
-                    repo_path,
-                    &write_roots,
-                    &diagnostics,
-                    None,
-                    &error.to_string(),
-                )
-                .await;
-                return Err(error);
-            }
-        };
-        if is_publishable(stage_result.result.outcome) {
-            for root in &write_roots {
-                replace_root(&stage_repo, repo_path, root)?;
-            }
-            if let Some(publication) = tracking
-                .as_ref()
-                .and_then(|tracking| tracking.publication.as_ref())
-                && let Err(error) = publish_checkpoint(
-                    publication,
-                    repo_path,
-                    &checkpoint_commit_title(
-                        flow,
-                        &[TaskKey {
-                            work_item: None,
-                            task: stage_name.clone(),
-                        }],
-                        issue_input,
-                        publication.issue_number,
-                    )
-                    .unwrap_or_else(|| {
-                        format!(
-                            "chore({}): checkpoint {} for issue #{}",
-                            active_facade().command,
-                            stage_name,
-                            publication.issue_number
-                        )
-                    }),
-                )
-                .await
-            {
-                tracing::warn!(%error, stage = stage_name, "plugin stage checkpoint failed");
-            }
-            if diagnostics_present_at(&stage_repo, &diagnostics) {
-                publish_serial_stage_attempt(
-                    tracking.as_ref(),
-                    selection,
-                    &stage_name,
-                    stage.publication_tag.as_deref(),
-                    attempt,
-                    &stage_root,
-                    repo_path,
-                    &write_roots,
-                    &diagnostics,
-                    Some(stage_result.result.outcome),
-                    &stage_result.result.summary,
-                )
-                .await;
-            }
-        } else {
-            publish_serial_stage_attempt(
-                tracking.as_ref(),
-                selection,
-                &stage_name,
-                stage.publication_tag.as_deref(),
-                attempt,
-                &stage_root,
-                repo_path,
-                &write_roots,
-                &diagnostics,
-                Some(stage_result.result.outcome),
-                &stage_result.result.summary,
-            )
-            .await;
-        }
-        accumulated_tests.extend(stage_result.result.tests.clone());
-        previous.push(json!({"stage": stage_name, "attempt": attempt, "outcome": stage_result.result.outcome, "summary": stage_result.result.summary}));
-
-        match stage_result.result.outcome {
-            Outcome::Implemented if stage.terminal => {
-                let mut result = stage_result.result;
-                result.tests = accumulated_tests;
-                result.summary = flow_summary(&previous, &result.summary);
-                if result.tests.is_empty() {
-                    return Err("terminal plugin result did not report tests".into());
-                }
-                return Ok(result);
-            }
-            Outcome::Implemented => {
-                stage_name = stage
-                    .transitions
-                    .get("implemented")
-                    .cloned()
-                    .ok_or_else(|| format!("stage `{stage_name}` has no implemented transition"))?;
-            }
-            Outcome::NeedsChanges => {
-                let handoff = stage_result.handoff.ok_or_else(|| {
-                    format!("stage `{stage_name}` returned needs_changes without a handoff")
-                })?;
-                if !stage.allowed_handoffs.contains(&handoff.target) {
-                    return Err(format!(
-                        "stage `{stage_name}` cannot hand off to `{}`",
-                        handoff.target
-                    )
-                    .into());
-                }
-                let key = (stage_name.clone(), handoff.target.clone());
-                let count = handoffs.entry(key).or_default();
-                *count += 1;
-                if *count > max_handoffs {
-                    let mut result = stage_result.result;
-                    result.outcome = Outcome::NeedsHuman;
-                    result.human_review_reason = Some(format!(
-                        "handoff from `{stage_name}` to `{}` exceeded policy limit {max_handoffs}: {}",
-                        handoff.target, handoff.reason
-                    ));
-                    result.tests = accumulated_tests;
-                    result.summary = flow_summary(&previous, &result.summary);
-                    return Ok(result);
-                }
-                previous.push(json!({"handoff": {"from": stage_name, "to": handoff.target, "reason": handoff.reason}}));
-                stage_name = handoff.target;
-            }
-            _ => {
-                let mut result = stage_result.result;
-                result.tests = accumulated_tests;
-                result.summary = flow_summary(&previous, &result.summary);
-                return Ok(result);
-            }
-        }
-    }
+    run_work_item_lifecycle(
+        selection,
+        &manifest,
+        flow,
+        repo_path,
+        workspace_path,
+        issue_input,
+        tracking,
+        &parameters,
+        plugin_root,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -685,161 +127,51 @@ async fn run_work_item_lifecycle(
     parameters: &BTreeMap<String, Value>,
     plugin_root: &Path,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
-    let checkpoint_path = workspace_path
-        .join(".donkeyspace")
-        .join("lifecycle-checkpoint.json");
     let is_resume = issue_input
         .pointer("/donkeyspace_resume")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut checkpoint = if is_resume {
-        if checkpoint_path.is_file() {
-            let checkpoint: LifecycleCheckpoint =
-                serde_json::from_str(&fs::read_to_string(&checkpoint_path)?)?;
-            if !matches!(checkpoint.version, 1 | 2 | 3 | CHECKPOINT_VERSION) {
-                return Err(format!(
-                    "unsupported lifecycle checkpoint version {}",
-                    checkpoint.version
-                )
-                .into());
-            }
-            Some(checkpoint)
-        } else {
-            // A planner can request human input before a work-item graph
-            // exists. In that case the retained workspace is authoritative
-            // and the planner is rerun in-place with the human response.
-            None
-        }
-    } else {
-        None
-    };
-
-    let mut rerun_start = false;
-    let mut accept_start_projection = false;
+    let mut store = CheckpointStore::new(workspace_path, tracking.as_ref());
+    let mut checkpoint = store.load(is_resume, issue_input, flow).await?;
+    if let Some(saved) = checkpoint.as_mut()
+        && saved.last_result.outcome == Outcome::NeedsInfo
+        && saved.start_action != StartAction::Revise
+    {
+        saved.previous.push(json!({
+            "human_response": issue_input.pointer("/comment/body").and_then(Value::as_str),
+            "resume_targets": saved.revision_targets,
+        }));
+    }
     if let Some(saved) = checkpoint.as_mut()
         && !saved.pending_approvals.is_empty()
+        && let Some(result) =
+            resume_human_decision(saved, flow, issue_input, tracking.as_ref(), &mut store).await?
     {
-        let decision_value = issue_input
-            .pointer("/donkeyspace_human_decision")
-            .cloned()
-            .ok_or("resumed approval checkpoint is missing a human decision")?;
-        let decision = serde_json::from_value::<HumanDecision>(decision_value)?;
-        let selected = match select_pending_approvals(&saved.pending_approvals, &decision) {
-            Ok(selected) => selected,
-            Err(error) => {
-                let result = pending_approval_result(
-                    &saved.pending_approvals,
-                    &saved.projected_issues,
-                    flow,
-                    &format!("The approval command was not applied: {error}"),
-                );
-                saved.version = CHECKPOINT_VERSION;
-                saved.last_result = result.clone();
-                write_lifecycle_checkpoint(&checkpoint_path, saved)?;
-                return Ok(finish_result(
-                    result,
-                    saved.accumulated_tests.clone(),
-                    &saved.previous,
-                ));
-            }
-        };
-        let selected_keys = selected
-            .iter()
-            .map(|approval| approval.key.clone())
-            .collect::<BTreeSet<_>>();
-        let feedback = match &decision {
-            HumanDecision::Approve { .. } => "approved".to_string(),
-            HumanDecision::Revise { feedback, .. } => feedback.trim().to_string(),
-        };
-        for approval in &selected {
-            let is_start = approval.key.work_item.is_none() && approval.key.task == flow.start;
-            match (&decision, approval.trigger, is_start) {
-                (HumanDecision::Approve { .. }, ApprovalTrigger::Required, true) => {
-                    saved.start_approved = true;
-                    accept_start_projection = true;
-                }
-                (HumanDecision::Approve { .. }, ApprovalTrigger::Required, false) => {
-                    if !saved.completed_keys.contains(&approval.key) {
-                        saved.completed_keys.push(approval.key.clone());
-                    }
-                }
-                (HumanDecision::Revise { .. }, _, true) => {
-                    saved.start_approved = false;
-                    rerun_start = true;
-                }
-                (HumanDecision::Revise { .. }, _, false)
-                | (HumanDecision::Approve { .. }, ApprovalTrigger::AgentRequested, false) => {
-                    if !saved.revision_targets.contains(&approval.key) {
-                        saved.revision_targets.push(approval.key.clone());
-                    }
-                }
-                (HumanDecision::Approve { .. }, ApprovalTrigger::AgentRequested, true) => {
-                    rerun_start = true;
-                }
-            }
-            saved.previous.push(json!({
-                "human_response": feedback,
-                "human_decision": issue_input.pointer("/donkeyspace_human_decision"),
-                "resume_target": approval.key,
-            }));
-            if let Some(tracking) = &tracking {
-                transition_approval_request(
-                    tracking.pool,
-                    tracking.coordinator.id,
-                    &approval.key.task,
-                    approval.key.work_item.as_deref(),
-                    match &decision {
-                        HumanDecision::Approve { .. } => "approved",
-                        HumanDecision::Revise { .. } => "revised",
-                    },
-                )
-                .await?;
-            }
-        }
-        saved
-            .pending_approvals
-            .retain(|approval| !selected_keys.contains(&approval.key));
-        if !saved.pending_approvals.is_empty() {
-            saved.version = CHECKPOINT_VERSION;
-            let result = pending_approval_result(
-                &saved.pending_approvals,
-                &saved.projected_issues,
-                flow,
-                "Some approvals remain pending.",
-            );
-            saved.last_result = result.clone();
-            write_lifecycle_checkpoint(&checkpoint_path, saved)?;
-            return Ok(finish_result(
-                result,
-                saved.accumulated_tests.clone(),
-                &saved.previous,
-            ));
-        }
+        return Ok(result);
     }
+    let rerun_start = checkpoint
+        .as_ref()
+        .is_some_and(|saved| saved.start_action == StartAction::Revise);
+    let accept_start_projection = checkpoint
+        .as_ref()
+        .is_some_and(|saved| saved.start_action == StartAction::Accept);
     let revision_targets = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.revision_targets.clone())
         .unwrap_or_default();
 
     let (
-        mut previous,
-        mut accumulated_tests,
-        mut attempt,
-        mut aggregate_risk,
-        mut aggregate_confidence,
-        mut last_result,
+        previous,
+        accumulated_tests,
+        attempt,
+        aggregate_risk,
+        aggregate_confidence,
+        last_result,
         requested_work_items,
     ) = if let Some(checkpoint) = &checkpoint
         && !rerun_start
     {
-        let mut previous = checkpoint.previous.clone();
-        if checkpoint.version == 1 {
-            previous.push(json!({
-                "human_response": issue_input.pointer("/comment/body").and_then(Value::as_str),
-                "human_decision": issue_input.pointer("/donkeyspace_human_decision"),
-                "resume_target": checkpoint.resume_target,
-            }));
-        }
+        let previous = checkpoint.previous.clone();
         (
             previous,
             checkpoint.accumulated_tests.clone(),
@@ -862,8 +194,11 @@ async fn run_work_item_lifecycle(
                 "resume_target": {"work_item": null, "task": flow.start},
             }));
         }
-        let mut accumulated_tests = Vec::<TestResult>::new();
-        let attempt = 1u32;
+        let mut accumulated_tests = checkpoint
+            .as_ref()
+            .map(|saved| saved.accumulated_tests.clone())
+            .unwrap_or_default();
+        let attempt = checkpoint.as_ref().map_or(1, |saved| saved.attempt + 1);
         let planner_key = TaskKey {
             work_item: None,
             task: flow.start.clone(),
@@ -952,7 +287,7 @@ async fn run_work_item_lifecycle(
             Some("completed"),
             Some(outcome_name(planner.result.outcome)),
             &planner.result.summary,
-            planner.result.human_review_reason.as_deref(),
+            task_result_reason(&planner.result).as_deref(),
             None,
             None,
             Some(attempt),
@@ -960,10 +295,16 @@ async fn run_work_item_lifecycle(
         .await?;
         accumulated_tests.extend(planner.result.tests.clone());
         let requested_work_items = planner.work_items.clone();
-        let aggregate_risk = planner.result.risk;
-        let aggregate_confidence = planner.result.confidence;
-        previous.push(task_summary(&flow.start, None, attempt, &planner.result));
-        if planner.result.outcome == Outcome::Implemented
+        let aggregate_risk = checkpoint.as_ref().map_or(planner.result.risk, |saved| {
+            max_risk(saved.aggregate_risk, planner.result.risk)
+        });
+        let aggregate_confidence = checkpoint
+            .as_ref()
+            .map_or(planner.result.confidence, |saved| {
+                min_confidence(saved.aggregate_confidence, planner.result.confidence)
+            });
+        previous.push(task_summary(&flow.start, None, attempt, &planner));
+        if retains_output(&flow.tasks[&flow.start], planner.result.outcome)
             && let Some(publication) = tracking
                 .as_ref()
                 .and_then(|tracking| tracking.publication.as_ref())
@@ -985,6 +326,11 @@ async fn run_work_item_lifecycle(
                         publication.issue_number
                     )
                 }),
+                &expand_artifacts(
+                    &flow.tasks[&flow.start].preserve_on_success,
+                    parameters,
+                    None,
+                )?,
             )
             .await?;
         }
@@ -1006,6 +352,70 @@ async fn run_work_item_lifecycle(
                 None,
             )
             .await;
+            if matches!(
+                planner.result.outcome,
+                Outcome::NeedsHuman | Outcome::NeedsInfo
+            ) {
+                let needs_info = planner.result.outcome == Outcome::NeedsInfo;
+                let pending = if needs_info {
+                    Vec::new()
+                } else {
+                    vec![PendingApproval {
+                        key: planner_key.clone(),
+                        trigger: ApprovalTrigger::AgentRequested,
+                    }]
+                };
+                let result = if needs_info {
+                    planner.result.clone()
+                } else {
+                    pending_approval_result(
+                        &pending,
+                        &BTreeMap::new(),
+                        flow,
+                        planner
+                            .result
+                            .human_review_reason
+                            .as_deref()
+                            .unwrap_or(&planner.result.summary),
+                    )
+                };
+                let mut saved = checkpoint.clone().unwrap_or_else(|| {
+                    LifecycleCheckpoint::capture(
+                        attempt,
+                        &accumulated_tests,
+                        &previous,
+                        aggregate_risk,
+                        aggregate_confidence,
+                        &result,
+                        &TaskGraph::for_work_items(flow, &[]),
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        &BTreeSet::new(),
+                        pending.clone(),
+                        false,
+                        &[],
+                    )
+                });
+                // Replanning can itself ask for clarification. Keep unrelated
+                // completed work and projected issue identities through that pause.
+                saved.attempt = attempt;
+                saved.accumulated_tests = accumulated_tests.clone();
+                saved.previous = previous.clone();
+                saved.aggregate_risk = aggregate_risk;
+                saved.aggregate_confidence = aggregate_confidence;
+                saved.last_result = result.clone();
+                saved.pending_approvals = pending;
+                saved.start_approved = false;
+                saved.revision_options.clear();
+                if needs_info {
+                    // Clarification resumes this coordinator and its exact draft;
+                    // it is not acceptance of the eventual completed proposal.
+                    saved.start_action = StartAction::Revise;
+                }
+                store.save(&saved, flow, true, false).await?;
+                return Ok(finish_result(result, accumulated_tests, &previous));
+            }
             return Ok(finish_result(planner.result, accumulated_tests, &previous));
         }
         (
@@ -1027,7 +437,7 @@ async fn run_work_item_lifecycle(
     let registry: PluginWorkItemRegistry =
         serde_json::from_str(&fs::read_to_string(repo_path.join(&registry_path))?)?;
     validate_work_items(&registry.work_items)?;
-    let mut work_items =
+    let work_items =
         select_lifecycle_work_items(&registry.work_items, requested_work_items.as_deref())?;
     if let Some(item) = work_items
         .iter()
@@ -1053,7 +463,7 @@ async fn run_work_item_lifecycle(
         .as_ref()
         .map(|checkpoint| checkpoint.projected_issues.clone())
         .unwrap_or_default();
-    let mut tracked_jobs = checkpoint
+    let tracked_jobs = checkpoint
         .as_ref()
         .map(|checkpoint| {
             checkpoint
@@ -1063,324 +473,49 @@ async fn run_work_item_lifecycle(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let mut finished_jobs = checkpoint
+    let finished_jobs = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.completed_keys.iter().cloned().collect())
         .unwrap_or_default();
     if let Some(checkpoint) = &checkpoint {
-        graph.restore_completed(&checkpoint.completed_keys)?;
+        // A revised plan may remove work items. Preserve only unaffected
+        // completed tasks that still exist in the reconciled graph.
+        let retained = checkpoint
+            .completed_keys
+            .iter()
+            .filter(|key| !rerun_start || graph.keys().any(|current| current == *key))
+            .cloned()
+            .collect::<Vec<_>>();
+        graph.restore_completed(&retained)?;
     }
     for target in &revision_targets {
         graph.restart_from(target)?;
     }
     if checkpoint.is_none() || rerun_start || accept_start_projection {
-        // Existing projected issues are deliberately retained during a revision.
-        // A removed, previously accepted work item is only closed after the new
-        // architect proposal is approved; until then it remains the accepted view.
-        if flow.project_github_issues
-            && let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
-            && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
-        {
-            let tracking_ref = tracking
-                .as_ref()
-                .expect("GitHub projection requires tracking");
-            crate::cancellation::side_effect(
-                tracking_ref.pool,
-                tracking_ref.coordinator.id,
-                async {
-                    if rerun_start && !accept_start_projection {
-                        let active_ids = work_items
-                            .iter()
-                            .map(|item| item.id.as_str())
-                            .collect::<BTreeSet<_>>();
-                        if let Some(tracking) = &tracking {
-                            for item in list_projected_work_items_for_run(
-                                tracking.pool,
-                                tracking.coordinator.id,
-                            )
-                            .await?
-                            .into_iter()
-                            .filter(|item| {
-                                !item.accepted && !active_ids.contains(item.work_item.as_str())
-                            }) {
-                                if let Some(issue_number) = item.issue_number {
-                                    github.close_issue(owner, repo, issue_number).await?;
-                                }
-                                projected_issues.remove(&item.work_item);
-                            }
-                        }
-                    }
-                    if accept_start_projection {
-                        let active_ids = work_items
-                            .iter()
-                            .map(|item| item.id.as_str())
-                            .collect::<BTreeSet<_>>();
-                        let removed = projected_issues
-                            .iter()
-                            .filter(|(id, _)| !active_ids.contains(id.as_str()))
-                            .map(|(id, number)| (id.clone(), *number))
-                            .collect::<Vec<_>>();
-                        for (id, issue_number) in removed {
-                            github.close_issue(owner, repo, issue_number).await?;
-                            projected_issues.remove(&id);
-                            if let (Some(tracking), Some(checkpoint)) = (&tracking, &checkpoint) {
-                                for tracked in checkpoint.tracked_jobs.iter().filter(|tracked| {
-                                    tracked.key.work_item.as_deref() == Some(id.as_str())
-                                }) {
-                                    supersede_job(
-                                        tracking.pool,
-                                        tracked.job_id,
-                                        "The approved architect checkpoint removed this work item.",
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
-                    }
-                    let run_publications = if let Some(tracking) = &tracking {
-                        list_agent_publications_for_run(
-                            tracking.pool,
-                            tracking.coordinator.id,
-                            Some(tracking.coordinator.id),
-                        )
-                        .await?
-                    } else {
-                        Vec::new()
-                    };
-                    let projection_records = if let Some(tracking) = &tracking {
-                        list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
-                            .await?
-                    } else {
-                        Vec::new()
-                    };
-                    let proposed_publication = run_publications
-                        .iter()
-                        .filter(|publication| {
-                            publication.kind == "checkpoint" && publication.status == "published"
-                        })
-                        .max_by_key(|publication| publication.id);
-                    let github_work_items = work_items
-                        .iter()
-                        .map(|item| {
-                            let accepted_commit = if accept_start_projection {
-                                proposed_publication
-                                    .map(|publication| publication.commit_sha.clone())
-                            } else {
-                                projection_records
-                                    .iter()
-                                    .find(|record| record.work_item == item.id)
-                                    .and_then(|record| record.accepted_publication_id)
-                                    .and_then(|id| {
-                                        run_publications
-                                            .iter()
-                                            .find(|publication| publication.id == id)
-                                    })
-                                    .map(|publication| publication.commit_sha.clone())
-                            };
-                            GitHubWorkItem {
-                                id: item.id.clone(),
-                                spec: item.spec.clone(),
-                                body: fs::read_to_string(repo_path.join(&item.spec))
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(50_000)
-                                    .collect(),
-                                depends_on: item.depends_on.clone(),
-                                proposed_commit: proposed_publication
-                                    .as_ref()
-                                    .map(|publication| publication.commit_sha.clone()),
-                                proposed_commit_url: proposed_publication
-                                    .as_ref()
-                                    .and_then(|publication| publication.commit_url.clone()),
-                                proposed_compare_url: proposed_publication
-                                    .as_ref()
-                                    .and_then(|publication| publication.compare_url.clone()),
-                                accepted_commit,
-                                accepted: accept_start_projection,
-                            }
-                        })
-                        .collect::<Vec<_>>();
-
-                    if let Some(workflow_item_id) = tracking
-                        .as_ref()
-                        .and_then(|tracking| tracking.coordinator.workflow_item_id)
-                    {
-                        for item in &github_work_items {
-                            let digest = format!("{:x}", Sha256::digest(item.body.as_bytes()));
-                            upsert_projected_work_item(
-                                tracking
-                                    .as_ref()
-                                    .expect("tracking exists when workflow id exists")
-                                    .pool,
-                                &ProjectedWorkItemInput {
-                                    workflow_item_id,
-                                    coordinator_job_id: tracking
-                                        .as_ref()
-                                        .expect("tracking exists")
-                                        .coordinator
-                                        .id,
-                                    work_item: item.id.clone(),
-                                    spec_path: item.spec.clone(),
-                                    body_digest: digest,
-                                    managed_dependencies: json!(item.depends_on),
-                                    proposed_publication_id: proposed_publication
-                                        .map(|publication| publication.id),
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-
-                    if rerun_start || accept_start_projection {
-                        for item in &github_work_items {
-                            let Some(issue_number) = projected_issues.get(&item.id) else {
-                                continue;
-                            };
-                            github
-                                .update_projected_work_item(
-                                    owner,
-                                    repo,
-                                    parent_issue_number,
-                                    *issue_number,
-                                    item,
-                                )
-                                .await?;
-                            if let Some(tracking) = &tracking {
-                                mark_projected_work_item_applied(
-                                    tracking.pool,
-                                    tracking.coordinator.id,
-                                    &item.id,
-                                    None,
-                                    *issue_number,
-                                    accept_start_projection,
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-
-                    let github_work_items = github_work_items
-                        .into_iter()
-                        .filter(|item| !projected_issues.contains_key(&item.id))
-                        .collect::<Vec<_>>();
-                    let issues = github
-                        .project_work_items(owner, repo, parent_issue_number, &github_work_items)
-                        .await?;
-                    if let Some(tracking) = &tracking
-                        && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
-                    {
-                        for (work_item, issue) in &issues {
-                            record_github_managed_resource_for_workflow_item(
-                                tracking.pool,
-                                workflow_item_id,
-                                "issue",
-                                &issue.id.to_string(),
-                                &json!({"work_item": work_item, "issue_number": issue.number}),
-                            )
-                            .await?;
-                        }
-                    }
-                    if let Some(tracking) = &tracking {
-                        for (work_item, issue) in &issues {
-                            mark_projected_work_item_applied(
-                                tracking.pool,
-                                tracking.coordinator.id,
-                                work_item,
-                                Some(&issue.id.to_string()),
-                                issue.number,
-                                accept_start_projection,
-                            )
-                            .await?;
-                        }
-                    }
-                    projected_issues.extend(
-                        issues
-                            .into_iter()
-                            .map(|(work_item, issue)| (work_item, issue.number)),
-                    );
-                    Ok::<_, Box<dyn std::error::Error>>(())
-                },
-            )
-            .await?;
-        }
-    }
-
-    let start_approved = checkpoint
-        .as_ref()
-        .is_some_and(|checkpoint| checkpoint.start_approved)
-        && !rerun_start;
-    if flow.tasks[&flow.start].approval == PluginApprovalMode::Required && !start_approved {
-        let pending = vec![PendingApproval {
-            key: TaskKey {
-                work_item: None,
-                task: flow.start.clone(),
-            },
-            trigger: ApprovalTrigger::Required,
-        }];
-        let result = pending_approval_result(
-            &pending,
-            &projected_issues,
-            flow,
-            "The lifecycle start task completed successfully and requires approval before downstream work begins.",
-        );
-        persist_pending_approvals(
+        let phase = if accept_start_projection {
+            ProjectionPhase::Accepted
+        } else if rerun_start {
+            ProjectionPhase::Proposed
+        } else {
+            ProjectionPhase::Initial
+        };
+        synchronize_work_items(
             tracking.as_ref(),
-            &pending,
-            &projected_issues,
             flow,
-            &result,
+            github_coordinates,
+            repo_path,
+            &work_items,
+            &mut projected_issues,
+            checkpoint
+                .as_ref()
+                .map(|saved| saved.tracked_jobs.as_slice())
+                .unwrap_or_default(),
+            phase,
         )
         .await?;
-        write_lifecycle_checkpoint(
-            &checkpoint_path,
-            &LifecycleCheckpoint {
-                version: CHECKPOINT_VERSION,
-                attempt,
-                accumulated_tests: accumulated_tests.clone(),
-                previous: previous.clone(),
-                aggregate_risk,
-                aggregate_confidence,
-                last_result: result.clone(),
-                completed_keys: Vec::new(),
-                tracked_jobs: Vec::new(),
-                handoffs: Vec::new(),
-                projected_issues: projected_issues.clone(),
-                closed_projected_issues: BTreeSet::new(),
-                resume_target: pending[0].key.clone(),
-                pending_approvals: pending,
-                start_approved: false,
-                revision_targets: Vec::new(),
-                active_work_items: work_items.iter().map(|item| item.id.clone()).collect(),
-            },
-        )?;
-        return Ok(finish_result(result, accumulated_tests, &previous));
     }
 
-    if let Some(tracking) = &tracking {
-        let pending_keys = graph
-            .keys()
-            .filter(|key| !graph.is_completed(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in pending_keys {
-            ensure_waiting_tracked_job(
-                tracking,
-                &mut tracked_jobs,
-                &mut finished_jobs,
-                manifest,
-                &selection.flow,
-                flow,
-                &key,
-                &work_items,
-                issue_input,
-            )
-            .await?;
-        }
-    }
-    let max_handoffs = selection
-        .max_handoffs_per_edge
-        .unwrap_or(flow.max_handoffs_per_edge);
-    let mut handoffs = checkpoint
+    let handoffs = checkpoint
         .as_ref()
         .map(|checkpoint| {
             checkpoint
@@ -1399,13 +534,84 @@ async fn run_work_item_lifecycle(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let mut closed_projected_issues = checkpoint
+    let closed_projected_issues = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.closed_projected_issues.clone())
         .unwrap_or_default();
 
-    while !graph.is_complete() {
-        let ready = graph
+    let mut state = LifecycleState {
+        attempt,
+        accumulated_tests,
+        previous,
+        aggregate_risk,
+        aggregate_confidence,
+        last_result,
+        graph,
+        tracked_jobs,
+        finished_jobs,
+        handoffs,
+        projected_issues,
+        closed_projected_issues,
+        work_items,
+    };
+    let start_approved = checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.start_approved)
+        && !rerun_start;
+    if flow.tasks[&flow.start].approval == PluginApprovalMode::Required && !start_approved {
+        let pending = vec![PendingApproval {
+            key: TaskKey {
+                work_item: None,
+                task: flow.start.clone(),
+            },
+            trigger: ApprovalTrigger::Required,
+        }];
+        let result = pending_approval_result(
+            &pending,
+            &state.projected_issues,
+            flow,
+            "The lifecycle start task completed successfully and requires approval before downstream work begins.",
+        );
+        store
+            .save(&state.snapshot(&result, pending, false), flow, true, false)
+            .await?;
+        return Ok(finish_result(
+            result,
+            state.accumulated_tests,
+            &state.previous,
+        ));
+    }
+
+    if let Some(tracking) = &tracking {
+        let pending_keys = state
+            .graph
+            .keys()
+            .filter(|key| !state.graph.is_completed(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in pending_keys {
+            ensure_waiting_tracked_job(
+                tracking,
+                &mut store.effects,
+                &mut state.tracked_jobs,
+                &mut state.finished_jobs,
+                manifest,
+                &selection.flow,
+                flow,
+                &key,
+                &state.work_items,
+                issue_input,
+            )
+            .await?;
+        }
+    }
+    let max_handoffs = selection
+        .max_handoffs_per_edge
+        .unwrap_or(flow.max_handoffs_per_edge);
+
+    while !state.graph.is_complete() {
+        let ready = state
+            .graph
             .ready()?
             .into_iter()
             .take(flow.max_parallel_tasks)
@@ -1414,53 +620,47 @@ async fn run_work_item_lifecycle(
             if let Some(tracking) = &tracking {
                 fail_unfinished_tracked_jobs(
                     tracking,
-                    &tracked_jobs,
-                    &mut finished_jobs,
+                    &state.tracked_jobs,
+                    &mut state.finished_jobs,
                     "plugin task graph had no runnable tasks",
                 )
                 .await?;
             }
             return Err("plugin task graph has no runnable tasks".into());
         }
-        let wave = attempt;
+        let wave = state.attempt;
         let released = ready
             .iter()
-            .map(approval_target)
+            .map(TaskKey::target)
             .collect::<Vec<_>>()
             .join(", ");
-        record_flow_event(
+        stage_flow_event(
             tracking.as_ref(),
+            &mut store.effects,
             "wave_started",
             "milestone",
             &format!("Wave {wave} started: {released}."),
             None,
             Some(wave),
             &wave.to_string(),
-        )
-        .await?;
+        );
         for key in &ready {
             if let Some(tracking) = &tracking {
                 let job_id = ensure_waiting_tracked_job(
                     tracking,
-                    &mut tracked_jobs,
-                    &mut finished_jobs,
+                    &mut store.effects,
+                    &mut state.tracked_jobs,
+                    &mut state.finished_jobs,
                     manifest,
                     &selection.flow,
                     flow,
                     key,
-                    &work_items,
+                    &state.work_items,
                     issue_input,
                 )
                 .await?;
-                start_waiting_job(tracking.pool, job_id)
-                    .await?
-                    .ok_or_else(|| {
-                        format!(
-                            "plugin child job `{job_id}` for task `{}` changed state before it could start",
-                            approval_target(key)
-                        )
-                    })?;
-                record_plugin_task_event(
+                store.effects.starting_children.push(job_id);
+                if let Some(event) = plugin_task_event(
                     Some(tracking),
                     manifest,
                     flow,
@@ -1475,45 +675,54 @@ async fn run_work_item_lifecycle(
                     None,
                     Some(wave),
                     Some(wave),
-                )
-                .await?;
+                ) {
+                    store.effects.events.push(event);
+                }
             }
-            graph.mark_running(key)?;
+            state.graph.mark_running(key)?;
         }
-        attempt += 1;
-        if attempt > 64 {
+        state.attempt += 1;
+        if state.attempt > 64 {
             if let Some(tracking) = &tracking {
                 fail_unfinished_tracked_jobs(
                     tracking,
-                    &tracked_jobs,
-                    &mut finished_jobs,
+                    &state.tracked_jobs,
+                    &mut state.finished_jobs,
                     "plugin lifecycle exceeded 64 task waves",
                 )
                 .await?;
             }
             return Err("plugin lifecycle exceeded 64 task waves".into());
         }
+        store
+            .save(
+                &state.snapshot(&state.last_result, Vec::new(), true),
+                flow,
+                false,
+                false,
+            )
+            .await?;
         let task_attempts = ready
             .iter()
             .enumerate()
-            .map(|(offset, key)| (key.clone(), attempt * 100 + offset as u32))
+            .map(|(offset, key)| (key.clone(), state.attempt * 100 + offset as u32))
             .collect::<BTreeMap<_, _>>();
         let executions = join_all(ready.iter().enumerate().map(|(offset, key)| {
             let work_item = key
                 .work_item
                 .as_deref()
-                .and_then(|id| work_items.iter().find(|item| item.id == id));
+                .and_then(|id| state.work_items.iter().find(|item| item.id == id));
             execute_task(
                 selection,
                 manifest,
                 &key.task,
                 &flow.tasks[&key.task],
                 work_item,
-                attempt * 100 + offset as u32,
+                state.attempt * 100 + offset as u32,
                 repo_path,
                 workspace_path,
                 issue_input,
-                &previous,
+                &state.previous,
                 parameters,
                 plugin_root,
             )
@@ -1525,54 +734,52 @@ async fn run_work_item_lifecycle(
         for (offset, (key, execution)) in ready.into_iter().zip(executions).enumerate() {
             match execution {
                 Ok(execution) => {
-                    if let Some(tracking) = &tracking {
-                        complete_job(
-                            tracking.pool,
-                            tracked_jobs[&key],
-                            &serde_json::to_value(&execution)?,
-                        )
-                        .await?;
-                        finished_jobs.insert(key.clone());
+                    if tracking.is_some() {
+                        store
+                            .effects
+                            .child_results
+                            .push((state.tracked_jobs[&key], serde_json::to_value(&execution)?));
+                        state.finished_jobs.insert(key.clone());
                     }
-                    record_plugin_task_event(
+                    if let Some(event) = plugin_task_event(
                         tracking.as_ref(),
                         manifest,
                         flow,
                         &key,
-                        tracking.as_ref().map(|_| tracked_jobs[&key]),
+                        tracking.as_ref().map(|_| state.tracked_jobs[&key]),
                         "task_completed",
                         "milestone",
                         Some("completed"),
                         Some(outcome_name(execution.result.outcome)),
                         &execution.result.summary,
-                        execution
-                            .result
-                            .human_review_reason
-                            .as_deref()
-                            .or(execution.result.blocked_reason.as_deref()),
+                        task_result_reason(&execution.result).as_deref(),
                         execution
                             .handoff
                             .as_ref()
                             .map(|handoff| handoff.target.as_str()),
                         Some(wave),
                         Some(wave),
-                    )
-                    .await?;
+                    ) {
+                        store.effects.events.push(event);
+                    }
                     successful_executions.push((key, execution));
                 }
                 Err(error) => {
                     let reason = error.to_string();
-                    if let Some(tracking) = &tracking {
+                    if tracking.is_some() {
                         let result = failed_task_result(reason.clone());
-                        fail_job(tracking.pool, tracked_jobs[&key], &result).await?;
-                        finished_jobs.insert(key.clone());
+                        store
+                            .effects
+                            .failed_children
+                            .push((state.tracked_jobs[&key], result));
+                        state.finished_jobs.insert(key.clone());
                     }
-                    record_plugin_task_event(
+                    if let Some(event) = plugin_task_event(
                         tracking.as_ref(),
                         manifest,
                         flow,
                         &key,
-                        tracking.as_ref().map(|_| tracked_jobs[&key]),
+                        tracking.as_ref().map(|_| state.tracked_jobs[&key]),
                         "task_failed",
                         "milestone",
                         Some("failed"),
@@ -1582,22 +789,49 @@ async fn run_work_item_lifecycle(
                         None,
                         Some(wave),
                         Some(wave),
-                    )
-                    .await?;
-                    execution_errors.push((key, attempt * 100 + offset as u32, reason));
+                    ) {
+                        store.effects.events.push(event);
+                    }
+                    execution_errors.push((key, state.attempt * 100 + offset as u32, reason));
                 }
             }
         }
-        if successful_executions
-            .iter()
-            .any(|(_, execution)| execution.result.outcome == Outcome::Implemented)
-            && let Some(publication) = tracking
-                .as_ref()
-                .and_then(|tracking| tracking.publication.as_ref())
+        for (key, execution) in &successful_executions {
+            state
+                .accumulated_tests
+                .extend(execution.result.tests.clone());
+            state.aggregate_risk = max_risk(state.aggregate_risk, execution.result.risk);
+            state.aggregate_confidence =
+                min_confidence(state.aggregate_confidence, execution.result.confidence);
+            state.previous.push(task_summary(
+                &key.task,
+                key.work_item.as_deref(),
+                state.attempt,
+                execution,
+            ));
+            state.last_result = execution.result.clone();
+        }
+        // Record successful siblings before processing feedback from this
+        // parallel wave. A pause in one task must not discard independent work
+        // that completed at the same time.
+        for (key, execution) in &successful_executions {
+            if execution.result.outcome == Outcome::Implemented
+                && flow.tasks[&key.task].approval != PluginApprovalMode::Required
+            {
+                state.graph.mark_completed(key)?;
+            }
+        }
+        if successful_executions.iter().any(|(key, execution)| {
+            retains_output(&flow.tasks[&key.task], execution.result.outcome)
+        }) && let Some(publication) = tracking
+            .as_ref()
+            .and_then(|tracking| tracking.publication.as_ref())
         {
             let checkpoint_keys = successful_executions
                 .iter()
-                .filter(|(_, execution)| execution.result.outcome == Outcome::Implemented)
+                .filter(|(key, execution)| {
+                    retains_output(&flow.tasks[&key.task], execution.result.outcome)
+                })
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
             let commit_title = checkpoint_commit_title(
@@ -1613,8 +847,31 @@ async fn run_work_item_lifecycle(
                     publication.issue_number
                 )
             });
-            publish_checkpoint(publication, repo_path, &commit_title).await?;
+            let mut retained = Vec::new();
+            for (key, _) in &successful_executions {
+                let item = state
+                    .work_items
+                    .iter()
+                    .find(|item| Some(&item.id) == key.work_item.as_ref());
+                retained.extend(expand_artifacts(
+                    &flow.tasks[&key.task].preserve_on_success,
+                    parameters,
+                    item,
+                )?);
+            }
+            publish_checkpoint(publication, repo_path, &commit_title, &retained).await?;
         }
+        // Task execution has copied retained output into the coordinator tree.
+        // Commit it before recording completed tasks and immutable provenance;
+        // otherwise capture rejects legitimate output as an uncommitted change.
+        store
+            .save(
+                &state.snapshot(&state.last_result, Vec::new(), true),
+                flow,
+                false,
+                false,
+            )
+            .await?;
         if let Some((_, architect)) = successful_executions.iter().find(|(key, execution)| {
             key.task == flow.start && execution.result.outcome == Outcome::Implemented
         }) {
@@ -1635,141 +892,18 @@ async fn run_work_item_lifecycle(
                 )
                 .into());
             }
-            if flow.project_github_issues
-                && let Some(tracking) = &tracking
-                && let Some(github) = tracking.github
-                && let (Some(owner), Some(repo), Some(parent_issue_number)) = github_coordinates
-                && let Some(workflow_item_id) = tracking.coordinator.workflow_item_id
-            {
-                let publications = list_agent_publications_for_run(
-                    tracking.pool,
-                    tracking.coordinator.id,
-                    Some(tracking.coordinator.id),
-                )
-                .await?;
-                let proposed = publications
-                    .iter()
-                    .filter(|publication| {
-                        publication.kind == "checkpoint" && publication.status == "published"
-                    })
-                    .max_by_key(|publication| publication.id)
-                    .ok_or("architect repair has no published checkpoint")?;
-                crate::cancellation::side_effect(tracking.pool, tracking.coordinator.id, async {
-                    let records =
-                        list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id)
-                            .await?;
-                    let active_ids = revised_work_items
-                        .iter()
-                        .map(|item| item.id.as_str())
-                        .collect::<BTreeSet<_>>();
-                    for removed in records.iter().filter(|record| {
-                        !record.accepted && !active_ids.contains(record.work_item.as_str())
-                    }) {
-                        if let Some(issue_number) = removed.issue_number {
-                            github.close_issue(owner, repo, issue_number).await?;
-                        }
-                        projected_issues.remove(&removed.work_item);
-                    }
-                    let desired = revised_work_items
-                        .iter()
-                        .map(|item| {
-                            let accepted_commit = records
-                                .iter()
-                                .find(|record| record.work_item == item.id)
-                                .and_then(|record| record.accepted_publication_id)
-                                .and_then(|id| {
-                                    publications.iter().find(|publication| publication.id == id)
-                                })
-                                .map(|publication| publication.commit_sha.clone());
-                            GitHubWorkItem {
-                                id: item.id.clone(),
-                                spec: item.spec.clone(),
-                                body: fs::read_to_string(repo_path.join(&item.spec))
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(50_000)
-                                    .collect(),
-                                depends_on: item.depends_on.clone(),
-                                proposed_commit: Some(proposed.commit_sha.clone()),
-                                proposed_commit_url: proposed.commit_url.clone(),
-                                proposed_compare_url: proposed.compare_url.clone(),
-                                accepted_commit,
-                                accepted: false,
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    for item in &desired {
-                        upsert_projected_work_item(
-                            tracking.pool,
-                            &ProjectedWorkItemInput {
-                                workflow_item_id,
-                                coordinator_job_id: tracking.coordinator.id,
-                                work_item: item.id.clone(),
-                                spec_path: item.spec.clone(),
-                                body_digest: format!("{:x}", Sha256::digest(item.body.as_bytes())),
-                                managed_dependencies: json!(item.depends_on),
-                                proposed_publication_id: Some(proposed.id),
-                            },
-                        )
-                        .await?;
-                        if let Some(issue_number) = projected_issues.get(&item.id) {
-                            github
-                                .update_projected_work_item(
-                                    owner,
-                                    repo,
-                                    parent_issue_number,
-                                    *issue_number,
-                                    item,
-                                )
-                                .await?;
-                            mark_projected_work_item_applied(
-                                tracking.pool,
-                                tracking.coordinator.id,
-                                &item.id,
-                                None,
-                                *issue_number,
-                                false,
-                            )
-                            .await?;
-                        }
-                    }
-                    let new_items = desired
-                        .iter()
-                        .filter(|item| !projected_issues.contains_key(&item.id))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let issues = github
-                        .project_work_items(owner, repo, parent_issue_number, &new_items)
-                        .await?;
-                    for (work_item, issue) in &issues {
-                        record_github_managed_resource_for_workflow_item(
-                            tracking.pool,
-                            workflow_item_id,
-                            "issue",
-                            &issue.id.to_string(),
-                            &json!({"work_item": work_item, "issue_number": issue.number}),
-                        )
-                        .await?;
-                        mark_projected_work_item_applied(
-                            tracking.pool,
-                            tracking.coordinator.id,
-                            work_item,
-                            Some(&issue.id.to_string()),
-                            issue.number,
-                            false,
-                        )
-                        .await?;
-                    }
-                    projected_issues.extend(
-                        issues
-                            .into_iter()
-                            .map(|(work_item, issue)| (work_item, issue.number)),
-                    );
-                    Ok::<_, Box<dyn std::error::Error>>(())
-                })
-                .await?;
-            }
-            let completed = graph.completed_keys().cloned().collect::<Vec<_>>();
+            synchronize_work_items(
+                tracking.as_ref(),
+                flow,
+                github_coordinates,
+                repo_path,
+                &revised_work_items,
+                &mut state.projected_issues,
+                &[],
+                ProjectionPhase::Proposed,
+            )
+            .await?;
+            let completed = state.graph.completed_keys().cloned().collect::<Vec<_>>();
             let mut revised_graph = TaskGraph::for_work_items(flow, &revised_work_items);
             let valid = revised_graph.keys().cloned().collect::<BTreeSet<_>>();
             revised_graph.restore_completed(
@@ -1778,14 +912,14 @@ async fn run_work_item_lifecycle(
                     .filter(|key| valid.contains(key))
                     .collect::<Vec<_>>(),
             )?;
-            graph = revised_graph;
-            work_items = revised_work_items;
+            state.graph = revised_graph;
+            state.work_items = revised_work_items;
         }
         for (key, execution) in &successful_executions {
             let work_item = key
                 .work_item
                 .as_deref()
-                .and_then(|id| work_items.iter().find(|item| item.id == id));
+                .and_then(|id| state.work_items.iter().find(|item| item.id == id));
             if execution.result.outcome == Outcome::Implemented
                 && !declared_diagnostics_present(
                     &flow.tasks[&key.task],
@@ -1809,12 +943,12 @@ async fn run_work_item_lifecycle(
                 repo_path,
                 parameters,
                 &manifest.parameters,
-                tracking.as_ref().map(|_| tracked_jobs[key]),
+                tracking.as_ref().map(|_| state.tracked_jobs[key]),
                 Some(execution.result.outcome),
                 &execution.result.summary,
                 key.work_item
                     .as_deref()
-                    .and_then(|work_item| projected_issues.get(work_item).copied()),
+                    .and_then(|work_item| state.projected_issues.get(work_item).copied()),
             )
             .await;
         }
@@ -1822,7 +956,7 @@ async fn run_work_item_lifecycle(
             let work_item = key
                 .work_item
                 .as_deref()
-                .and_then(|id| work_items.iter().find(|item| item.id == id));
+                .and_then(|id| state.work_items.iter().find(|item| item.id == id));
             publish_task_attempt(
                 tracking.as_ref(),
                 selection,
@@ -1834,12 +968,12 @@ async fn run_work_item_lifecycle(
                 repo_path,
                 parameters,
                 &manifest.parameters,
-                tracking.as_ref().map(|_| tracked_jobs[key]),
+                tracking.as_ref().map(|_| state.tracked_jobs[key]),
                 None,
                 reason,
                 key.work_item
                     .as_deref()
-                    .and_then(|work_item| projected_issues.get(work_item).copied()),
+                    .and_then(|work_item| state.projected_issues.get(work_item).copied()),
             )
             .await;
         }
@@ -1847,8 +981,8 @@ async fn run_work_item_lifecycle(
             if let Some(tracking) = &tracking {
                 fail_unfinished_tracked_jobs(
                     tracking,
-                    &tracked_jobs,
-                    &mut finished_jobs,
+                    &state.tracked_jobs,
+                    &mut state.finished_jobs,
                     &format!("plugin lifecycle stopped after a parallel task failed: {error}"),
                 )
                 .await?;
@@ -1857,6 +991,7 @@ async fn run_work_item_lifecycle(
         }
 
         let mut feedback = Vec::new();
+        let mut pause_reasons = Vec::new();
         let mut required_approvals = successful_executions
             .iter()
             .filter(|(key, execution)| {
@@ -1868,29 +1003,7 @@ async fn run_work_item_lifecycle(
                 trigger: ApprovalTrigger::Required,
             })
             .collect::<Vec<_>>();
-        for (key, execution) in &successful_executions {
-            accumulated_tests.extend(execution.result.tests.clone());
-            aggregate_risk = max_risk(aggregate_risk, execution.result.risk);
-            aggregate_confidence =
-                min_confidence(aggregate_confidence, execution.result.confidence);
-            previous.push(task_summary(
-                &key.task,
-                key.work_item.as_deref(),
-                attempt,
-                &execution.result,
-            ));
-            last_result = execution.result.clone();
-        }
-        // Record successful siblings before processing feedback from this
-        // parallel wave. A pause in one task must not discard independent work
-        // that completed at the same time.
-        for (key, execution) in &successful_executions {
-            if execution.result.outcome == Outcome::Implemented
-                && flow.tasks[&key.task].approval != PluginApprovalMode::Required
-            {
-                graph.mark_completed(key)?;
-            }
-        }
+        let mut clarifications = Vec::new();
         for (key, execution) in successful_executions {
             match execution.result.outcome {
                 Outcome::Implemented => {}
@@ -1903,8 +1016,8 @@ async fn run_work_item_lifecycle(
                         if let Some(tracking) = &tracking {
                             fail_unfinished_tracked_jobs(
                                 tracking,
-                                &tracked_jobs,
-                                &mut finished_jobs,
+                                &state.tracked_jobs,
+                                &mut state.finished_jobs,
                                 &reason,
                             )
                             .await?;
@@ -1920,8 +1033,8 @@ async fn run_work_item_lifecycle(
                         if let Some(tracking) = &tracking {
                             fail_unfinished_tracked_jobs(
                                 tracking,
-                                &tracked_jobs,
-                                &mut finished_jobs,
+                                &state.tracked_jobs,
+                                &mut state.finished_jobs,
                                 &reason,
                             )
                             .await?;
@@ -1933,12 +1046,12 @@ async fn run_work_item_lifecycle(
                         .get(&handoff.target)
                         .map(String::as_str)
                         .unwrap_or("An agent requested changes from another task.");
-                    record_plugin_task_event(
+                    if let Some(event) = plugin_task_event(
                         tracking.as_ref(),
                         manifest,
                         flow,
                         &key,
-                        tracking.as_ref().map(|_| tracked_jobs[&key]),
+                        tracking.as_ref().map(|_| state.tracked_jobs[&key]),
                         "handoff_requested",
                         "milestone",
                         None,
@@ -1948,218 +1061,68 @@ async fn run_work_item_lifecycle(
                         Some(&handoff.target),
                         Some(wave),
                         Some(wave),
-                    )
-                    .await?;
+                    ) {
+                        store.effects.events.push(event);
+                    }
                     let edge = (
                         key.work_item.clone(),
                         key.task.clone(),
                         handoff.target.clone(),
                     );
-                    let count = handoffs.entry(edge.clone()).or_default();
+                    let count = state.handoffs.entry(edge.clone()).or_default();
                     *count += 1;
                     if *count > max_handoffs {
                         let resume_target = normalize_handoff_target(flow, &key, &handoff.target)?;
-                        graph.restart_from(&resume_target)?;
-                        if let Some(tracking) = &tracking {
-                            let pending_keys = graph
-                                .keys()
-                                .filter(|key| !graph.is_completed(key))
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            for pending_key in pending_keys {
-                                if !required_approvals
-                                    .iter()
-                                    .any(|approval| approval.key == pending_key)
-                                {
-                                    ensure_waiting_tracked_job(
-                                        tracking,
-                                        &mut tracked_jobs,
-                                        &mut finished_jobs,
-                                        manifest,
-                                        &selection.flow,
-                                        flow,
-                                        &pending_key,
-                                        &work_items,
-                                        issue_input,
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
+                        state.graph.restart_from(&resume_target)?;
                         // A human decision authorizes a fresh bounded feedback
                         // cycle on the edge that caused the pause.
-                        handoffs.insert(edge, 0);
-                        let lead = format!(
-                            "handoff from `{}` to `{}` exceeded policy limit {max_handoffs}: {}\n\nPreserved checkpoint:\n- {} completed task(s) remain valid.\n- Existing block issues and workspace changes will be reused.",
-                            key.task,
-                            handoff.target,
-                            handoff.reason,
-                            graph.completed_keys().count()
-                        );
-                        required_approvals.push(PendingApproval {
-                            key: resume_target.clone(),
-                            trigger: ApprovalTrigger::AgentRequested,
-                        });
-                        let result = pending_approval_result(
-                            &required_approvals,
-                            &projected_issues,
-                            flow,
-                            &lead,
-                        );
-                        persist_pending_approvals(
-                            tracking.as_ref(),
-                            &required_approvals,
-                            &projected_issues,
-                            flow,
-                            &result,
-                        )
-                        .await?;
-                        write_lifecycle_checkpoint(
-                            &checkpoint_path,
-                            &LifecycleCheckpoint {
-                                version: CHECKPOINT_VERSION,
-                                attempt,
-                                accumulated_tests: accumulated_tests.clone(),
-                                previous: previous.clone(),
-                                aggregate_risk,
-                                aggregate_confidence,
-                                last_result: result.clone(),
-                                completed_keys: graph.completed_keys().cloned().collect(),
-                                tracked_jobs: tracked_jobs
-                                    .iter()
-                                    .map(|(key, job_id)| TrackedJobCheckpoint {
-                                        key: key.clone(),
-                                        job_id: *job_id,
-                                    })
-                                    .collect(),
-                                handoffs: handoffs
-                                    .iter()
-                                    .map(|((work_item, from, to), count)| HandoffCheckpoint {
-                                        work_item: work_item.clone(),
-                                        from: from.clone(),
-                                        to: to.clone(),
-                                        count: *count,
-                                    })
-                                    .collect(),
-                                projected_issues: projected_issues.clone(),
-                                closed_projected_issues: closed_projected_issues.clone(),
-                                resume_target: resume_target.clone(),
-                                pending_approvals: required_approvals,
-                                start_approved: true,
-                                revision_targets: Vec::new(),
-                                active_work_items: work_items
-                                    .iter()
-                                    .map(|item| item.id.clone())
-                                    .collect(),
-                            },
-                        )?;
-                        return Ok(finish_result(result, accumulated_tests, &previous));
+                        state.handoffs.insert(edge, 0);
+                        pause_reasons.push(format!(
+                            "handoff from `{}` to `{}` exceeded policy limit {max_handoffs}: {}",
+                            key.task, handoff.target, handoff.reason
+                        ));
+                        if !required_approvals
+                            .iter()
+                            .any(|approval| approval.key == resume_target)
+                        {
+                            required_approvals.push(PendingApproval {
+                                key: resume_target,
+                                trigger: ApprovalTrigger::AgentRequested,
+                            });
+                        }
+                        continue;
                     }
                     feedback.push(normalize_handoff_target(flow, &key, &handoff.target)?);
                 }
+                Outcome::NeedsInfo => {
+                    state.graph.restart_from(&key)?;
+                    clarifications.push((key, execution.result.questions));
+                }
                 Outcome::NeedsHuman => {
                     let resume_target = key.clone();
-                    graph.restart_from(&resume_target)?;
-                    if let Some(tracking) = &tracking {
-                        let pending_keys = graph
-                            .keys()
-                            .filter(|key| !graph.is_completed(key))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        for pending_key in pending_keys {
-                            if !required_approvals
-                                .iter()
-                                .any(|approval| approval.key == pending_key)
-                            {
-                                ensure_waiting_tracked_job(
-                                    tracking,
-                                    &mut tracked_jobs,
-                                    &mut finished_jobs,
-                                    manifest,
-                                    &selection.flow,
-                                    flow,
-                                    &pending_key,
-                                    &work_items,
-                                    issue_input,
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                    let original_reason = execution
+                    state.graph.restart_from(&resume_target)?;
+                    let reason = execution
                         .result
                         .human_review_reason
                         .as_deref()
                         .unwrap_or("task requested human judgment");
-                    let lead = format!(
-                        "{original_reason}\n\nPreserved checkpoint:\n- {} completed task(s) remain valid.\n- Existing block issues and workspace changes will be reused.",
-                        graph.completed_keys().count()
-                    );
-                    required_approvals.push(PendingApproval {
-                        key: resume_target.clone(),
-                        trigger: ApprovalTrigger::AgentRequested,
-                    });
-                    let result = pending_approval_result(
-                        &required_approvals,
-                        &projected_issues,
-                        flow,
-                        &lead,
-                    );
-                    persist_pending_approvals(
-                        tracking.as_ref(),
-                        &required_approvals,
-                        &projected_issues,
-                        flow,
-                        &result,
-                    )
-                    .await?;
-                    write_lifecycle_checkpoint(
-                        &checkpoint_path,
-                        &LifecycleCheckpoint {
-                            version: CHECKPOINT_VERSION,
-                            attempt,
-                            accumulated_tests: accumulated_tests.clone(),
-                            previous: previous.clone(),
-                            aggregate_risk,
-                            aggregate_confidence,
-                            last_result: result.clone(),
-                            completed_keys: graph.completed_keys().cloned().collect(),
-                            tracked_jobs: tracked_jobs
-                                .iter()
-                                .map(|(key, job_id)| TrackedJobCheckpoint {
-                                    key: key.clone(),
-                                    job_id: *job_id,
-                                })
-                                .collect(),
-                            handoffs: handoffs
-                                .iter()
-                                .map(|((work_item, from, to), count)| HandoffCheckpoint {
-                                    work_item: work_item.clone(),
-                                    from: from.clone(),
-                                    to: to.clone(),
-                                    count: *count,
-                                })
-                                .collect(),
-                            projected_issues: projected_issues.clone(),
-                            closed_projected_issues: closed_projected_issues.clone(),
-                            resume_target: resume_target.clone(),
-                            pending_approvals: required_approvals,
-                            start_approved: true,
-                            revision_targets: Vec::new(),
-                            active_work_items: work_items
-                                .iter()
-                                .map(|item| item.id.clone())
-                                .collect(),
-                        },
-                    )?;
-                    return Ok(finish_result(result, accumulated_tests, &previous));
+                    pause_reasons.push(format!("{}: {reason}", key.target()));
+                    if !required_approvals
+                        .iter()
+                        .any(|approval| approval.key == resume_target)
+                    {
+                        required_approvals.push(PendingApproval {
+                            key: resume_target,
+                            trigger: ApprovalTrigger::AgentRequested,
+                        });
+                    }
                 }
                 _ => {
                     if let Some(tracking) = &tracking {
                         fail_unfinished_tracked_jobs(
                             tracking,
-                            &tracked_jobs,
-                            &mut finished_jobs,
+                            &state.tracked_jobs,
+                            &mut state.finished_jobs,
                             &format!(
                                 "plugin lifecycle stopped after task `{}` returned {:?}",
                                 key.task, execution.result.outcome
@@ -2169,100 +1132,152 @@ async fn run_work_item_lifecycle(
                     }
                     return Ok(finish_result(
                         execution.result,
-                        accumulated_tests,
-                        &previous,
+                        state.accumulated_tests,
+                        &state.previous,
                     ));
                 }
             }
         }
         for target in feedback {
-            let invalidated = graph.restart_from(&target)?;
+            let invalidated = state.graph.restart_from(&target)?;
             let invalidated_names = invalidated
                 .iter()
-                .map(approval_target)
+                .map(TaskKey::target)
                 .collect::<Vec<_>>()
                 .join(", ");
-            record_flow_event(
+            stage_flow_event(
                 tracking.as_ref(),
+                &mut store.effects,
                 "repair_wave_created",
                 "milestone",
                 &format!("Repair work was released for {invalidated_names}."),
                 Some("A task handoff invalidated its target and dependent results."),
                 Some(wave + 1),
-                &format!("{}:{}", wave + 1, approval_target(&target)),
-            )
-            .await?;
-            required_approvals.retain(|approval| !invalidated.contains(&approval.key));
+                &format!("{}:{}", wave + 1, target.target()),
+            );
+            required_approvals.retain(|approval| {
+                matches!(approval.trigger, ApprovalTrigger::AgentRequested)
+                    || !invalidated.contains(&approval.key)
+            });
             if let Some(tracking) = &tracking {
                 for invalidated_key in invalidated {
                     ensure_waiting_tracked_job(
                         tracking,
-                        &mut tracked_jobs,
-                        &mut finished_jobs,
+                        &mut store.effects,
+                        &mut state.tracked_jobs,
+                        &mut state.finished_jobs,
                         manifest,
                         &selection.flow,
                         flow,
                         &invalidated_key,
-                        &work_items,
+                        &state.work_items,
                         issue_input,
                     )
                     .await?;
                 }
             }
         }
+        let questions = clarifications
+            .iter()
+            .flat_map(|(key, questions)| {
+                questions
+                    .iter()
+                    .map(|question| format!("{}: {question}", key.target()))
+            })
+            .collect::<Vec<_>>();
         if !required_approvals.is_empty() {
-            let result = pending_approval_result(
-                &required_approvals,
-                &projected_issues,
+            // A clarification reply cannot bypass another task's approval.
+            // Mixed waves keep the stricter gate and expose each question.
+            for (key, _) in &clarifications {
+                if !required_approvals
+                    .iter()
+                    .any(|approval| &approval.key == key)
+                {
+                    required_approvals.push(PendingApproval {
+                        key: key.clone(),
+                        trigger: ApprovalTrigger::AgentRequested,
+                    });
+                }
+            }
+            pause_reasons.extend(questions.clone());
+        }
+        if !required_approvals.is_empty() || !clarifications.is_empty() {
+            // Collect every blocked sibling before pausing. Returning on the
+            // first needs_human result loses other targets and reruns them when
+            // an unrelated target is approved.
+            if let Some(tracking) = &tracking {
+                let waiting = state
+                    .graph
+                    .keys()
+                    .filter(|key| {
+                        !state.graph.is_completed(key)
+                            && !required_approvals.iter().any(|approval| {
+                                &approval.key == *key
+                                    && matches!(approval.trigger, ApprovalTrigger::Required)
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in waiting {
+                    ensure_waiting_tracked_job(
+                        tracking,
+                        &mut store.effects,
+                        &mut state.tracked_jobs,
+                        &mut state.finished_jobs,
+                        manifest,
+                        &selection.flow,
+                        flow,
+                        &key,
+                        &state.work_items,
+                        issue_input,
+                    )
+                    .await?;
+                }
+            }
+            let lead = if pause_reasons.is_empty() {
+                "The configured tasks completed successfully and require approval before their dependents can run.".to_string()
+            } else {
+                format!(
+                    "{}\n\nPreserved checkpoint:\n- {} completed task(s) remain valid.\n- Existing block issues and workspace changes will be reused.",
+                    pause_reasons.join("\n\n"),
+                    state.graph.completed_keys().count()
+                )
+            };
+            let mut result = if required_approvals.is_empty() {
+                RunResult {
+                    outcome: Outcome::NeedsInfo,
+                    summary: "Awaiting answers before continuing the retained workflow.".into(),
+                    confidence: state.aggregate_confidence,
+                    risk: state.aggregate_risk,
+                    questions: Vec::new(),
+                    tests: Vec::new(),
+                    changed_files: Vec::new(),
+                    human_review_reason: None,
+                    blocked_reason: None,
+                }
+            } else {
+                pending_approval_result(&required_approvals, &state.projected_issues, flow, &lead)
+            };
+            result.questions = questions;
+            let mut saved = state.snapshot(&result, required_approvals, true);
+            if result.outcome == Outcome::NeedsInfo {
+                saved.revision_targets = clarifications.into_iter().map(|(key, _)| key).collect();
+            }
+            store.save(&saved, flow, true, false).await?;
+            return Ok(finish_result(
+                result,
+                state.accumulated_tests,
+                &state.previous,
+            ));
+        }
+        store
+            .save(
+                &state.snapshot(&state.last_result, Vec::new(), true),
                 flow,
-                "The configured tasks completed successfully and require approval before their dependents can run.",
-            );
-            persist_pending_approvals(
-                tracking.as_ref(),
-                &required_approvals,
-                &projected_issues,
-                flow,
-                &result,
+                false,
+                false,
             )
             .await?;
-            write_lifecycle_checkpoint(
-                &checkpoint_path,
-                &LifecycleCheckpoint {
-                    version: CHECKPOINT_VERSION,
-                    attempt,
-                    accumulated_tests: accumulated_tests.clone(),
-                    previous: previous.clone(),
-                    aggregate_risk,
-                    aggregate_confidence,
-                    last_result: result.clone(),
-                    completed_keys: graph.completed_keys().cloned().collect(),
-                    tracked_jobs: tracked_jobs
-                        .iter()
-                        .map(|(key, job_id)| TrackedJobCheckpoint {
-                            key: key.clone(),
-                            job_id: *job_id,
-                        })
-                        .collect(),
-                    handoffs: handoffs
-                        .iter()
-                        .map(|((work_item, from, to), count)| HandoffCheckpoint {
-                            work_item: work_item.clone(),
-                            from: from.clone(),
-                            to: to.clone(),
-                            count: *count,
-                        })
-                        .collect(),
-                    projected_issues: projected_issues.clone(),
-                    closed_projected_issues: closed_projected_issues.clone(),
-                    resume_target: required_approvals[0].key.clone(),
-                    pending_approvals: required_approvals,
-                    start_approved: true,
-                    revision_targets: Vec::new(),
-                    active_work_items: work_items.iter().map(|item| item.id.clone()).collect(),
-                },
-            )?;
-            return Ok(finish_result(result, accumulated_tests, &previous));
-        }
         if let Some(github) = tracking.as_ref().and_then(|tracking| tracking.github)
             && let (Some(owner), Some(repo), _) = github_coordinates
         {
@@ -2273,10 +1288,10 @@ async fn run_work_item_lifecycle(
                 tracking_ref.pool,
                 tracking_ref.coordinator.id,
                 async {
-                    for item in &work_items {
-                        if graph.work_item_is_complete(&item.id)
-                            && closed_projected_issues.insert(item.id.clone())
-                            && let Some(issue_number) = projected_issues.get(&item.id)
+                    for item in &state.work_items {
+                        if state.graph.work_item_is_complete(&item.id)
+                            && state.closed_projected_issues.insert(item.id.clone())
+                            && let Some(issue_number) = state.projected_issues.get(&item.id)
                             && let Err(error) = github.close_issue(owner, repo, *issue_number).await
                         {
                             tracing::warn!(
@@ -2293,322 +1308,27 @@ async fn run_work_item_lifecycle(
         }
     }
 
-    last_result.outcome = Outcome::Implemented;
-    last_result.risk = aggregate_risk;
-    last_result.confidence = aggregate_confidence;
-    last_result.summary = format!(
+    state.last_result.outcome = Outcome::Implemented;
+    state.last_result.risk = state.aggregate_risk;
+    state.last_result.confidence = state.aggregate_confidence;
+    state.last_result.summary = format!(
         "Completed {} block work item(s) across {} task execution(s).",
-        work_items.len(),
-        previous.len()
+        state.work_items.len(),
+        state.previous.len()
     );
-    if checkpoint_path.exists() {
-        fs::remove_file(&checkpoint_path)?;
-    }
-    Ok(finish_result(last_result, accumulated_tests, &previous))
-}
-
-fn declared_diagnostics_present(
-    task: &PluginTask,
-    workspace_path: &Path,
-    task_name: &str,
-    work_item: Option<&PluginWorkItem>,
-    attempt: u32,
-    parameters: &BTreeMap<String, Value>,
-) -> bool {
-    let Ok(diagnostics) = expand_artifacts(&task.diagnostics, parameters, work_item) else {
-        return false;
-    };
-    let repo = task_attempt_root(
-        workspace_path,
-        task_name,
-        work_item.map(|item| item.id.as_str()),
-        attempt,
-    )
-    .join("repo");
-    diagnostics_present_at(&repo, &diagnostics)
-}
-
-fn diagnostics_present_at(repo: &Path, diagnostics: &[PluginArtifact]) -> bool {
-    diagnostics.iter().any(|diagnostic| {
-        let path = repo.join(&diagnostic.path);
-        match diagnostic.kind {
-            PluginArtifactType::File => path.metadata().is_ok_and(|metadata| metadata.len() > 0),
-            PluginArtifactType::Directory => path
-                .read_dir()
-                .is_ok_and(|mut entries| entries.next().is_some()),
-        }
-    })
-}
-
-fn write_lifecycle_checkpoint(
-    path: &Path,
-    checkpoint: &LifecycleCheckpoint,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(checkpoint)?)?;
-    Ok(())
-}
-
-fn approval_target(key: &TaskKey) -> String {
-    key.work_item
-        .as_ref()
-        .map(|work_item| format!("{}/{work_item}", key.task))
-        .unwrap_or_else(|| key.task.clone())
-}
-
-fn normalize_handoff_target(
-    flow: &PluginFlow,
-    source: &TaskKey,
-    target: &str,
-) -> Result<TaskKey, Box<dyn std::error::Error>> {
-    let task = flow
-        .tasks
-        .get(target)
-        .ok_or_else(|| format!("handoff targets unknown task `{target}`"))?;
-    let work_item = match task.scope {
-        PluginTaskScope::Workflow => None,
-        PluginTaskScope::WorkItem => Some(
-            source
-                .work_item
-                .clone()
-                .ok_or_else(|| format!("workflow task `{}` cannot hand off to work-item task `{target}` without a work item", source.task))?,
-        ),
-    };
-    Ok(TaskKey {
-        work_item,
-        task: target.to_string(),
-    })
-}
-
-fn select_pending_approvals(
-    pending: &[PendingApproval],
-    decision: &HumanDecision,
-) -> Result<Vec<PendingApproval>, Box<dyn std::error::Error>> {
-    let target = match decision {
-        HumanDecision::Approve { target } | HumanDecision::Revise { target, .. } => {
-            target.as_deref()
-        }
-    };
-    if target == Some("all") {
-        if matches!(decision, HumanDecision::Revise { .. }) {
-            return Err("revision feedback must target one task".into());
-        }
-        return Ok(pending.to_vec());
-    }
-    if let Some(target) = target {
-        return pending
-            .iter()
-            .find(|approval| approval_target(&approval.key) == target)
-            .cloned()
-            .map(|approval| vec![approval])
-            .ok_or_else(|| format!("no pending approval matches `{target}`").into());
-    }
-    if pending.len() == 1 {
-        return Ok(pending.to_vec());
-    }
-    Err("an approval target is required when multiple tasks are pending".into())
-}
-
-async fn persist_pending_approvals(
-    tracking: Option<&LifecycleTracking<'_>>,
-    pending: &[PendingApproval],
-    projected_issues: &BTreeMap<String, i64>,
-    flow: &PluginFlow,
-    result: &RunResult,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(tracking) = tracking else {
-        return Ok(());
-    };
-    let Some(workflow_item_id) = tracking.coordinator.workflow_item_id else {
-        return Ok(());
-    };
-    let publication = list_agent_publications_for_run(
-        tracking.pool,
-        tracking.coordinator.id,
-        Some(tracking.coordinator.id),
-    )
-    .await?
-    .into_iter()
-    .filter(|publication| publication.kind == "checkpoint" && publication.status == "published")
-    .max_by_key(|publication| publication.id);
-    let projected = projected_issues
-        .iter()
-        .map(|(work_item, number)| json!({"work_item": work_item, "number": number}))
-        .collect::<Vec<_>>();
-    for approval in pending {
-        let task = &flow.tasks[&approval.key.task];
-        let downstream = flow
-            .tasks
-            .iter()
-            .filter(|(_, candidate)| candidate.dependencies.contains(&approval.key.task))
-            .map(|(name, _)| name)
-            .collect::<Vec<_>>();
-        upsert_approval_request(
-            tracking.pool,
-            &ApprovalRequestInput {
-                workflow_item_id,
-                coordinator_job_id: tracking.coordinator.id,
-                target_task: approval.key.task.clone(),
-                target_work_item: approval.key.work_item.clone(),
-                purpose: "accept_result".into(),
-                trigger: match approval.trigger {
-                    ApprovalTrigger::Required => "required",
-                    ApprovalTrigger::AgentRequested => "agent_requested",
-                }
-                .into(),
-                approval_subject: task.approval_subject.clone().unwrap_or_else(|| {
-                    approval.key.work_item.as_ref().map_or_else(
-                        || format!("{} result", approval.key.task),
-                        |work_item| format!("{} result for {work_item}", approval.key.task),
-                    )
-                }),
-                result_summary: result.summary.clone(),
-                changed_files: publication.as_ref().map_or_else(
-                    || json!([]),
-                    |publication| publication.changed_files.clone(),
-                ),
-                proposed_publication_id: publication.as_ref().map(|publication| publication.id),
-                projected_issues: json!(projected),
-                downstream_tasks: json!(downstream),
-            },
+    store
+        .save(
+            &state.snapshot(&state.last_result, Vec::new(), true),
+            flow,
+            false,
+            true,
         )
         .await?;
-    }
-    Ok(())
-}
-
-fn pending_approval_result(
-    pending: &[PendingApproval],
-    projected_issues: &BTreeMap<String, i64>,
-    flow: &PluginFlow,
-    lead: &str,
-) -> RunResult {
-    let start_task = &flow.start;
-    let subjects = pending
-        .iter()
-        .map(|approval| {
-            let target = approval_target(&approval.key);
-            let configured_subject = flow.tasks[&approval.key.task]
-                .approval_subject
-                .as_deref();
-            let artifact = match (&approval.key.work_item, configured_subject) {
-                (Some(work_item), Some(subject)) => {
-                    format!("the {subject} for work item `{work_item}`")
-                }
-                (None, Some(subject)) => format!("the {subject}"),
-                (Some(work_item), None) => format!(
-                    "the completed `{}` output for work item `{work_item}`",
-                    approval.key.task
-                ),
-                (None, None) if approval.key.task == *start_task && !projected_issues.is_empty() => {
-                    "the proposed lifecycle plan and block specifications in the projected work-item issues listed below".to_string()
-                }
-                (None, None) => format!("the completed workflow-level `{}` output", approval.key.task),
-            };
-            let consequence = match approval.trigger {
-                ApprovalTrigger::Required => {
-                    "Approving accepts this output as the current checkpoint and authorizes its dependent agent tasks to run. Revising keeps those dependents blocked and reruns this target with your feedback."
-                }
-                ApprovalTrigger::AgentRequested => {
-                    "Approving authorizes this target to rerun from the preserved checkpoint without additional feedback. Revising reruns it with the feedback you provide."
-                }
-            };
-            format!("- `{target}`: Review {artifact}. {consequence}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let include_all_issues = pending
-        .iter()
-        .any(|approval| approval.key.work_item.is_none() && approval.key.task == *start_task);
-    let pending_work_items = pending
-        .iter()
-        .filter_map(|approval| approval.key.work_item.as_deref())
-        .collect::<BTreeSet<_>>();
-    let relevant_issues = projected_issues
-        .iter()
-        .filter(|(item, _)| include_all_issues || pending_work_items.contains(item.as_str()))
-        .collect::<Vec<_>>();
-    let review_issues = if relevant_issues.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nReview the projected work-item issues:\n{}",
-            relevant_issues
-                .into_iter()
-                .map(|(item, number)| format!("- `{item}`: #{number}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    };
-    let single = (pending.len() == 1).then(|| approval_target(&pending[0].key));
-    let commands = match single {
-        Some(target) => format!(
-            "To accept the approval subject described above, comment:\n`{0} approve {target}`\n\nTo request changes, comment with the revision command and put specific feedback on the following lines:\n`{0} revise {target}`\n`<describe the required changes>`",
-            active_facade().issue_command()
-        ),
-        None => format!(
-            "Accept every approval subject with `{0} approve all`, accept one with `{0} approve <task>`, or request changes to one with `{0} revise <task>` followed by specific feedback on subsequent lines.",
-            active_facade().issue_command()
-        ),
-    };
-    RunResult {
-        outcome: Outcome::NeedsHuman,
-        summary: format!("Awaiting approval for {} task(s).", pending.len()),
-        confidence: Confidence::High,
-        risk: Risk::Unknown,
-        questions: Vec::new(),
-        tests: Vec::new(),
-        changed_files: Vec::new(),
-        human_review_reason: Some(format!(
-            "{lead}\n\nApproval subjects:\n{subjects}{review_issues}\n\nDecision instructions:\n{commands}"
-        )),
-        blocked_reason: None,
-    }
-}
-
-fn failed_task_result(reason: impl Into<String>) -> Value {
-    json!({
-        "outcome": "failed",
-        "summary": "Plugin task execution failed.",
-        "confidence": "low",
-        "risk": "unknown",
-        "questions": [],
-        "tests": [],
-        "changed_files": [],
-        "human_review_reason": null,
-        "blocked_reason": reason.into(),
-    })
-}
-
-fn unfinished_tracked_keys(
-    tracked_jobs: &BTreeMap<TaskKey, uuid::Uuid>,
-    finished_jobs: &BTreeSet<TaskKey>,
-) -> Vec<TaskKey> {
-    tracked_jobs
-        .keys()
-        .filter(|key| !finished_jobs.contains(*key))
-        .cloned()
-        .collect()
-}
-
-async fn fail_unfinished_tracked_jobs(
-    tracking: &LifecycleTracking<'_>,
-    tracked_jobs: &BTreeMap<TaskKey, uuid::Uuid>,
-    finished_jobs: &mut BTreeSet<TaskKey>,
-    reason: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for key in unfinished_tracked_keys(tracked_jobs, finished_jobs) {
-        fail_job(
-            tracking.pool,
-            tracked_jobs[&key],
-            &failed_task_result(reason),
-        )
-        .await?;
-        finished_jobs.insert(key);
-    }
-    Ok(())
+    Ok(finish_result(
+        state.last_result,
+        state.accumulated_tests,
+        &state.previous,
+    ))
 }
 
 fn max_risk(left: Risk, right: Risk) -> Risk {
@@ -2640,435 +1360,6 @@ fn min_confidence(left: Confidence, right: Confidence) -> Confidence {
     } else {
         right
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrackedJobDisposition {
-    KeepWaiting,
-    ReplaceTerminal,
-    RejectActive,
-}
-
-fn tracked_job_disposition(status: Option<&str>) -> TrackedJobDisposition {
-    match status {
-        Some("waiting") => TrackedJobDisposition::KeepWaiting,
-        Some("completed" | "failed") | None => TrackedJobDisposition::ReplaceTerminal,
-        Some(_) => TrackedJobDisposition::RejectActive,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn ensure_waiting_tracked_job(
-    tracking: &LifecycleTracking<'_>,
-    tracked_jobs: &mut BTreeMap<TaskKey, Uuid>,
-    finished_jobs: &mut BTreeSet<TaskKey>,
-    manifest: &PluginManifest,
-    flow_name: &str,
-    flow: &PluginFlow,
-    key: &TaskKey,
-    work_items: &[PluginWorkItem],
-    issue_input: &Value,
-) -> Result<Uuid, Box<dyn std::error::Error>> {
-    let existing = match tracked_jobs.get(key).copied() {
-        Some(job_id) => get_job(tracking.pool, job_id).await?,
-        None => None,
-    };
-    match tracked_job_disposition(existing.as_ref().map(|job| job.status.as_str())) {
-        TrackedJobDisposition::KeepWaiting => {
-            finished_jobs.remove(key);
-            Ok(existing.expect("waiting disposition requires a job").id)
-        }
-        TrackedJobDisposition::ReplaceTerminal => {
-            let job = create_tracked_job(
-                tracking,
-                manifest,
-                flow_name,
-                flow,
-                key,
-                work_items,
-                issue_input,
-            )
-            .await?;
-            tracked_jobs.insert(key.clone(), job.id);
-            finished_jobs.remove(key);
-            Ok(job.id)
-        }
-        TrackedJobDisposition::RejectActive => {
-            let job = existing.expect("active disposition requires a job");
-            Err(format!(
-                "plugin task `{}` already has active child job `{}` in `{}` state",
-                approval_target(key),
-                job.id,
-                job.status
-            )
-            .into())
-        }
-    }
-}
-
-async fn create_tracked_job(
-    tracking: &LifecycleTracking<'_>,
-    manifest: &PluginManifest,
-    flow_name: &str,
-    flow: &PluginFlow,
-    key: &TaskKey,
-    work_items: &[PluginWorkItem],
-    issue_input: &Value,
-) -> Result<JobRecord, Box<dyn std::error::Error>> {
-    let mut input = issue_input.clone();
-    let work_item = key
-        .work_item
-        .as_deref()
-        .and_then(|id| work_items.iter().find(|item| item.id == id));
-    if let Value::Object(map) = &mut input {
-        let task = &flow.tasks[&key.task];
-        let role = &manifest.roles[&task.role];
-        map.insert(
-            "plugin_execution".into(),
-            json!({
-                "coordinator_run_id": tracking.coordinator.id,
-                "plugin_id": manifest.id,
-                "flow": flow_name,
-                "task": key.task,
-                "task_display_name": task.display_name.as_deref().unwrap_or(&key.task),
-                "role_display_name": role.display_name.as_deref().unwrap_or(&task.role),
-                "work_item": work_item,
-                "dependencies": task.dependencies,
-            }),
-        );
-    }
-    let job = create_waiting_job(
-        tracking.pool,
-        tracking.coordinator.workflow_item_id,
-        &flow.tasks[&key.task].role,
-        &input,
-    )
-    .await?;
-    record_plugin_task_event(
-        Some(tracking),
-        manifest,
-        flow,
-        key,
-        Some(job.id),
-        "task_waiting",
-        "detail",
-        Some("waiting"),
-        None,
-        "Waiting for dependencies.",
-        None,
-        None,
-        None,
-        None,
-    )
-    .await?;
-    Ok(job)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_task(
-    selection: &PluginFlowSelection,
-    manifest: &PluginManifest,
-    task_name: &str,
-    task: &PluginTask,
-    work_item: Option<&PluginWorkItem>,
-    attempt: u32,
-    repo_path: &Path,
-    workspace_path: &Path,
-    issue_input: &Value,
-    previous: &[Value],
-    parameters: &BTreeMap<String, Value>,
-    plugin_root: &Path,
-) -> Result<PluginTaskResult, Box<dyn std::error::Error>> {
-    let role = &manifest.roles[&task.role];
-    let task_root = task_attempt_root(
-        workspace_path,
-        task_name,
-        work_item.map(|item| item.id.as_str()),
-        attempt,
-    );
-    let task_repo = task_root.join("repo");
-    fs::create_dir_all(&task_repo)?;
-    let declared_read = expand_templates(&task.read, parameters, work_item)?;
-    let declared_write = expand_templates(&task.write, parameters, work_item)?;
-    let (read_roots, write_roots) = resolve_access(
-        selection,
-        task_name,
-        &declared_read,
-        &declared_write,
-        parameters,
-        &manifest.parameters,
-    )?;
-    let diagnostics = expand_artifacts(&task.diagnostics, parameters, work_item)?;
-    if let Some(diagnostic) = diagnostics.iter().find(|diagnostic| {
-        !covered(&diagnostic.path, &read_roots) && !covered(&diagnostic.path, &write_roots)
-    }) {
-        return Err(format!(
-            "task `{task_name}` diagnostic `{}` is outside its declared roots",
-            diagnostic.path
-        )
-        .into());
-    }
-    for root in read_roots.iter().chain(&write_roots) {
-        copy_root(repo_path, &task_repo, root)?;
-    }
-    let donkeyspace = task_root.join(".donkeyspace");
-    fs::create_dir_all(&donkeyspace)?;
-    let result_path = donkeyspace.join("run-result.json");
-    let resources = materialize_resources(
-        manifest,
-        &task.role,
-        task,
-        plugin_root,
-        repo_path,
-        &task_root,
-        parameters,
-    )?;
-    let selected_mcp = role
-        .mcp_servers
-        .iter()
-        .filter_map(|name| manifest.mcp_servers.get(name).map(|server| (name, server)))
-        .collect::<BTreeMap<_, _>>();
-    fs::write(
-        donkeyspace.join("run-input.json"),
-        serde_json::to_vec_pretty(&json!({
-            "run_id": issue_input.pointer("/run_id"),
-            "role": task.role,
-            "plugin": {"id": manifest.id, "flow": selection.flow, "task": task_name, "attempt": attempt},
-            "work_item": work_item,
-            "issue": issue_input.pointer("/issue").unwrap_or(issue_input),
-            "repository": issue_input.pointer("/repository"),
-            "workspace": {"repo_path": "repo", "result_path": ".donkeyspace/run-result.json", "read": read_roots, "write": write_roots},
-            "parameters": parameters,
-            "resources": resources,
-            "previous_tasks": previous.iter().rev().take(64).rev().collect::<Vec<_>>(),
-            "mcp_servers": selected_mcp,
-        }))?,
-    )?;
-    let image = role
-        .image
-        .as_deref()
-        .unwrap_or(&manifest.runtime.default_image);
-    let output = run_container(
-        image,
-        &role.command,
-        &task_root,
-        &selection.environment,
-        &role.environment,
-    )
-    .await?;
-    write_agent_log(&donkeyspace.join("agent.stdout.log"), &output.stdout)?;
-    write_agent_log(&donkeyspace.join("agent.stderr.log"), &output.stderr)?;
-    if !output.status.success() {
-        return Err(format!(
-            "plugin task `{task_name}` exited {:?}: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let mut task_result: PluginTaskResult =
-        serde_json::from_str(&fs::read_to_string(result_path)?)?;
-    validate_resources_used(&task_result.resources_used, &resources)?;
-    validate_changed_files(&task_result.result.changed_files, &write_roots)?;
-    if is_publishable(task_result.result.outcome) {
-        verify_resources(&task_root, &resources)?;
-        let artifacts = expand_artifacts(&task.artifacts, parameters, work_item)?;
-        validate_artifacts(&task_repo, &artifacts, &write_roots)?;
-        let validator_results = run_validators(
-            &task.validators,
-            image,
-            &task_root,
-            &selection.environment,
-            &role.environment,
-        )
-        .await?;
-        apply_validator_results(&mut task_result.result, validator_results);
-    }
-    task_result.result.validate_for_orchestration()?;
-    if is_publishable(task_result.result.outcome) {
-        for root in &write_roots {
-            replace_root(&task_repo, repo_path, root)?;
-        }
-    }
-    Ok(task_result)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn publish_task_attempt(
-    tracking: Option<&LifecycleTracking<'_>>,
-    selection: &PluginFlowSelection,
-    task_name: &str,
-    task: &PluginTask,
-    work_item: Option<&PluginWorkItem>,
-    attempt: u32,
-    workspace_path: &Path,
-    aggregate_repo: &Path,
-    parameters: &BTreeMap<String, Value>,
-    parameter_definitions: &BTreeMap<String, PluginParameter>,
-    job_id: Option<Uuid>,
-    outcome: Option<Outcome>,
-    reason: &str,
-    related_issue_number: Option<i64>,
-) {
-    let Some(publication) = tracking.and_then(|tracking| tracking.publication.as_ref()) else {
-        return;
-    };
-    let result = async {
-        let declared_read = expand_templates(&task.read, parameters, work_item)?;
-        let declared_write = expand_templates(&task.write, parameters, work_item)?;
-        let (_, write_roots) = resolve_access(
-            selection,
-            task_name,
-            &declared_read,
-            &declared_write,
-            parameters,
-            parameter_definitions,
-        )?;
-        let diagnostics = expand_artifacts(&task.diagnostics, parameters, work_item)?;
-        let redactions = selection
-            .environment
-            .values()
-            .filter_map(|source| {
-                if Path::new(source).is_absolute() {
-                    fs::read_to_string(source).ok()
-                } else {
-                    env::var(source).ok()
-                }
-            })
-            .map(|value| value.trim_end().to_string())
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>();
-        let task_root = task_attempt_root(
-            workspace_path,
-            task_name,
-            work_item.map(|item| item.id.as_str()),
-            attempt,
-        );
-        publish_attempt(
-            publication,
-            aggregate_repo,
-            &AttemptPublication {
-                job_id,
-                task: task_name,
-                publication_tag: task.publication_tag.as_deref(),
-                work_item: work_item.map(|item| item.id.as_str()),
-                attempt,
-                outcome,
-                task_root: &task_root,
-                write_roots: &write_roots,
-                diagnostics: &diagnostics,
-                reason,
-                related_issue_number,
-                redactions: &redactions,
-            },
-        )
-        .await?;
-        Ok::<_, Box<dyn std::error::Error>>(())
-    }
-    .await;
-    if let Err(error) = result {
-        tracing::warn!(%error, task = task_name, ?outcome, "forensic attempt publication failed");
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn publish_serial_stage_attempt(
-    tracking: Option<&LifecycleTracking<'_>>,
-    selection: &PluginFlowSelection,
-    stage_name: &str,
-    publication_tag: Option<&str>,
-    attempt: u32,
-    stage_root: &Path,
-    aggregate_repo: &Path,
-    write_roots: &[String],
-    diagnostics: &[PluginArtifact],
-    outcome: Option<Outcome>,
-    reason: &str,
-) {
-    let Some(publication) = tracking.and_then(|tracking| tracking.publication.as_ref()) else {
-        return;
-    };
-    let redactions = configured_environment_redactions(selection);
-    if let Err(error) = publish_attempt(
-        publication,
-        aggregate_repo,
-        &AttemptPublication {
-            job_id: tracking.map(|tracking| tracking.coordinator.id),
-            task: stage_name,
-            publication_tag,
-            work_item: None,
-            attempt,
-            outcome,
-            task_root: stage_root,
-            write_roots,
-            diagnostics,
-            reason,
-            related_issue_number: None,
-            redactions: &redactions,
-        },
-    )
-    .await
-    {
-        tracing::warn!(%error, stage = stage_name, ?outcome, "plugin stage forensic publication failed");
-    }
-}
-
-fn configured_environment_redactions(selection: &PluginFlowSelection) -> Vec<String> {
-    selection
-        .environment
-        .values()
-        .filter_map(|source| {
-            if Path::new(source).is_absolute() {
-                fs::read_to_string(source).ok()
-            } else {
-                env::var(source).ok()
-            }
-        })
-        .map(|value| value.trim_end().to_string())
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
-fn task_attempt_root(
-    workspace_path: &Path,
-    task_name: &str,
-    work_item: Option<&str>,
-    attempt: u32,
-) -> PathBuf {
-    let item_suffix = work_item.map(|item| format!("-{item}")).unwrap_or_default();
-    workspace_path
-        .join("plugin-tasks")
-        .join(format!("{attempt:04}-{task_name}{item_suffix}"))
-}
-
-fn write_agent_log(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    const MAX_LOG_CHARS: usize = 1_000_000;
-    let mut value = String::from_utf8_lossy(bytes)
-        .chars()
-        .take(MAX_LOG_CHARS)
-        .collect::<String>();
-    if bytes.len() > value.len() {
-        value.push_str("\n[truncated]\n");
-    }
-    fs::write(path, value)?;
-    Ok(())
-}
-
-fn expand_templates(
-    values: &[String],
-    parameters: &BTreeMap<String, Value>,
-    work_item: Option<&PluginWorkItem>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    values
-        .iter()
-        .map(|value| {
-            let expanded = expand_template(value, parameters)?;
-            Ok(match work_item {
-                Some(item) => expanded.replace("{work_item}", &item.id),
-                None => expanded,
-            })
-        })
-        .collect()
 }
 
 fn validate_work_items(items: &[PluginWorkItem]) -> Result<(), Box<dyn std::error::Error>> {
@@ -3166,13 +1457,23 @@ fn select_lifecycle_work_items(
         .collect())
 }
 
-fn task_summary(task: &str, work_item: Option<&str>, attempt: u32, result: &RunResult) -> Value {
+fn task_summary(
+    task: &str,
+    work_item: Option<&str>,
+    attempt: u32,
+    execution: &PluginTaskResult,
+) -> Value {
+    let result = &execution.result;
     json!({
         "task": task,
         "work_item": work_item,
         "attempt": attempt,
         "outcome": result.outcome,
         "summary": result.summary.chars().take(2_000).collect::<String>(),
+        "questions": result.questions,
+        "human_review_reason": result.human_review_reason,
+        "blocked_reason": result.blocked_reason,
+        "handoff": execution.handoff,
     })
 }
 
@@ -3197,7 +1498,14 @@ fn flow_summary(previous: &[Value], final_summary: &str) -> String {
         .filter_map(|entry| {
             let stage = entry.get("stage").or_else(|| entry.get("task"))?.as_str()?;
             let summary = entry.get("summary")?.as_str()?;
-            Some(format!("{stage}: {summary}"))
+            Some(format!(
+                "{stage}{}: {summary}",
+                if entry.get("superseded").and_then(Value::as_bool) == Some(true) {
+                    " (superseded)"
+                } else {
+                    ""
+                }
+            ))
         })
         .collect::<Vec<_>>();
     if lines
@@ -3207,542 +1515,6 @@ fn flow_summary(previous: &[Value], final_summary: &str) -> String {
         lines.push(final_summary.to_string());
     }
     lines.join("\n")
-}
-
-fn resolve_parameters(
-    manifest: &PluginManifest,
-    selection: &PluginFlowSelection,
-) -> Result<BTreeMap<String, Value>, Box<dyn std::error::Error>> {
-    if let Some(name) = selection
-        .parameters
-        .keys()
-        .find(|name| !manifest.parameters.contains_key(*name))
-    {
-        return Err(format!("unknown plugin parameter `{name}`").into());
-    }
-    let mut resolved = BTreeMap::new();
-    for (name, definition) in &manifest.parameters {
-        let selected = selection.parameters.get(name);
-        if let Some(selected) = selected {
-            let valid = match definition {
-                PluginParameter::Path { .. }
-                | PluginParameter::Enum { .. }
-                | PluginParameter::String { .. } => selected.is_string(),
-                PluginParameter::Integer { .. } => selected.is_i64(),
-                PluginParameter::Boolean { .. } => selected.is_boolean(),
-            };
-            if !valid {
-                return Err(format!("invalid type for plugin parameter `{name}`").into());
-            }
-        }
-        let value = match definition {
-            PluginParameter::Path { default } => {
-                let value = selected
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| default.clone())
-                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?;
-                validate_runtime_path(&value)?;
-                Value::String(value)
-            }
-            PluginParameter::Enum { values, default } => {
-                let value = selected
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| default.clone())
-                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?;
-                if !values.contains(&value) {
-                    return Err(format!("invalid value for enum parameter `{name}`").into());
-                }
-                Value::String(value)
-            }
-            PluginParameter::String { default } => Value::String(
-                selected
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| default.clone())
-                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?,
-            ),
-            PluginParameter::Integer { default } => Value::Number(
-                selected
-                    .and_then(Value::as_i64)
-                    .or(*default)
-                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?
-                    .into(),
-            ),
-            PluginParameter::Boolean { default } => Value::Bool(
-                selected
-                    .and_then(Value::as_bool)
-                    .or(*default)
-                    .ok_or_else(|| format!("missing plugin parameter `{name}`"))?,
-            ),
-        };
-        resolved.insert(name.clone(), value);
-    }
-    Ok(resolved)
-}
-
-fn expand_template(
-    template: &str,
-    parameters: &BTreeMap<String, Value>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut expanded = template.to_string();
-    for (name, value) in parameters {
-        if let Some(value) = value.as_str() {
-            expanded = expanded.replace(&format!("{{{name}}}"), value);
-        }
-    }
-    let remainder = expanded.replace("{work_item}", "item");
-    if remainder.contains('{') || remainder.contains('}') {
-        return Err(format!("unknown placeholder in filesystem field `{template}`").into());
-    }
-    validate_runtime_path(&remainder)?;
-    Ok(expanded)
-}
-
-fn validate_runtime_path(value: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new(value);
-    if value.trim().is_empty()
-        || value.contains(['{', '}'])
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(format!("unsafe plugin path `{value}`").into());
-    }
-    Ok(())
-}
-
-fn merged_resource_assignments(
-    role: &[PluginResourceAssignment],
-    task: &[PluginResourceAssignment],
-) -> BTreeMap<String, bool> {
-    let mut merged = BTreeMap::new();
-    for assignment in role.iter().chain(task) {
-        merged
-            .entry(assignment.id.clone())
-            .and_modify(|required| *required |= assignment.required)
-            .or_insert(assignment.required);
-    }
-    merged
-}
-
-#[allow(clippy::too_many_arguments)]
-fn materialize_resources(
-    manifest: &PluginManifest,
-    role_name: &str,
-    task: &PluginTask,
-    plugin_root: &Path,
-    repo_root: &Path,
-    attempt_root: &Path,
-    parameters: &BTreeMap<String, Value>,
-) -> Result<Vec<MaterializedResource>, Box<dyn std::error::Error>> {
-    let assignments =
-        merged_resource_assignments(&manifest.roles[role_name].resources, &task.resources);
-    let mut result = Vec::new();
-    for (id, required) in assignments {
-        let definition = &manifest.resources[&id];
-        let source_path = expand_template(&definition.path, parameters)?;
-        let source_root = match definition.source {
-            PluginResourceSource::Plugin => plugin_root,
-            PluginResourceSource::Repository => repo_root,
-        };
-        let source = source_root.join(&source_path);
-        let relative_root = format!(".donkeyspace/resources/{id}");
-        let target = attempt_root.join(&relative_root);
-        let metadata = match fs::symlink_metadata(&source) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let Some(metadata) = metadata else {
-            if required {
-                return Err(
-                    format!("required resource `{id}` is missing at `{source_path}`").into(),
-                );
-            }
-            result.push(MaterializedResource {
-                id,
-                source: definition.source,
-                source_path,
-                root: relative_root,
-                available: false,
-                inventory: Vec::new(),
-                digest: None,
-            });
-            continue;
-        };
-        if metadata.file_type().is_symlink() {
-            return Err(format!("resource `{id}` may not be a symlink").into());
-        }
-        fs::create_dir_all(&target)?;
-        if metadata.is_file() {
-            let basename = source
-                .file_name()
-                .ok_or_else(|| format!("resource `{id}` has no basename"))?;
-            copy_resource_entry(&source, &target.join(basename))?;
-        } else if metadata.is_dir() {
-            copy_resource_directory(&source, &target)?;
-        } else {
-            return Err(format!("resource `{id}` is not a regular file or directory").into());
-        }
-        let (inventory, digest) = digest_resource_tree(&target)?;
-        result.push(MaterializedResource {
-            id,
-            source: definition.source,
-            source_path,
-            root: relative_root,
-            available: true,
-            inventory,
-            digest: Some(digest),
-        });
-    }
-    Ok(result)
-}
-
-fn copy_resource_directory(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!("resource contains symlink `{}`", entry.path().display()).into());
-        }
-        let destination = target.join(entry.file_name());
-        if metadata.is_dir() {
-            fs::create_dir_all(&destination)?;
-            copy_resource_directory(&entry.path(), &destination)?;
-        } else if metadata.is_file() {
-            copy_resource_entry(&entry.path(), &destination)?;
-        } else {
-            return Err(format!(
-                "resource contains special file `{}`",
-                entry.path().display()
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-fn copy_resource_entry(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(source, target)?;
-    Ok(())
-}
-
-fn digest_resource_tree(root: &Path) -> Result<(Vec<String>, String), Box<dyn std::error::Error>> {
-    let root_metadata = fs::symlink_metadata(root)?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err("materialized resource root is not a regular directory".into());
-    }
-    fn visit(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-        let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if metadata.file_type().is_symlink() {
-                return Err("materialized resource contains a symlink".into());
-            }
-            if metadata.is_dir() {
-                visit(&entry.path(), files)?;
-            } else if metadata.is_file() {
-                files.push(entry.path());
-            } else {
-                return Err("materialized resource contains a special file".into());
-            }
-        }
-        Ok(())
-    }
-    let mut files = Vec::new();
-    visit(root, &mut files)?;
-    if files.len() > MAX_RESOURCE_FILES {
-        return Err(format!("resource exceeds {MAX_RESOURCE_FILES} files").into());
-    }
-    let mut inventory = Vec::with_capacity(files.len());
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    for file in files {
-        let relative = file
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let contents = fs::read(&file)?;
-        total = total.saturating_add(contents.len() as u64);
-        if total > MAX_RESOURCE_BYTES {
-            return Err(format!("resource exceeds {MAX_RESOURCE_BYTES} bytes").into());
-        }
-        hasher.update((relative.len() as u64).to_be_bytes());
-        hasher.update(relative.as_bytes());
-        hasher.update((contents.len() as u64).to_be_bytes());
-        hasher.update(&contents);
-        inventory.push(relative);
-    }
-    Ok((inventory, format!("sha256:{:x}", hasher.finalize())))
-}
-
-fn verify_resources(
-    attempt_root: &Path,
-    resources: &[MaterializedResource],
-) -> Result<(), Box<dyn std::error::Error>> {
-    for resource in resources.iter().filter(|resource| resource.available) {
-        let (inventory, digest) = digest_resource_tree(&attempt_root.join(&resource.root))?;
-        if inventory != resource.inventory || Some(digest) != resource.digest {
-            return Err(format!("resource `{}` was modified during execution", resource.id).into());
-        }
-    }
-    Ok(())
-}
-
-fn validate_resources_used(
-    used: &[String],
-    resources: &[MaterializedResource],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let supplied = resources
-        .iter()
-        .filter(|resource| resource.available)
-        .map(|resource| resource.id.as_str())
-        .collect::<BTreeSet<_>>();
-    if let Some(id) = used.iter().find(|id| !supplied.contains(id.as_str())) {
-        return Err(format!("plugin reported unsupplied resource `{id}`").into());
-    }
-    Ok(())
-}
-
-fn expand_artifacts(
-    artifacts: &[PluginArtifact],
-    parameters: &BTreeMap<String, Value>,
-    work_item: Option<&PluginWorkItem>,
-) -> Result<Vec<PluginArtifact>, Box<dyn std::error::Error>> {
-    artifacts
-        .iter()
-        .map(|artifact| {
-            let mut artifact = artifact.clone();
-            artifact.path = expand_template(&artifact.path, parameters)?;
-            if let Some(item) = work_item {
-                artifact.path = artifact.path.replace("{work_item}", &item.id);
-            }
-            Ok(artifact)
-        })
-        .collect()
-}
-
-fn validate_artifacts(
-    repo: &Path,
-    artifacts: &[PluginArtifact],
-    write_roots: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    for artifact in artifacts {
-        if !covered(&artifact.path, write_roots) {
-            return Err(format!("artifact `{}` is outside task write roots", artifact.path).into());
-        }
-        let path = repo.join(&artifact.path);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let Some(metadata) = metadata else {
-            if artifact.required {
-                return Err(format!("required artifact `{}` is missing", artifact.path).into());
-            }
-            continue;
-        };
-        if metadata.file_type().is_symlink()
-            || match artifact.kind {
-                PluginArtifactType::File => !metadata.is_file(),
-                PluginArtifactType::Directory => !metadata.is_dir(),
-            }
-        {
-            return Err(format!("artifact `{}` has the wrong type", artifact.path).into());
-        }
-    }
-    Ok(())
-}
-
-fn is_publishable(outcome: Outcome) -> bool {
-    outcome == Outcome::Implemented
-}
-
-fn apply_validator_results(result: &mut RunResult, validator_results: Vec<TestResult>) {
-    let validators_passed = validator_results
-        .iter()
-        .all(|result| result.status == TestStatus::Passed);
-    result.tests.extend(validator_results);
-    if !validators_passed {
-        result.outcome = Outcome::Failed;
-        result.blocked_reason = Some("plugin validator failed".into());
-    }
-}
-
-async fn run_validators(
-    validators: &[PluginValidator],
-    image: &str,
-    task_root: &Path,
-    configured: &BTreeMap<String, String>,
-    allowed: &[String],
-) -> Result<Vec<TestResult>, Box<dyn std::error::Error>> {
-    let mut results = Vec::new();
-    for validator in validators {
-        let output =
-            run_container(image, &validator.command, task_root, configured, allowed).await?;
-        results.push(TestResult {
-            name: validator.name.clone(),
-            command: validator.command.clone(),
-            status: if output.status.success() {
-                TestStatus::Passed
-            } else {
-                TestStatus::Failed
-            },
-            exit_code: output.status.code(),
-            summary: Some(if output.status.success() {
-                String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .chars()
-                    .take(2_000)
-                    .collect()
-            } else {
-                String::from_utf8_lossy(&output.stderr)
-                    .trim()
-                    .chars()
-                    .take(2_000)
-                    .collect()
-            }),
-        });
-    }
-    Ok(results)
-}
-
-fn resolve_access(
-    selection: &PluginFlowSelection,
-    stage: &str,
-    declared_read: &[String],
-    declared_write: &[String],
-    parameters: &BTreeMap<String, Value>,
-    parameter_definitions: &BTreeMap<String, PluginParameter>,
-) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
-    let Some(overrides) = selection.task_access_overrides.get(stage) else {
-        return Ok((declared_read.to_vec(), declared_write.to_vec()));
-    };
-    let read = overrides
-        .read
-        .clone()
-        .map(|values| expand_policy_roots(&values, parameters, parameter_definitions))
-        .transpose()?
-        .unwrap_or_else(|| declared_read.to_vec());
-    let write = overrides
-        .write
-        .clone()
-        .map(|values| expand_policy_roots(&values, parameters, parameter_definitions))
-        .transpose()?
-        .unwrap_or_else(|| declared_write.to_vec());
-    if !read.iter().all(|path| covered(path, declared_read))
-        || !write.iter().all(|path| covered(path, declared_write))
-    {
-        return Err(
-            format!("policy access override widens plugin task `{stage}` permissions").into(),
-        );
-    }
-    Ok((read, write))
-}
-
-fn expand_policy_roots(
-    values: &[String],
-    parameters: &BTreeMap<String, Value>,
-    definitions: &BTreeMap<String, PluginParameter>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    for value in values {
-        for segment in value.split('{').skip(1) {
-            let name = segment
-                .split_once('}')
-                .map(|(name, _)| name)
-                .ok_or_else(|| format!("unclosed placeholder in policy path `{value}`"))?;
-            if !matches!(
-                definitions.get(name),
-                Some(PluginParameter::Path { .. } | PluginParameter::Enum { .. })
-            ) {
-                return Err(format!(
-                    "parameter `{name}` cannot be used in a policy filesystem field"
-                )
-                .into());
-            }
-        }
-    }
-    expand_templates(values, parameters, None)
-}
-
-fn covered(path: &str, roots: &[String]) -> bool {
-    roots.iter().any(|root| {
-        path == root
-            || path
-                .strip_prefix(root)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
-}
-
-fn validate_changed_files(
-    files: &[String],
-    roots: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(path) = files
-        .iter()
-        .find(|path| validate_runtime_path(path).is_err() || !covered(path, roots))
-    {
-        return Err(format!("plugin reported change outside task write roots: `{path}`").into());
-    }
-    Ok(())
-}
-
-fn copy_root(
-    source_repo: &Path,
-    target_repo: &Path,
-    root: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let source = source_repo.join(root);
-    if !source.exists() {
-        return Ok(());
-    }
-    copy_entry(&source, &target_repo.join(root))
-}
-
-fn copy_entry(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if source.is_dir() {
-        fs::create_dir_all(target)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            copy_entry(&entry.path(), &target.join(entry.file_name()))?;
-        }
-    } else {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, target)?;
-    }
-    Ok(())
-}
-
-fn replace_root(
-    source_repo: &Path,
-    target_repo: &Path,
-    root: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let source = source_repo.join(root);
-    let target = target_repo.join(root);
-    if target.is_dir() {
-        fs::remove_dir_all(&target)?;
-    } else if target.exists() {
-        fs::remove_file(&target)?;
-    }
-    if source.exists() {
-        copy_entry(&source, &target)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3772,6 +1544,8 @@ roles:
 flows:
   blocks:
     start: rtl
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
       rtl: { role: rtl, display_name: RTL implementation, publication_tag: RTL }
       dv: { role: dv, display_name: Design verification, publication_tag: DV }
@@ -4014,6 +1788,8 @@ roles: { developer: { command: [run] } }
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks: { develop: { role: developer } }
 "#,
         );
@@ -4090,6 +1866,8 @@ roles:
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
       develop:
         role: developer
@@ -4163,6 +1941,8 @@ roles: { developer: { command: [run], resources: [{ id: library, required: true 
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks: { develop: { role: developer } }
 "#,
         );
@@ -4267,6 +2047,8 @@ roles: { developer: { command: [run], resources: [{ id: special, required: true 
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks: { develop: { role: developer } }
 "#,
         );
@@ -4409,7 +2191,7 @@ flows:
             },
         )
         .unwrap();
-        assert_eq!(approval_target(&selected[0].key), "rtl/storage");
+        assert_eq!(selected[0].key.target(), "rtl/storage");
         assert_eq!(
             select_pending_approvals(
                 &pending,

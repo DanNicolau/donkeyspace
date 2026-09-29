@@ -32,7 +32,7 @@ pub async fn register_container_execution(
         .bind(coordinator).execute(&mut *tx).await?;
     let job: Option<(Option<i64>, i64)> = sqlx::query_as(
         "SELECT j.workflow_item_id, j.generation FROM jobs j LEFT JOIN workflow_items w ON w.id=j.workflow_item_id
-         WHERE j.id=$1 AND j.lease_owner=$2 AND j.status='running' AND j.lease_expires_at>clock_timestamp()
+         WHERE j.id=$1 AND workflow_repository_tracked(w.id) AND j.lease_owner=$2 AND j.status='running' AND j.lease_expires_at>clock_timestamp()
          AND (w.id IS NULL OR (w.provider_state<>'closed' AND w.generation=j.generation)) FOR UPDATE OF j",
     )
     .bind(coordinator).bind(lease_owner).fetch_optional(&mut *tx).await?;

@@ -54,9 +54,9 @@ Donkeyspace does not merge pull requests.
 - `web`: React and TanStack Query dashboard served by Vite in the current
   Compose development stack.
 
-Docker Compose runs PostgreSQL, the API, the worker, and the dashboard. Agent
-commands run inside the worker container in a fresh filesystem workspace; the
-current implementation does not launch a separate container or VM per job.
+Docker Compose runs PostgreSQL, the API, the worker, and the dashboard. Built-in agent
+commands run in supervised worker processes. Plugin tasks run in separate
+containers with filtered workspaces and durable execution ownership.
 
 ## State and Audit Model
 
@@ -99,9 +99,9 @@ fallback.
 
 Policy can enable roles, require allow labels, define block labels, run local
 commands, and route high-risk, unknown-risk, or sensitive-path changes to human
-review. Required GitHub checks, automatic merge, automatic retries, cancellation,
-and maximum-concurrency enforcement are not implemented even though some fields
-are reserved in the policy schema.
+review. Issue closure cancels and fences work using workflow generations. Required
+GitHub checks, automatic merge, automatic retries and configurable maximum
+concurrency are not implemented; version 2 rejects their former no-op settings.
 
 GitHub App credentials are the default. The API and worker authenticate as one
 configured installation; Octocrab refreshes installation tokens for REST calls
@@ -115,7 +115,8 @@ deprecated compatibility mode. Codex authentication is delegated to Codex CLI.
 - No automatic merge or reviewer-to-developer feedback loop in the default
   lifecycle; plugins may define bounded task-level feedback.
 - No cancellation API, per-command timeout, or provider pause/resume control.
-- No per-job container, VM boundary, or configurable network isolation.
+- Built-in agent commands have no per-job container or VM boundary; plugin tasks
+  run in separate containers. Network isolation is not configurable.
 - V1 supports one GitHub repository owner per Donkeyspace instance; setup
   discovers that owner's manifest-created App installation automatically.
 - No token accounting or configurable retention policy.
@@ -123,6 +124,22 @@ deprecated compatibility mode. Codex authentication is delegated to Codex CLI.
   or engagement decisions, although decision records are available from the API.
 - Registry images are modeled by setup but intentionally unavailable until a
   release-image backend exists.
-- Test coverage is primarily unit-level; PostgreSQL, live GitHub, and complete
-  end-to-end workflows are not covered by automated tests.
+- Automated tests cover PostgreSQL transactions, deterministic plugin lifecycles,
+  and dashboard flows. Live GitHub and production model/tool runs still require
+  deployment smoke tests.
 - Donkeyspace does not coordinate changes across repositories.
+
+## Transaction and lifecycle boundaries
+
+GitHub intake prepares network-dependent authorization before entering a database
+transaction. The delivery receipt, engagement audit, queued/resumed jobs, lifecycle
+history and outbound actions commit together. Issue closure observations converge
+independently; intake checks the observed generation/state again under a row lock.
+Transient authorization failures and stale admission snapshots remain retryable.
+
+The lifecycle coordinator owns typed in-memory progress and task graph state.
+Separate modules execute tasks, apply human decisions, capture/persist checkpoints,
+track jobs, publish artifacts and reconcile projected work items. One checkpoint
+constructor serves every pause and wave, and one projection path handles initial,
+proposed and accepted plans. Legacy checkpoint interpretation lives at import.
+PostgreSQL is the progress authority; retained workspaces hold repository content.

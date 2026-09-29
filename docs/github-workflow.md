@@ -78,6 +78,10 @@ each action completed or failed.
   dependents while preserving independent completed work.
 - Retry a failed job: use the dashboard or `POST /api/runs/{id}/retry`. Results
   ending in `blocked` or `needs_human` are not eligible for direct retry.
+  A failed lifecycle with an incomplete checkpoint resumes the same coordinator
+  and retains its approved work. Closed or superseded workflow generations
+  cannot be retried. Failed lifecycle workspaces remain available for diagnostics
+  even when no pending publication was registered.
 - Resume a blocked issue through GitHub: remove the block condition and add the
   configured allow label or provide a human comment, as appropriate.
 

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Exercise the packaged coordinator's Docker client, not the host client.
+# Uses only synthetic files and containers/volume owned by this invocation.
+set -euo pipefail
+task_image=${1:?usage: scripts/test-execution-image IMAGE}
+task_directory=$(mktemp -d /tmp/ds-execution-image.XXXXXX)
+task_volume="ds-image-$(basename "$task_directory")"
+task_coordinator="$task_volume-coordinator"
+task_child="$task_volume-agent"
+task_setup="$task_volume-setup"
+cleanup() {
+    docker rm -f "$task_child" "$task_coordinator" "$task_setup" >/dev/null 2>&1 || true
+    docker volume rm "$task_volume" >/dev/null 2>&1 || true
+    rmdir "$task_directory"
+}
+trap cleanup EXIT
+docker volume create "$task_volume" >/dev/null
+docker run --rm --pull=never --network none --name "$task_setup" \
+    --mount "type=volume,src=$task_volume,dst=/data" busybox:latest sh -ec '
+    mkdir -p /data/job/repo/.git /data/sibling
+    printf owned > /data/job/repo/source
+    printf synthetic-other-job > /data/sibling/private
+    '
+docker run --rm --pull=never --network none --name "$task_coordinator" \
+    --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+    --env "TEST_VOLUME=$task_volume" --env "TEST_CHILD=$task_child" \
+    --entrypoint sh "$task_image" -ec '
+    docker --version
+    flock --version
+    donkeyspace --help >/dev/null
+    docker run --rm --pull=never --network none --name "$TEST_CHILD" \
+        --cap-drop=ALL --security-opt=no-new-privileges \
+        --mount "type=volume,src=$TEST_VOLUME,dst=/workspace,volume-subpath=job,volume-nocopy" \
+        --mount "type=volume,src=$TEST_VOLUME,dst=/workspace/repo/.git,volume-subpath=job/repo/.git,volume-nocopy,readonly" \
+        --workdir /workspace busybox:latest sh -ec '\''
+        test "$(cat repo/source)" = owned
+        test ! -e /sibling/private
+        test ! -e /workspace/sibling/private
+        test ! -e /var/run/docker.sock
+        test ! -e /root/.codex/auth.json
+        if touch repo/.git/forbidden 2>/dev/null; then exit 90; fi
+        printf generated > output
+        '\''
+    '
+docker run --rm --pull=never --network none --name "$task_setup" \
+    --mount "type=volume,src=$task_volume,dst=/data,readonly" busybox:latest sh -ec '
+    test "$(cat /data/job/output)" = generated
+    test "$(cat /data/sibling/private)" = synthetic-other-job
+    test ! -e /data/job/repo/.git/forbidden
+    '
+echo "Packaged Docker client: isolated subdirectory execution and output persistence passed."

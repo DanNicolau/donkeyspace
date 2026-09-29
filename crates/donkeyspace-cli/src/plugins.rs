@@ -123,17 +123,8 @@ impl Instance {
         }
         let flows = manifest
             .flows
-            .iter()
-            .map(|(name, flow)| {
-                (
-                    name.clone(),
-                    if flow.replaces_default_lifecycle {
-                        PluginFlowClass::LifecycleReplacement
-                    } else {
-                        PluginFlowClass::Developer
-                    },
-                )
-            })
+            .keys()
+            .map(|name| (name.clone(), PluginFlowClass::LifecycleReplacement))
             .collect();
         let plugin = InstalledPlugin {
             id: manifest.id.clone(),
@@ -287,18 +278,10 @@ impl Instance {
             parameters: BTreeMap::new(),
             task_access_overrides: BTreeMap::new(),
         };
-        match active.class {
-            PluginFlowClass::LifecycleReplacement => {
-                policy.lifecycle.plugin = Some(selection);
-                policy.agents.developer.plugin = None;
-            }
-            PluginFlowClass::Developer => {
-                policy.lifecycle.plugin = None;
-                policy.agents.developer.enabled = true;
-                policy.agents.developer.command.clear();
-                policy.agents.developer.plugin = Some(selection);
-            }
+        if active.class == PluginFlowClass::Developer {
+            return Err(SetupError::Config("serial developer plugins are retired; finish queued/running jobs with the previous release, then disconnect the old plugin or select a full lifecycle plugin".into()));
         }
+        policy.lifecycle.plugin = Some(selection);
         write_secret(&policy_path, serde_yaml::to_string(&policy)?.as_bytes())?;
 
         // Both the API and worker consume these bind mounts, so use the shared
@@ -359,11 +342,7 @@ impl Instance {
                     "worker",
                     OverlayService {
                         environment: worker_environment,
-                        volumes: vec![
-                            plugin_mount,
-                            policy_mount,
-                            "/var/run/docker.sock:/var/run/docker.sock".into(),
-                        ],
+                        volumes: vec![plugin_mount, policy_mount],
                         secrets: mounts,
                     },
                 ),
@@ -457,6 +436,7 @@ mod tests {
                 api_port: 8080,
                 web_port: 5173,
                 codex_home: None,
+                codex_auth_method: None,
                 github: None,
                 repositories_pending_apply: false,
                 github_access: BTreeMap::from([(
@@ -550,7 +530,6 @@ mod tests {
         instance.write_plugin_runtime_files().unwrap();
         let overlay = fs::read_to_string(instance.plugin_overlay_path()).unwrap();
         let policy = fs::read_to_string(directory.join("effective-policy.yml")).unwrap();
-        assert!(overlay.contains("/var/run/docker.sock"));
         assert!(overlay.contains(":/plugins/example-plugin:ro,z"));
         assert!(overlay.contains(":/run/donkeyspace/policy.yml:ro,z"));
         assert!(overlay.contains("plugin_env_0"));

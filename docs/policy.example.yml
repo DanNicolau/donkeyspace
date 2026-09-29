@@ -1,6 +1,6 @@
 # Example donkeyspace policy for a single GitHub repository.
 
-version: 1
+version: 2
 
 # Optional user-facing product facade. Plugins may supply their own defaults.
 # facade:
@@ -51,11 +51,8 @@ checks:
       command: ["sh", "-lc", "test ! -f Cargo.toml || cargo test --workspace"]
     - name: "dashboard build"
       command: ["sh", "-lc", "test ! -f web/package.json || (cd web && npm install && npm run build)"]
-  require_github_checks: false
 
 risk:
-  default: "unknown"
-  agent_classification: true
   route_unknown_to_human: true
   route_high_to_human: true
   human_review_paths:
@@ -65,13 +62,6 @@ risk:
     - "**/billing/**"
     - "**/security/**"
 
-automation:
-  max_concurrent_jobs: 2
-  retry_failed_jobs: false
-  auto_merge: false
-
 dashboard:
   # public_url: https://agents.example.com
-  expose_policy: true
   allow_retry: true
-  allow_cancel: true

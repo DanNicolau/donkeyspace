@@ -76,7 +76,7 @@ Every agent must write `.donkeyspace/run-result.json`.
 
 The validation schema lives at `schemas/run-result.schema.json`.
 
-Codex CLI triage uses `schemas/run-result.codex.schema.json` and Codex CLI developer runs use `schemas/run-result.codex-developer.schema.json` for model-facing structured output because OpenAI response-format schemas do not support every JSON Schema feature used by the orchestration schema. The reference wrappers disable Codex's inner bubblewrap sandbox and rely on the worker container boundary for local testing. The orchestrator still applies Rust validation after reading the result file.
+Codex CLI triage uses `schemas/run-result.codex.schema.json` and Codex CLI developer runs use `schemas/run-result.codex-developer.schema.json` for model-facing structured output because OpenAI response-format schemas do not support every JSON Schema feature used by the orchestration schema. The reference wrappers disable Codex's inner bubblewrap sandbox and run inside disposable job containers. See [execution isolation](execution-isolation.md) for the execution boundary and remaining credential/Git audit work. The orchestrator still applies Rust validation after reading the result file.
 
 Codex CLI reviewer runs use `schemas/run-result.codex-reviewer.schema.json`. Reviewer agents may inspect the PR checkout and diff context, but must not edit files, commit, push, apply labels, or open pull requests.
 

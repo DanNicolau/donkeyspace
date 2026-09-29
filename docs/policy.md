@@ -135,15 +135,14 @@ checks:
       command: ["git", "diff", "--check"]
 ```
 
-Commands must exist in the worker image. The default image includes Git, Node, npm, and the Rust toolchain so Donkeyspace can dogfood its own Rust workspace and dashboard build. Other project-specific tools need a custom worker image or wrapper command.
+Commands must exist in the execution image selected by `DONKEYSPACE_AGENT_IMAGE`. Compose uses its locally built runtime image, which includes Git, Node, npm, and the Rust toolchain. Other project-specific tools need a custom execution image. Agents and required checks run in disposable containers; see [execution isolation](execution-isolation.md) for mount boundaries and the remaining audit work.
 
-`checks.require_github_checks` is reserved for required GitHub status/check enforcement. The field is parsed but GitHub check enforcement is not implemented yet, so keep it `false` for dogfooding.
+Policy version 2 rejects `checks.require_github_checks`; GitHub check enforcement is not implemented.
 
 ## Risk Routing
 
-`risk.default` and `risk.agent_classification` are parsed for forward
-compatibility but do not currently alter routing. Agent results must report a
-risk value explicitly.
+Agent results must report a risk value explicitly. Version 2 removes the unused
+`risk.default` and `risk.agent_classification` declarations.
 
 `risk.route_unknown_to_human` and `risk.route_high_to_human` route `ready` triage results to `needs_human` before developer work is queued.
 
@@ -167,7 +166,8 @@ Supported path patterns are exact paths, prefix globs ending in `/**`, and neste
 
 ## Automation
 
-`automation.auto_merge` is false by default and humans remain responsible for merging. `automation.max_concurrent_jobs` and `automation.retry_failed_jobs` are reserved declarations; neither is enforced yet.
+Humans remain responsible for merging. Version 2 rejects the unused `automation`
+settings for auto-merge, concurrency and automatic retries.
 
 Failed jobs can be retried manually through `POST /api/runs/{id}/retry` or the
 dashboard when `dashboard.allow_retry` is true. Only failed jobs are eligible;
@@ -185,12 +185,19 @@ retry creates a new job linked through `retry_of_job_id`.
 dashboard:
   # Optional externally reachable dashboard origin used in GitHub status links.
   public_url: https://agents.example.com
-  expose_policy: true
   allow_retry: true
-  allow_cancel: true
 ```
 
-`dashboard.allow_retry` gates the retry API. `dashboard.expose_policy` and
-`dashboard.allow_cancel` are parsed but not implemented. The dashboard does not
-edit policy. When `dashboard.public_url` is omitted, lifecycle status comments
+`dashboard.allow_retry` gates the retry API. Version 2 removes `expose_policy` and
+`allow_cancel`. The dashboard does not edit policy. When `dashboard.public_url` is omitted, lifecycle status comments
 remain self-contained and do not publish a broken dashboard link.
+
+## Version migration
+
+Save new policies as `version: 2`. Version 1 remains readable through an explicit
+migration boundary: retired no-op fields are removed with startup warnings and
+serialization emits version 2. Version 2 rejects those fields and unknown fields
+in the affected sections. Selecting a serial role plugin is an error in either
+version. Set `lifecycle.plugin` for a full graph or keep the built-in role commands.
+The worker rejects the retired `deterministic`, `fake` and `local` triage providers;
+use the native agent or the configured OpenAI-compatible provider.

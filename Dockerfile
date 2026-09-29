@@ -4,6 +4,9 @@ WORKDIR /app
 COPY . .
 RUN cargo build --release --bin donkeyspace-api --bin donkeyspace-worker --bin donkeyspace
 
+# Docker 29.5.3 CLI. Debian bookworm's docker.io client predates volume-subpath.
+FROM docker:29.5.3-cli@sha256:11e1133c30f3ceb73c6bdc7dfb78b3f9ed8e8e0d1d0400e91c5ec2eb240bf2ff AS docker-cli
+
 FROM node:25-bookworm-slim AS runtime
 
 ENV CARGO_HOME=/usr/local/cargo
@@ -11,11 +14,12 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates docker.io git ripgrep \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates git ripgrep util-linux \
     && npm install -g @openai/codex@0.130.0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY .donkeyspace/policy.yml /app/.donkeyspace/policy.yml
 COPY docs/policy.plugin.example.yml /app/docs/policy.plugin.example.yml
 COPY schemas/run-result.schema.json /app/schemas/run-result.schema.json

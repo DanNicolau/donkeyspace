@@ -2,7 +2,7 @@
 use crate::{DbError, PgPool, WorkflowItemInput};
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::{Acquire, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(FromRow)]
@@ -107,7 +107,7 @@ pub async fn lock_job_side_effect(
     job_id: Uuid,
 ) -> Result<Transaction<'static, Postgres>, DbError> {
     let mut tx = pool.begin().await?;
-    let allowed: Option<bool> = sqlx::query_scalar("SELECT w.provider_state <> 'closed' AND w.generation=j.generation AND j.status NOT IN ('cancel_requested','cancelled') FROM workflow_items w JOIN jobs j ON j.workflow_item_id=w.id WHERE j.id=$1 FOR NO KEY UPDATE OF w")
+    let allowed: Option<bool> = sqlx::query_scalar("SELECT workflow_repository_tracked(w.id) AND w.provider_state <> 'closed' AND w.generation=j.generation AND j.status NOT IN ('cancel_requested','cancelled') FROM workflow_items w JOIN jobs j ON j.workflow_item_id=w.id WHERE j.id=$1 FOR NO KEY UPDATE OF w")
         .bind(job_id).fetch_optional(&mut *tx).await?;
     if allowed != Some(true) {
         return Err(DbError::ExecutionCancelled);
@@ -115,8 +115,11 @@ pub async fn lock_job_side_effect(
     Ok(tx)
 }
 
-pub async fn job_execution_allowed(pool: &PgPool, job_id: Uuid) -> Result<bool, DbError> {
-    Ok(sqlx::query_scalar::<_,bool>("SELECT j.status NOT IN ('cancel_requested','cancelled') AND (w.id IS NULL OR (w.provider_state <> 'closed' AND w.generation=j.generation)) FROM jobs j LEFT JOIN workflow_items w ON w.id=j.workflow_item_id WHERE j.id=$1")
+pub async fn job_execution_allowed<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
+    job_id: Uuid,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_,bool>("SELECT workflow_repository_tracked(w.id) AND j.status NOT IN ('cancel_requested','cancelled') AND (w.id IS NULL OR (w.provider_state <> 'closed' AND w.generation=j.generation)) FROM jobs j LEFT JOIN workflow_items w ON w.id=j.workflow_item_id WHERE j.id=$1")
         .bind(job_id).fetch_optional(pool).await?.unwrap_or(false))
 }
 
@@ -142,7 +145,7 @@ pub async fn update_workflow_state_for_job(
     job: Uuid,
     state: &str,
 ) -> Result<(), DbError> {
-    sqlx::query("UPDATE workflow_items w SET current_state=$3, updated_at=now() WHERE w.id=$1 AND w.provider_state <> 'closed' AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=$2 AND j.workflow_item_id=w.id AND j.generation=w.generation AND j.status NOT IN ('cancel_requested','cancelled'))")
+    sqlx::query("UPDATE workflow_items w SET current_state=$3, updated_at=now() WHERE w.id=$1 AND workflow_repository_tracked(w.id) AND w.provider_state <> 'closed' AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=$2 AND j.workflow_item_id=w.id AND j.generation=w.generation AND j.status NOT IN ('cancel_requested','cancelled'))")
         .bind(workflow).bind(job).bind(state).execute(pool).await?;
     Ok(())
 }
@@ -152,7 +155,7 @@ pub async fn lock_outbound_side_effect(
     action_id: i64,
 ) -> Result<Option<Transaction<'static, Postgres>>, DbError> {
     let mut tx = pool.begin().await?;
-    let allowed: Option<bool> = sqlx::query_scalar("SELECT a.status='pending' AND a.generation=w.generation AND (j.id IS NULL OR j.status NOT IN ('cancel_requested','cancelled')) AND (w.provider_state <> 'closed' OR (a.job_id IS NULL AND a.action_type='issue.remove_labels' AND COALESCE(a.payload->>'closure_cleanup'='true',false))) FROM outbound_actions a JOIN workflow_items w ON w.id=a.workflow_item_id LEFT JOIN jobs j ON j.id=a.job_id WHERE a.id=$1 FOR NO KEY UPDATE OF w")
+    let allowed: Option<bool> = sqlx::query_scalar("SELECT workflow_repository_tracked(w.id) AND a.status='pending' AND a.generation=w.generation AND (j.id IS NULL OR j.status NOT IN ('cancel_requested','cancelled')) AND (w.provider_state <> 'closed' OR (a.job_id IS NULL AND a.action_type='issue.remove_labels' AND COALESCE(a.payload->>'closure_cleanup'='true',false))) FROM outbound_actions a JOIN workflow_items w ON w.id=a.workflow_item_id LEFT JOIN jobs j ON j.id=a.job_id WHERE a.id=$1 FOR NO KEY UPDATE OF w")
         .bind(action_id).fetch_optional(&mut *tx).await?;
     if allowed != Some(true) {
         sqlx::query("UPDATE outbound_actions SET status='cancelled',updated_at=now() WHERE id=$1 AND status='pending'")
@@ -168,6 +171,17 @@ pub async fn lock_outbound_side_effect(
 /// A caller's earlier PR/workflow snapshot is never sufficient authorization.
 pub async fn apply_pull_request_effects(
     pool: &PgPool,
+    workflow: i64,
+    provider_pr_id: &str,
+    state: Option<&str>,
+    actions: &[(String, serde_json::Value)],
+) -> Result<Option<i64>, DbError> {
+    let mut connection = pool.acquire().await?;
+    apply_pull_request_effects_on(&mut connection, workflow, provider_pr_id, state, actions).await
+}
+
+pub async fn apply_pull_request_effects_on(
+    pool: &mut sqlx::PgConnection,
     workflow: i64,
     provider_pr_id: &str,
     state: Option<&str>,
@@ -876,7 +890,7 @@ pub async fn pull_request_is_current(
     workflow: i64,
     provider_pr_id: &str,
 ) -> Result<bool, DbError> {
-    Ok(sqlx::query_scalar::<_,bool>("SELECT p.generation=w.generation AND w.provider_state <> 'closed' FROM pull_requests p JOIN workflow_items w ON w.id=p.workflow_item_id WHERE w.id=$1 AND p.provider_pr_id=$2")
+    Ok(sqlx::query_scalar::<_,bool>("SELECT workflow_repository_tracked(w.id) AND p.generation=w.generation AND w.provider_state <> 'closed' FROM pull_requests p JOIN workflow_items w ON w.id=p.workflow_item_id WHERE w.id=$1 AND p.provider_pr_id=$2")
         .bind(workflow).bind(provider_pr_id).fetch_optional(pool).await?.unwrap_or(false))
 }
 
@@ -920,7 +934,7 @@ pub async fn reconcile_closed_workflows(
         )
         .await?;
     }
-    sqlx::query("UPDATE outbound_actions a SET status='pending',updated_at=now() FROM workflow_items w WHERE w.id=a.workflow_item_id AND w.provider_state='closed' AND w.generation=a.generation AND a.action_type='issue.remove_labels' AND a.payload->>'closure_cleanup'='true' AND a.status='failed' AND a.updated_at < now()-interval '30 seconds'")
+    sqlx::query("UPDATE outbound_actions a SET status='pending',updated_at=now() FROM workflow_items w WHERE w.id=a.workflow_item_id AND w.provider_state='closed' AND w.generation=a.generation AND a.action_type='issue.remove_labels' AND a.payload->>'closure_cleanup'='true' AND a.status='failed' AND workflow_repository_tracked(w.id) AND a.retry_count<8 AND a.next_attempt_at<=now() AND COALESCE(a.last_error,'') !~* '(401|403|404|422|authentication|permission|forbidden)' AND a.updated_at < now()-interval '30 seconds'")
         .execute(pool).await?;
     Ok(())
 }

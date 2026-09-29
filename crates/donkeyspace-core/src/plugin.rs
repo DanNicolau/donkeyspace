@@ -189,6 +189,7 @@ pub enum PluginApprovalMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PluginTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -214,6 +215,10 @@ pub struct PluginTask {
     pub resources: Vec<PluginResourceAssignment>,
     #[serde(default)]
     pub artifacts: Vec<PluginArtifact>,
+    /// Exact artifacts retained after a successful process and valid result,
+    /// independent of the semantic outcome. Does not complete or approve work.
+    #[serde(default)]
+    pub preserve_on_success: Vec<PluginArtifact>,
     /// Optional text diagnostics to preserve on a forensic attempt branch.
     /// Unlike publishable artifacts, these never enter the aggregate checkout.
     #[serde(default)]
@@ -224,10 +229,6 @@ pub struct PluginTask {
     pub allowed_handoffs: Vec<String>,
     #[serde(default)]
     pub handoff_descriptions: BTreeMap<String, String>,
-    #[serde(default)]
-    pub transitions: BTreeMap<String, String>,
-    #[serde(default)]
-    pub terminal: bool,
     /// Pause after a successful task result until an authorized human approves
     /// the published output. Agents may still request human input themselves
     /// by returning `needs_human` when this is `none`.
@@ -397,6 +398,11 @@ impl PluginManifest {
             validate_resource_assignments(&role.resources, &self.resources, name)?;
         }
         for (flow_name, flow) in &self.flows {
+            if !flow.replaces_default_lifecycle {
+                return Err(PluginError::Invalid(format!(
+                    "flow `{flow_name}` uses retired serial developer plugins; finish existing runs with the previous release, then select the built-in lifecycle or a full lifecycle plugin"
+                )));
+            }
             if let Some(template) = &flow.pull_request_title {
                 validate_publication_title_template(template)?;
             }
@@ -457,7 +463,7 @@ impl PluginManifest {
                     )));
                 }
                 validate_resource_assignments(&task.resources, &self.resources, task_name)?;
-                for artifact in &task.artifacts {
+                for artifact in task.artifacts.iter().chain(&task.preserve_on_success) {
                     if let Some(display_name) = &artifact.display_name {
                         validate_display_text("artifact display_name", display_name)?;
                     }
@@ -493,7 +499,7 @@ impl PluginManifest {
                         )));
                     }
                 }
-                for target in task.transitions.values().chain(&task.allowed_handoffs) {
+                for target in &task.allowed_handoffs {
                     if !flow.tasks.contains_key(target) {
                         return Err(PluginError::Invalid(format!(
                             "task `{task_name}` references unknown target `{target}`"
@@ -624,7 +630,7 @@ fn validate_filesystem_template(
         }
         expanded = expanded.replace(&format!("{{{placeholder}}}"), "value");
     }
-    validate_relative_path(&expanded)
+    validate_repository_path(&expanded)
 }
 
 fn placeholders(value: &str) -> Result<Vec<String>, PluginError> {
@@ -691,6 +697,25 @@ fn validate_task_graph(flow_name: &str, flow: &PluginFlow) -> Result<(), PluginE
     Ok(())
 }
 
+/// Repository artifacts must name content below the checkout, never metadata.
+/// Build contexts may still use `.` through the separate relative-path validator.
+pub fn validate_repository_path(value: &str) -> Result<(), PluginError> {
+    validate_relative_path(value)?;
+    let path = Path::new(value);
+    if !path
+        .components()
+        .any(|part| matches!(part, std::path::Component::Normal(_)))
+        || path
+            .components()
+            .any(|part| part.as_os_str().eq_ignore_ascii_case(".git"))
+    {
+        return Err(PluginError::Invalid(format!(
+            "unsafe repository artifact path `{value}`"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_relative_path(value: &str) -> Result<(), PluginError> {
     let path = Path::new(value);
     if value.trim().is_empty()
@@ -712,10 +737,22 @@ mod tests {
     fn rejects_path_traversal() {
         assert!(validate_relative_path("../dv").is_err());
         assert!(validate_relative_path("rtl").is_ok());
+        assert!(validate_relative_path(".").is_ok()); // installation build context
+        for path in [
+            ".",
+            "./",
+            ".git",
+            "./.git/config",
+            "src/.Git/config",
+            "../rtl",
+        ] {
+            assert!(validate_repository_path(path).is_err(), "{path}");
+        }
+        assert!(validate_repository_path("src/rtl").is_ok());
     }
 
     #[test]
-    fn parses_and_validates_a_serial_flow() {
+    fn rejects_retired_serial_flows_with_migration_guidance() {
         let manifest: PluginManifest = serde_yaml::from_str(
             r#"
 api_version: 1
@@ -732,11 +769,16 @@ flows:
         agent: rtl
         read: [docs/design, rtl]
         write: [rtl]
-        terminal: true
 "#,
         )
         .unwrap();
-        manifest.validate().unwrap();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("retired serial")
+        );
         assert_eq!(manifest.facade.command.as_deref(), Some("example-agent"));
     }
 
@@ -759,8 +801,10 @@ roles:
 flows:
   implementation:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
-      develop: { role: developer, terminal: true }
+      develop: { role: developer }
 "#,
         )
         .unwrap();
@@ -785,8 +829,10 @@ roles:
 flows:
   implementation:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
-      develop: { role: developer, terminal: true }
+      develop: { role: developer }
 "#,
         )
         .unwrap();
@@ -894,6 +940,8 @@ roles:
 flows:
   implementation:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
       develop:
         role: developer
@@ -902,14 +950,28 @@ flows:
         write: ["{source_root}/{work_item}.{extension}"]
         artifacts:
           - { path: "{source_root}/{work_item}.{extension}", type: file, required: true }
+        preserve_on_success:
+          - { path: "{source_root}/{work_item}.{extension}", type: file }
         validators:
           - { name: source validation, command: [/plugin/validate] }
-        terminal: true
 "#,
         )
         .unwrap();
 
         manifest.validate().unwrap();
+        for invalid in ["../outside", "build/*.txt", "{unknown}/report.txt"] {
+            let mut invalid_manifest = manifest.clone();
+            invalid_manifest
+                .flows
+                .get_mut("implementation")
+                .unwrap()
+                .tasks
+                .get_mut("develop")
+                .unwrap()
+                .preserve_on_success[0]
+                .path = invalid.into();
+            assert!(invalid_manifest.validate().is_err(), "{invalid}");
+        }
     }
 
     #[test]
@@ -923,6 +985,8 @@ roles: { developer: { command: [run] } }
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
       develop: { role: developer, read: ["{missing}"] }
 "#,
@@ -940,6 +1004,8 @@ roles: { developer: { command: [run] } }
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
       develop: { role: developer, read: ["{location}"] }
 "#,
@@ -960,6 +1026,8 @@ roles: { developer: { command: [run] } }
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks: { develop: { role: developer } }
 "#,
         )
@@ -976,6 +1044,8 @@ roles:
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks: { develop: { role: developer } }
 "#,
         )
@@ -994,6 +1064,8 @@ roles: { developer: { command: [run] } }
 flows:
   default:
     start: develop
+    replaces_default_lifecycle: true
+    work_items_path: work-items.json
     tasks:
       develop:
         role: developer

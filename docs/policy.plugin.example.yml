@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 workflow:
   state_labels:
@@ -28,22 +28,12 @@ checks:
   required_commands:
     - name: "diff whitespace"
       command: ["git", "diff", "--check"]
-  require_github_checks: false
 
 risk:
-  default: "unknown"
-  agent_classification: true
   route_unknown_to_human: false
   route_high_to_human: true
   human_review_paths: []
 
-automation:
-  max_concurrent_jobs: 1
-  retry_failed_jobs: false
-  auto_merge: false
-
 dashboard:
   # public_url: https://agents.example.com
-  expose_policy: true
   allow_retry: true
-  allow_cancel: false

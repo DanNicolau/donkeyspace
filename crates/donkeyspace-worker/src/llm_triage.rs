@@ -6,18 +6,20 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriageProvider {
     Auto,
-    Deterministic,
     OpenAiCompatible,
     Agent,
 }
 
 impl TriageProvider {
-    pub fn parse(value: &str) -> Self {
+    pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "llm" | "openai" | "openai-compatible" | "openrouter" => Self::OpenAiCompatible,
-            "deterministic" | "fake" | "local" => Self::Deterministic,
-            "agent" | "command" | "external" => Self::Agent,
-            _ => Self::Auto,
+            "llm" | "openai" | "openai-compatible" | "openrouter" => Ok(Self::OpenAiCompatible),
+            "deterministic" | "fake" | "local" => Err(
+                "deterministic triage is retired; select agent, auto, or openai-compatible".into(),
+            ),
+            "agent" | "command" | "external" => Ok(Self::Agent),
+            "auto" | "" => Ok(Self::Auto),
+            _ => Err(format!("unknown triage provider `{value}`")),
         }
     }
 }
@@ -39,7 +41,7 @@ impl LlmTriageConfig {
                 .as_ref()
                 .map(|key| !key.trim().is_empty())
                 .unwrap_or(false),
-            TriageProvider::Deterministic | TriageProvider::Agent => false,
+            TriageProvider::Agent => false,
         }
     }
 }
@@ -262,15 +264,10 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_provider_does_not_use_llm() {
-        let config = LlmTriageConfig {
-            provider: TriageProvider::Deterministic,
-            base_url: "https://openrouter.ai/api/v1".to_string(),
-            api_key: Some("key".to_string()),
-            model: "openrouter/free".to_string(),
-        };
-
-        assert!(!config.should_use_llm());
+    fn retired_providers_are_rejected() {
+        for name in ["deterministic", "fake", "local", "misspelled"] {
+            assert!(TriageProvider::parse(name).is_err());
+        }
     }
 
     #[test]
@@ -283,7 +280,10 @@ mod tests {
         };
 
         assert!(!config.should_use_llm());
-        assert_eq!(TriageProvider::parse("external"), TriageProvider::Agent);
+        assert_eq!(
+            TriageProvider::parse("external").unwrap(),
+            TriageProvider::Agent
+        );
     }
 
     #[test]
