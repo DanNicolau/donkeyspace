@@ -159,3 +159,73 @@ test('health link returns upstream JSON and preserves failure status through thi
   const spa = await request.get('/repositories/example/test/issues/1');
   expect(spa.headers()['content-type']).toContain('text/html');
 });
+
+test('parallel approval cards keep per-target commands and legacy text has no invented command', async ({ page }) => {
+  const approval = (target: string) => ({ target_task: 'rtl', target_work_item: target, purpose: 'accept_result', trigger: 'required', approval_subject: `Review ${target}`, result_summary: 'Human wording contains no commands.', changed_files: [], proposed_publication: null, accepted_publication: null, projected_issues: [], downstream_tasks: [], state: 'pending', approve_command: `/example approve rtl/${target}`, revise_command: `/example revise rtl/${target}` });
+  const workflow = { id: 1, owner: 'test', repository: 'test', issue_number: 1, issue_title: 'Parallel review', issue_url: 'https://github.com/test/test/issues/1', provider_state: 'open', current_state: 'needs_human', coordinator_job_id: null, coordinator_status: 'paused', outcome: 'needs_human', summary: 'Review output.', pending_approval: 'Legacy explanation only.', approvals: [approval('one'), approval('two')], external_sync: { status: 'ready' }, tasks: [], pull_request_url: null, no_pr_reason: 'Awaiting approval.', updated_at: '2026-01-01T00:00:00Z' };
+  await page.route('**/api/workflows/test/test/issues/1', route => route.fulfill({ json: workflow }));
+  await page.goto('/repositories/test/test/issues/1');
+  for (const target of ['one', 'two']) {
+    const card = page.locator('.approval-card').filter({ hasText: `Review ${target}` });
+    await expect(card.locator('code')).toHaveText([`/example approve rtl/${target}`, `/example revise rtl/${target}`]);
+  }
+  workflow.approvals = [];
+  await page.reload();
+  await expect(page.getByText('Legacy explanation only.', { exact: true })).toBeVisible();
+  await expect(page.locator('.approval-commands code')).toHaveCount(0);
+});
+
+test('upstream revisions explain invalidation scope before showing the command', async ({ page }, info) => {
+  const workflow = { id: 1, owner: 'test', repository: 'test', issue_number: 1, issue_title: 'Upstream revision', issue_url: 'https://github.com/test/test/issues/1', provider_state: 'open', current_state: 'needs_human', coordinator_status: 'paused', outcome: 'needs_human', summary: 'Validation requires a contract change.', approvals: [], tasks: [], external_sync: { status: 'ready' }, no_pr_reason: 'Awaiting a decision.', updated_at: '2026-01-01T00:00:00Z', revision_targets: [{ target: 'plan', affected: ['plan', 'build/left', 'check/left', 'build/right', 'check/right'], revise_command: '/example revise plan' }] };
+  await page.route('**/api/workflows/test/test/issues/1', route => route.fulfill({ json: workflow }));
+  await page.goto('/repositories/test/test/issues/1');
+  await expect(page.getByText('Revise completed upstream work', { exact: true })).toBeVisible();
+  await page.getByText('plan', { exact: true }).click();
+  await expect(page.getByText('Supersedes:', { exact: true }).locator('..')).toContainText('build/right, check/right');
+  await expect(page.locator('code').filter({ hasText: '/example revise plan' })).toBeVisible();
+  await expect(page.getByText(/Required approval will be requested for revised output/)).toBeVisible();
+  await expect(page.getByText('/example approve plan', { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath('upstream-revision.png'), fullPage: true });
+  workflow.revision_targets = [];
+  workflow.current_state = 'in_progress';
+  await page.reload();
+  await expect(page.getByText('Revise completed upstream work', { exact: true })).toHaveCount(0);
+});
+
+test('current blockers show all questions and distinguish draft publication states', async ({ page }, info) => {
+  const first = { job_id: 'attempt-one', task: 'check', work_item: 'one', outcome: 'needs_info', reason: 'The output behavior needs clarification.', questions: ['Which reset polarity should this interface use?', 'Should output saturate at the maximum value?'], action: 'Reply on the parent issue with answers to these questions to continue the retained workflow.', response_command: null as string | null, evidence: { state: 'none', message: 'No draft produced: this attempt contains no supporting files in its write scope.', files: [] as { path: string; url: string }[] } };
+  const second = { ...first, job_id: 'attempt-two', work_item: 'two', questions: ['Is the clock shared between the two components?'], evidence: { state: 'failed', message: 'Draft publication failed. Retry publication to make supporting files available.', files: [] as { path: string; url: string }[] } };
+  const workflow = { id: 1, owner: 'test', repository: 'test', issue_number: 1, issue_title: 'Clarify interface behavior', issue_url: 'https://github.com/test/test/issues/1', provider_state: 'open', current_state: 'needs_info', coordinator_status: 'paused', outcome: 'needs_info', summary: 'Awaiting answers before continuing the retained workflow.', approvals: [], tasks: [], external_sync: { status: 'ready' }, no_pr_reason: 'check/one: Which reset polarity should this interface use?', updated_at: '2026-01-01T00:00:00Z', blockers: [first, second] };
+  await page.route('**/api/workflows', route => route.fulfill({ json: [workflow] }));
+  await page.route('**/api/workflows/test/test/issues/1', route => route.fulfill({ json: workflow }));
+  await page.route('**/api/workflows/test/test/issues/1/events?*', route => route.fulfill({ json: { events: [{ id: 1, event_type: 'task_completed', level: 'milestone', source: 'worker', task: 'check', work_item: 'one', summary: 'Clarification requested.', reason: first.questions.join('\n'), created_at: workflow.updated_at, links: [] }], next_before_id: null } }));
+  await page.goto('/');
+  await expect(page.locator('.blocker-preview')).toContainText('check/one: Which reset polarity');
+  await expect(page.locator('.summary-grid').getByText('Needs attention').locator('..')).toContainText('1');
+  await page.getByRole('link', { name: 'View 2 current blockers' }).click();
+  const blockers = page.locator('#current-blockers');
+  await expect(blockers.locator('.blocker-card')).toHaveCount(2);
+  for (const question of [...first.questions, ...second.questions]) await expect(blockers.getByText(question, { exact: true })).toBeVisible();
+  await expect(blockers).toContainText('No draft produced');
+  await expect(blockers).toContainText('Draft publication failed');
+  await expect(blockers.getByRole('link')).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath('blockers-no-draft-and-failed.png'), fullPage: true });
+  first.evidence = { state: 'pending', message: 'Draft publication pending. Questions can be answered while publication is pending.', files: [] };
+  await page.reload();
+  await expect(blockers).toContainText('Draft publication pending');
+  await expect(blockers.getByText(first.questions[1], { exact: true })).toBeVisible();
+  first.evidence = { state: 'published', message: 'Supporting files at the exact attempt revision; these may include unchanged drafts.', files: [{ path: 'docs/interface.md', url: 'https://github.com/test/test/blob/accepted-sha/docs/interface.md' }] };
+  workflow.current_state = 'needs_human';
+  first.response_command = '/example revise check/one';
+  first.action = 'Answer these questions through the relevant revision control on the parent issue. Other pending approvals remain required.';
+  second.response_command = '/example revise check/two'; second.action = first.action; workflow.outcome = 'needs_human';
+  await page.reload();
+  await expect(blockers.getByRole('link', { name: 'docs/interface.md' })).toHaveAttribute('href', first.evidence.files[0].url);
+  await expect(blockers.locator('code')).toHaveText(['/example revise check/one', '/example revise check/two']);
+  await page.screenshot({ path: info.outputPath('blockers-published.png'), fullPage: true });
+  workflow.blockers = []; workflow.current_state = 'in_progress'; workflow.outcome = 'implemented';
+  await page.reload();
+  await expect(blockers).toHaveCount(0);
+  await page.locator('.timeline-row').getByText('Reason', { exact: true }).click();
+  await expect(page.locator('.timeline-row pre')).toContainText(first.questions[1]);
+});

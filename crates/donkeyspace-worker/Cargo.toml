@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 clap.workspace = true
 donkeyspace-core = { path = "../donkeyspace-core" }
 donkeyspace-db = { path = "../donkeyspace-db" }
@@ -23,3 +24,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 serde_yaml.workspace = true
+sqlx.workspace = true

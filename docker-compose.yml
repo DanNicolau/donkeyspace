@@ -51,12 +51,14 @@ services:
         condition: service_healthy
 
   worker:
+    image: donkeyspace-execution:local
     build:
       context: .
     command: ["donkeyspace-worker"]
     environment:
       <<: *github-environment
       DONKEYSPACE_WORKER_ID: ${DONKEYSPACE_WORKER_ID:-worker-local}
+      DONKEYSPACE_AGENT_IMAGE: ${DONKEYSPACE_AGENT_IMAGE:-donkeyspace-execution:local}
       DONKEYSPACE_LEASE_SECONDS: ${DONKEYSPACE_LEASE_SECONDS:-300}
       DONKEYSPACE_TRIAGE_PROVIDER: ${DONKEYSPACE_TRIAGE_PROVIDER:-agent}
       DONKEYSPACE_LLM_BASE_URL: ${DONKEYSPACE_LLM_BASE_URL:-https://openrouter.ai/api/v1}
@@ -64,10 +66,14 @@ services:
       DONKEYSPACE_LLM_API_KEY: ${DONKEYSPACE_LLM_API_KEY:-}
       DONKEYSPACE_WORKSPACE_ROOT: /workspaces
       DONKEYSPACE_WORKSPACE_VOLUME: donkeyspace-workspaces
-      # Pass the same source mounted below to plugin job containers. The
-      # default is the Docker volume's actual name, not its Compose alias.
-      DONKEYSPACE_CODEX_HOME_SOURCE: ${DONKEYSPACE_CODEX_HOME_SOURCE:-donkeyspace-codex-home}
-      DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX: ${DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX:-}
+      # Agent containers receive only this dedicated automation credential file.
+      # The coordinator and checks do not mount Codex credentials.
+      DONKEYSPACE_CODEX_AUTH_SOURCE: ${DONKEYSPACE_CODEX_AUTH_SOURCE:-}
+      DONKEYSPACE_CODEX_AUTH_METHOD: ${DONKEYSPACE_CODEX_AUTH_METHOD:-}
+      DONKEYSPACE_CODEX_AUTH_MOUNT_SUFFIX: ${DONKEYSPACE_CODEX_AUTH_MOUNT_SUFFIX:-}
+      # Retain these only to reject legacy home-sharing configurations clearly.
+      DONKEYSPACE_CODEX_HOME_SOURCE: ${DONKEYSPACE_CODEX_HOME_SOURCE:-}
+      DONKEYSPACE_CODEX_VOLUME: ${DONKEYSPACE_CODEX_VOLUME:-}
       DONKEYSPACE_OSS_TOOLS_PATH: ${DONKEYSPACE_OSS_TOOLS_PATH:-}
       DONKEYSPACE_TECH_PATH: ${DONKEYSPACE_TECH_PATH:-}
       DONKEYSPACE_REPO_CONTEXT_MAX_BYTES: ${DONKEYSPACE_REPO_CONTEXT_MAX_BYTES:-20000}
@@ -78,8 +84,8 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     volumes:
       - ${DONKEYSPACE_POLICY_SOURCE:-./.donkeyspace/policy.yml}:/run/donkeyspace/policy.yml:ro,z
-      - ${DONKEYSPACE_CODEX_HOME_SOURCE:-codex-home}:/root/.codex${DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX:-}
       - donkeyspace-workspaces:/workspaces
+      - /var/run/docker.sock:/var/run/docker.sock
     secrets:
       - github_private_key
       - github_webhook_secret
@@ -105,8 +111,6 @@ secrets:
     file: ${DONKEYSPACE_WEBHOOK_SECRET_SOURCE:-.donkeyspace/compose-placeholder}
 
 volumes:
-  codex-home:
-    name: donkeyspace-codex-home
   donkeyspace-workspaces:
     name: donkeyspace-workspaces
   postgres-data:

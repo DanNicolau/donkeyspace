@@ -1,7 +1,7 @@
 # Installation and authentication
 
 The `donkeyspace` CLI and TUI share one reusable setup control plane.
-Instance configuration uses `schema_version = 4` and lives under
+Instance configuration uses `schema_version = 9` and lives under
 `$XDG_CONFIG_HOME/donkeyspace` or `~/.config/donkeyspace` by default. Pass
 `--config-dir` to select a different instance.
 
@@ -79,8 +79,10 @@ Port changes are persisted but do not silently restart a running stack. Run
 it checks Docker and Compose, required source files, the API and dashboard ports, GitHub
 repository access, secret permissions, and `codex login status`.
 
-`down` preserves PostgreSQL and Codex/workspace volumes. Deletion requires the
-explicit pair `reset --delete-data --confirm`.
+`down` preserves PostgreSQL/workspace volumes and the instance-owned automation
+login. Compose volume deletion requires `reset --delete-data --confirm`; it does
+not delete host authentication files or legacy credential volumes no longer
+declared in Compose.
 
 ## Deployment entry points
 
@@ -213,7 +215,7 @@ the Docker socket. The installer writes the configured host bindings through
 `DONKEYSPACE_API_PORT` and `DONKEYSPACE_WEB_PORT`; container-internal ports stay
 fixed. Use `docker-compose.dev.yml` for Vite hot reload. The setup control plane
 generates a private effective policy and plugin overlay, and mounts the Docker
-socket only on the worker when a plugin flow is active.
+socket only on the worker; both built-in and plugin execution use isolated containers.
 The checked-in `.donkeyspace/compose-placeholder` is not a key or webhook
 secret; it only lets an unauthenticated Compose configuration parse. Runtime
 credentials are stored outside the source tree by default, and
@@ -224,9 +226,9 @@ credentials are stored outside the source tree by default, and
 The Compose files label host bind mounts for container access on
 SELinux-enforcing Fedora, RHEL, CentOS Stream, Rocky Linux, and AlmaLinux
 hosts. Policy and plugin paths use the shared `z` label because both the API
-and worker mount them. A host-backed Codex home also uses the shared `z` label
-because the worker and plugin job containers mount the same directory, and
-the setup CLI configures it automatically. Named volumes require no relabeling.
+and worker mount them. The automation `auth.json` file uses the shared `z`
+label because multiple agent containers can mount it; the CLI configures this
+automatically. Its surrounding home is not mounted. Named volumes require no relabeling.
 Do not add `z` or `Z` to the Docker socket mount.
 
 If startup still reports `Permission denied (os error 13)`, confirm whether
@@ -259,52 +261,82 @@ their existing trusted identities into both independent lists.
 
 ## Codex
 
-The CLI overview and **Configure Codex** screen show the configured login's
-email and plan. API-key logins are identified as such without displaying the
-key; Codex does not provide an account email for that login method. The
-configuration screen also shows the Codex home and supports **R** to refresh.
-Account details refresh after login and every 30 seconds. Failed lookups show
-`account unavailable` instead of claiming the account is connected.
+Connect an explicit automation login for each instance:
 
-The lookup uses Codex's local `account/read` endpoint with the configured
-`CODEX_HOME`. It reads saved account metadata without requesting a token
-refresh or starting an agent run; it does not verify network access or identify
-credentials retained by already-running jobs.
+```sh
+donkeyspace connect codex --method api-key
+# Or use a separate browser login for this automation instance:
+donkeyspace connect codex --method chatgpt
+```
 
-`connect codex --method chatgpt` runs `codex login` and leaves the browser flow
-entirely with Codex. `--method api-key` reads a hidden prompt and pipes the key
-to `codex login --with-api-key`; Donkeyspace does not persist the key. Both
-branches finish with `codex login status`. Setup records only the Codex home
-directory path (including a custom `CODEX_HOME`) so Compose and plugin job
-containers mount the same CLI-owned credentials at `/root/.codex`;
-Donkeyspace never reads or copies the OAuth/API credentials. These are the two local sign-in
-methods described by the
-[official Codex authentication documentation](https://learn.chatgpt.com/docs/auth).
+Setup uses `<instance-config-directory>/codex-automation` as an explicit
+`CODEX_HOME` and forces file credential storage. It ignores ambient personal
+Codex authentication and never imports a personal home or token file. An API key
+is entered through a hidden prompt and piped to Codex through stdin; ChatGPT
+login delegates the browser interaction to Codex. Both finish with login-status
+verification. Instance configuration records only the directory and login method;
+Codex owns the private `auth.json` file. The
+[official authentication guide](https://learn.chatgpt.com/docs/auth) recommends
+API keys for programmatic automation.
 
-After upgrading an existing deployment, run `donkeyspace up` with the updated
-CLI and source tree to regenerate the configuration and rebuild/recreate the
-worker. This replaces the old plugin-job credential volume selection with the
-configured Codex home. A plain container restart does not apply mount or
-environment changes. No credential copying is required.
+Only `auth.json` is mounted into agent containers at `/root/.codex/auth.json`.
+The worker and checks receive no Codex credential mount. Each agent has its own
+remaining Codex state, including configuration, history, sessions and caches:
 
-Once the stack shares that directory, signing into another account in the same
-Codex home takes effect for newly launched Codex processes without a stack
-restart. Changing the home directory itself requires `donkeyspace up` to apply
-the new mount. Already-running Codex processes may retain their previous login.
+- **API key:** read-only credential mount and shared file lock, allowing parallel
+  jobs. Prefer a dedicated project key for automation.
+- **ChatGPT:** writable credential mount and exclusive file lock for the entire
+  agent command. Jobs sharing this login serialize so token refresh writes persist
+  before another job reads the file. Cancellation releases ownership when its
+  container is removed. This reduces throughput compared with API-key jobs.
 
-For manual Compose deployments, set `DONKEYSPACE_CODEX_HOME_SOURCE` to an
-absolute host directory and use `DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX=:z` on
-SELinux hosts. With no source configured, both the worker and plugin jobs use
-the `donkeyspace-codex-home` named volume. Standalone workers still accept the
-legacy `DONKEYSPACE_CODEX_VOLUME` setting when no explicit source is provided.
+The TUI displays saved account metadata without requesting a token refresh or
+starting an agent run. Lookups use the dedicated home, refresh periodically, and
+show `account unavailable` on failure or while a subscription job/login owns the
+credential file. Login status does not verify provider availability.
+
+Schema versions 1–8 migrate to version 9. An old `codex_home` remains recorded
+but cannot be used for agent execution until explicitly reconnected. To upgrade:
+
+1. Let active work finish and stop the old stack with `donkeyspace down`.
+2. Use the updated CLI to connect dedicated automation authentication as above.
+   Old personal credentials and legacy volumes remain untouched.
+3. Run `donkeyspace up` with the updated source and plugin checkout to rebuild and
+   recreate the stack. A container restart alone does not apply the new mounts or
+   environment. Use fresh runs for the new plugin graph.
+
+Drain and stop the worker before changing login method, reconnecting, or replacing
+`auth.json`. The CLI refuses login while the file is locked by an active job;
+this is an additional guard, not a substitute for draining. Do not replace the
+credential inode underneath waiting/running containers or share this login with
+other tools that do not honor its lock.
+
+For manual Compose deployments, first create a dedicated host directory with
+mode `0700` and log in using that explicit `CODEX_HOME` with
+`-c cli_auth_credentials_store='"file"'`. Restrict `auth.json` to mode `0600`.
+Set `DONKEYSPACE_CODEX_AUTH_SOURCE` to its absolute, existing file path and
+`DONKEYSPACE_CODEX_AUTH_METHOD` to `api-key` or `chatgpt`. Set
+`DONKEYSPACE_CODEX_AUTH_MOUNT_SUFFIX=:z` on SELinux hosts. Named credential
+volumes and the old `DONKEYSPACE_CODEX_HOME_SOURCE` / `DONKEYSPACE_CODEX_VOLUME`
+settings are no longer authentication sources; legacy-only configurations fail
+with reconnection instructions instead of falling back to personal credentials.
+
+Authenticated execution images require `/bin/sh` and `flock`. Their configured
+commands must work directly without an image entrypoint, because the coordinator
+wraps them to hold the credential lock. Single-file persistence was verified with
+Codex 0.130.0 in the built-in execution image. Recheck this compatibility when
+updating Codex or selecting a different execution image:
+a storage implementation that replaces the file with an atomic rename cannot
+write through this mount. Missing, corrupt or incompatible credentials require
+explicit reconnection; they are never reconstructed from personal state.
+
+Agents and their commands can read their assigned automation credential; ChatGPT
+jobs can also modify it. This is narrower credential delivery, not a credential
+proxy or protection against disclosure by authorized agent code. See
+[execution isolation](execution-isolation.md) for the full boundary.
 
 Direct OpenAI-compatible triage settings remain an advanced runtime option and
 are not required during setup.
-
-In the TUI, ChatGPT login temporarily restores the normal terminal while Codex
-owns the browser interaction, then returns to the full-screen interface and
-checks login status. API-key input is masked and piped directly to Codex; it is
-cleared from UI state and never written to instance configuration.
 
 ## Plugins
 

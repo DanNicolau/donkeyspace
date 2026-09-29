@@ -1,11 +1,16 @@
 pub mod cancellation;
 pub mod container_executions;
 pub mod execution_recovery;
+pub mod ingress;
+pub mod lifecycle_checkpoints;
+pub mod repository_label_sync;
+pub mod repository_retirement;
+pub mod workflow_blockers;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-pub use sqlx::PgPool;
+pub use sqlx::{Acquire, PgConnection, PgPool, Postgres};
 use sqlx::{FromRow, postgres::PgPoolOptions};
 use std::time::Duration;
 use thiserror::Error;
@@ -13,6 +18,14 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum DbError {
+    #[error(
+        "repository selection is empty; refusing to retire stored work without an explicit selection"
+    )]
+    EmptyRepositorySelection,
+    #[error("workflow changed during event preparation; retry this delivery")]
+    StaleAdmission,
+    #[error("lifecycle checkpoint revision changed; execution must stop")]
+    CheckpointConflict,
     #[error("workflow execution was cancelled or superseded")]
     ExecutionCancelled,
     #[error("database url is empty")]
@@ -81,6 +94,21 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../../migrations/0006_execution_recovery.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0007_lifecycle_checkpoints.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0008_repository_label_sync.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0009_repository_retirement.sql"
     ))
     .execute(&mut *transaction)
     .await?;
@@ -472,6 +500,7 @@ pub struct GitHubIngressDeliveryStats {
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ManagedPullRequestRecord {
     pub workflow_item_id: i64,
+    pub generation: i64,
     pub pr_number: i64,
     pub title: String,
     pub html_url: String,
@@ -603,8 +632,8 @@ pub async fn upsert_workflow_item(
     Ok(id)
 }
 
-pub async fn get_workflow_item_state(
-    pool: &PgPool,
+pub async fn get_workflow_item_state<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     repository_id: i64,
     provider_issue_id: &str,
 ) -> Result<Option<String>, DbError> {
@@ -644,8 +673,8 @@ pub async fn get_workflow_item_state(
     Ok(state)
 }
 
-pub async fn get_workflow_item_by_issue_number(
-    pool: &PgPool,
+pub async fn get_workflow_item_by_issue_number<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     repository_id: i64,
     issue_number: i64,
 ) -> Result<Option<WorkflowItemIssueRecord>, DbError> {
@@ -665,8 +694,8 @@ pub async fn get_workflow_item_by_issue_number(
     Ok(item)
 }
 
-pub async fn latest_workflow_job_input(
-    pool: &PgPool,
+pub async fn latest_workflow_job_input<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: i64,
 ) -> Result<Option<Value>, DbError> {
     let input = sqlx::query_scalar::<_, Value>(
@@ -688,7 +717,10 @@ pub async fn latest_workflow_job_input(
     Ok(input)
 }
 
-pub async fn upsert_pull_request(pool: &PgPool, input: &PullRequestInput) -> Result<i64, DbError> {
+pub async fn upsert_pull_request<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
+    input: &PullRequestInput,
+) -> Result<i64, DbError> {
     let id = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO pull_requests (
@@ -740,8 +772,8 @@ pub async fn upsert_pull_request(pool: &PgPool, input: &PullRequestInput) -> Res
     Ok(id)
 }
 
-pub async fn list_open_managed_pull_requests_for_base(
-    pool: &PgPool,
+pub async fn list_open_managed_pull_requests_for_base<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     repository_id: i64,
     base_ref: &str,
 ) -> Result<Vec<ManagedPullRequestRecord>, DbError> {
@@ -749,6 +781,7 @@ pub async fn list_open_managed_pull_requests_for_base(
         r#"
         SELECT
             workflow_item_id,
+            generation,
             pr_number,
             title,
             html_url,
@@ -775,8 +808,8 @@ pub async fn list_open_managed_pull_requests_for_base(
     Ok(rows)
 }
 
-pub async fn repair_job_exists_for_pr_base(
-    pool: &PgPool,
+pub async fn repair_job_exists_for_pr_base<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: i64,
     pr_number: i64,
     head_sha: Option<&str>,
@@ -812,8 +845,8 @@ pub async fn repair_job_exists_for_pr_base(
     Ok(exists)
 }
 
-pub async fn reviewer_job_exists_for_pr_head(
-    pool: &PgPool,
+pub async fn reviewer_job_exists_for_pr_head<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: i64,
     pr_number: i64,
     head_sha: Option<&str>,
@@ -843,8 +876,8 @@ pub async fn reviewer_job_exists_for_pr_head(
     Ok(exists)
 }
 
-pub async fn record_webhook_delivery(
-    pool: &PgPool,
+pub async fn record_webhook_delivery<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     repository_id: Option<i64>,
     delivery_id: &str,
     event_name: &str,
@@ -868,7 +901,10 @@ pub async fn record_webhook_delivery(
     Ok(inserted)
 }
 
-pub async fn webhook_delivery_exists(pool: &PgPool, delivery_id: &str) -> Result<bool, DbError> {
+pub async fn webhook_delivery_exists<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
+    delivery_id: &str,
+) -> Result<bool, DbError> {
     Ok(sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE delivery_id = $1)",
     )
@@ -936,8 +972,8 @@ pub async fn github_ingress_delivery_stats(
     .await?)
 }
 
-pub async fn record_engagement_decision(
-    pool: &PgPool,
+pub async fn record_engagement_decision<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     input: &EngagementDecisionInput,
 ) -> Result<EngagementDecisionRecord, DbError> {
     Ok(sqlx::query_as::<_, EngagementDecisionRecord>(
@@ -1006,8 +1042,8 @@ pub async fn record_github_managed_resource_for_workflow_item(
     Ok(())
 }
 
-pub async fn github_managed_resource_exists(
-    pool: &PgPool,
+pub async fn github_managed_resource_exists<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     repository_id: i64,
     resource_kind: &str,
     provider_id: &str,
@@ -1027,8 +1063,8 @@ pub async fn github_managed_resource_exists(
     .await?)
 }
 
-pub async fn pending_outbound_comment_exists(
-    pool: &PgPool,
+pub async fn pending_outbound_comment_exists<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: i64,
     body: &str,
 ) -> Result<bool, DbError> {
@@ -1049,8 +1085,8 @@ pub async fn pending_outbound_comment_exists(
     .await?)
 }
 
-pub async fn create_job(
-    pool: &PgPool,
+pub async fn create_job<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: Option<i64>,
     role: &str,
     input: &Value,
@@ -1058,8 +1094,8 @@ pub async fn create_job(
     create_job_with_retry_of(pool, workflow_item_id, None, role, input).await
 }
 
-pub async fn active_job_exists_for_workflow_item(
-    pool: &PgPool,
+pub async fn active_job_exists_for_workflow_item<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: i64,
 ) -> Result<bool, DbError> {
     Ok(sqlx::query_scalar::<_, bool>(
@@ -1081,8 +1117,8 @@ pub async fn active_job_exists_for_workflow_item(
 /// The coordinator keeps its UUID so its durable workspace and checkpoint can
 /// be reused. The new webhook payload becomes the run input and is marked as a
 /// resume so the worker does not replace the retained checkout.
-pub async fn resume_latest_paused_job(
-    pool: &PgPool,
+pub async fn resume_latest_paused_job<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: i64,
     input: &Value,
 ) -> Result<Option<JobRecord>, DbError> {
@@ -1195,8 +1231,8 @@ pub async fn requeue_failed_job(pool: &PgPool, id: Uuid) -> Result<bool, DbError
         == 1)
 }
 
-async fn create_job_with_retry_of(
-    pool: &PgPool,
+async fn create_job_with_retry_of<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     workflow_item_id: Option<i64>,
     retry_of_job_id: Option<Uuid>,
     role: &str,
@@ -1243,6 +1279,7 @@ pub async fn list_ready_developer_candidates(
             LIMIT 1
         ) AS latest_triage ON true
         WHERE workflow_items.current_state = 'ready'
+          AND workflow_repository_tracked(workflow_items.id)
           AND workflow_items.provider_state <> 'closed'
           AND COALESCE(latest_triage.input #>> '{issue,state}', 'open') <> 'closed'
           AND NOT EXISTS (
@@ -1284,10 +1321,13 @@ pub async fn list_repair_candidates(
             pull_requests.base_sha,
             latest_input.input AS input
         FROM pull_requests
+        JOIN workflow_items w ON w.id=pull_requests.workflow_item_id
+        JOIN repositories r ON r.id=w.repository_id
         JOIN LATERAL (
             SELECT jobs.input
             FROM jobs
             WHERE jobs.workflow_item_id = pull_requests.workflow_item_id
+              AND jobs.generation = w.generation
               AND jobs.role IN ('developer', 'triage')
             ORDER BY
               CASE WHEN role = 'developer' THEN 0 ELSE 1 END,
@@ -1295,6 +1335,9 @@ pub async fn list_repair_candidates(
             LIMIT 1
         ) AS latest_input ON true
         WHERE pull_requests.workflow_item_id IS NOT NULL
+          AND w.provider_state <> 'closed'
+          AND pull_requests.generation = w.generation
+          AND r.retired_at IS NULL
           AND pull_requests.state = 'open'
           AND pull_requests.managed_by_donkeyspace = true
           AND NOT EXISTS (
@@ -1326,6 +1369,26 @@ pub async fn list_repair_candidates(
 
 pub async fn record_state_transition(
     pool: &PgPool,
+    workflow_item_id: i64,
+    job_id: Option<Uuid>,
+    from_state: Option<&str>,
+    to_state: &str,
+    reason: &str,
+) -> Result<(), DbError> {
+    let mut connection = pool.acquire().await?;
+    record_state_transition_on(
+        &mut connection,
+        workflow_item_id,
+        job_id,
+        from_state,
+        to_state,
+        reason,
+    )
+    .await
+}
+
+pub async fn record_state_transition_on(
+    pool: &mut sqlx::PgConnection,
     workflow_item_id: i64,
     job_id: Option<Uuid>,
     from_state: Option<&str>,
@@ -1377,8 +1440,16 @@ pub async fn record_lifecycle_event(
     pool: &PgPool,
     input: &LifecycleEventInput,
 ) -> Result<Option<LifecycleEventRecord>, DbError> {
+    let mut connection = pool.acquire().await?;
+    record_lifecycle_event_on(&mut connection, input).await
+}
+
+pub async fn record_lifecycle_event_on(
+    pool: &mut sqlx::PgConnection,
+    input: &LifecycleEventInput,
+) -> Result<Option<LifecycleEventRecord>, DbError> {
     if let Some(job) = input.coordinator_job_id.or(input.job_id)
-        && !cancellation::job_execution_allowed(pool, job).await?
+        && !cancellation::job_execution_allowed(&mut *pool, job).await?
     {
         return Ok(None);
     }
@@ -1419,12 +1490,12 @@ pub async fn record_lifecycle_event(
     .bind(&input.reason)
     .bind(&input.handoff_target)
     .bind(&input.links)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *pool)
     .await?)
 }
 
-pub async fn create_outbound_action(
-    pool: &PgPool,
+pub async fn create_outbound_action<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     input: &OutboundActionInput,
 ) -> Result<OutboundActionRecord, DbError> {
     let action = sqlx::query_as::<_, OutboundActionRecord>(
@@ -1613,7 +1684,11 @@ pub async fn retry_projected_work_items(
     Ok(sqlx::query(
         r#"UPDATE projected_work_items SET sync_status = 'pending', retry_count = 0,
                next_attempt_at = now(), last_error = NULL, updated_at = now()
-           WHERE coordinator_job_id = $1 AND sync_status <> 'applied'"#,
+           WHERE coordinator_job_id = $1 AND sync_status IN ('pending','failed')
+             AND workflow_repository_tracked(workflow_item_id)
+             AND EXISTS (SELECT 1 FROM jobs j JOIN workflow_items w ON w.id=j.workflow_item_id
+                 WHERE j.id=projected_work_items.coordinator_job_id AND j.generation=w.generation
+                 AND w.provider_state<>'closed' AND j.status NOT IN ('cancel_requested','cancelled'))"#,
     )
     .bind(coordinator_job_id)
     .execute(pool)
@@ -1621,8 +1696,8 @@ pub async fn retry_projected_work_items(
     .rows_affected())
 }
 
-pub async fn upsert_approval_request(
-    pool: &PgPool,
+pub async fn upsert_approval_request<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     input: &ApprovalRequestInput,
 ) -> Result<ApprovalRequestRecord, DbError> {
     Ok(sqlx::query_as::<_, ApprovalRequestRecord>(
@@ -1668,8 +1743,8 @@ pub async fn list_approval_requests_for_run(
     .await?)
 }
 
-pub async fn transition_approval_request(
-    pool: &PgPool,
+pub async fn transition_approval_request<'a>(
+    pool: impl sqlx::Executor<'a, Database = Postgres>,
     coordinator_job_id: Uuid,
     target_task: &str,
     target_work_item: Option<&str>,
@@ -1784,6 +1859,10 @@ pub async fn retry_agent_publication(pool: &PgPool, id: i64) -> Result<bool, DbE
         SET status = 'pending', retry_count = 0, next_attempt_at = now(),
             last_error = NULL, updated_at = now()
         WHERE id = $1 AND status = 'failed'
+          AND workflow_repository_tracked(workflow_item_id)
+          AND EXISTS (SELECT 1 FROM jobs j JOIN workflow_items w ON w.id=j.workflow_item_id
+              WHERE j.id=agent_publications.coordinator_job_id AND j.generation=w.generation
+              AND w.provider_state<>'closed' AND j.status NOT IN ('cancel_requested','cancelled'))
         "#,
     )
     .bind(id)
@@ -2003,6 +2082,8 @@ pub async fn mark_outbound_action_failed(
         UPDATE outbound_actions
         SET status = 'failed',
             last_error = $2,
+            retry_count = retry_count + 1,
+            next_attempt_at = now() + make_interval(secs => LEAST(900, 30 * power(2, LEAST(retry_count, 8)))::int),
             updated_at = now()
         WHERE id = $1
         "#,

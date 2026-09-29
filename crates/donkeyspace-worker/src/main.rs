@@ -1,3 +1,4 @@
+use crate::trusted_git::run as run_git;
 use clap::Parser;
 use donkeyspace_core::policy::RequiredCommand;
 use donkeyspace_core::{
@@ -9,31 +10,30 @@ use donkeyspace_db::{
     CommandResultInput, DbConfig, JobRecord, LifecycleEventInput, OutboundActionInput,
     OutboundActionRecord, acquire_next_queued_job, apply_migrations, complete_job, connect,
     create_command_result, create_job, create_outbound_action, fail_active_plugin_child_jobs,
-    fail_job, get_job, list_github_repositories, list_github_repositories_for_installation,
-    list_pending_agent_publications, list_pending_outbound_actions,
+    fail_job, get_job, list_pending_agent_publications, list_pending_outbound_actions,
     list_ready_developer_candidates, list_repair_candidates, mark_job_running,
-    mark_outbound_action_completed, mark_outbound_action_failed, pause_job, record_lifecycle_event,
+    mark_outbound_action_completed, mark_outbound_action_failed, record_lifecycle_event,
     record_state_transition, set_checkpoint_pull_request, unpublished_agent_publications_exist,
 };
 use donkeyspace_github::{
     GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubCredentialProvider,
 };
-use donkeyspace_runner::{AgentCommand, AgentCommandStatus, read_run_result, run_agent_command};
+use donkeyspace_runner::AgentCommandStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::OnceLock,
     time::Duration,
 };
-use tokio::fs as tokio_fs;
-use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cancellation;
+mod checkout_recovery;
+#[cfg(test)]
+mod execution_isolation_tests;
 mod execution_recovery;
 mod llm_triage;
 mod plugin_container;
@@ -42,6 +42,9 @@ mod plugin_input;
 mod plugin_task_graph;
 mod publication;
 mod repo_context;
+mod repository_files;
+mod repository_maintenance;
+mod trusted_git;
 
 use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
 use publication::{
@@ -50,7 +53,7 @@ use publication::{
 };
 use repo_context::{
     RepoContextConfig, build_repository_context, cleanup_repository_context,
-    enrich_input_with_repository_context, workspace_path, write_askpass_script,
+    enrich_input_with_repository_context, workspace_path,
 };
 
 static GITHUB_AUTH: OnceLock<GitHubCredentialProvider> = OnceLock::new();
@@ -181,7 +184,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = load_policy()?;
     if deployment_mode == DeploymentMode::Minimal
         && (policy.lifecycle.plugin.is_some()
-            || policy.agents.developer.plugin.is_some()
             || [
                 "DONKEYSPACE_GITHUB_AUTH_MODE",
                 "DONKEYSPACE_GITHUB_APP_ID",
@@ -219,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let triage_config = LlmTriageConfig {
-        provider: TriageProvider::parse(&args.triage_provider),
+        provider: TriageProvider::parse(&args.triage_provider)?,
         base_url: args.llm_base_url.clone(),
         api_key: non_empty_string(args.llm_api_key.clone())
             .or_else(|| non_empty_string(env::var("OPENROUTER_API_KEY").ok())),
@@ -275,6 +277,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| error as Box<dyn std::error::Error>);
     }
 
+    let configured_repositories = donkeyspace_core::repository::RepositoryName::parse_list(
+        &env::var("DONKEYSPACE_GITHUB_REPOSITORIES").unwrap_or_default(),
+    )?;
+
+    if github_auth.is_some() && configured_repositories.is_empty() {
+        return Err(
+            "GitHub authentication requires an explicit DONKEYSPACE_GITHUB_REPOSITORIES selection"
+                .into(),
+        );
+    }
+
     // Keep recovery alive even while the main loop is awaiting an agent.
     // Runtime shutdown aborts this task; each pass is bounded and retryable.
     let _recovery = pool.as_ref().map(|pool| {
@@ -283,8 +296,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             policy.workflow.state_labels.clone(),
         ))
     });
-
-    let mut label_synced_repositories = HashSet::new();
 
     if args.once {
         if let Some(pool) = &pool {
@@ -299,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 triage_client.as_ref(),
                 &repo_context_config,
                 github_token.as_deref(),
-                &mut label_synced_repositories,
+                &configured_repositories,
                 &args.worker_id,
                 args.lease_seconds,
                 args.ready_reconcile_limit,
@@ -324,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 triage_client.as_ref(),
                 &repo_context_config,
                 github_token.as_deref(),
-                &mut label_synced_repositories,
+                &configured_repositories,
                 &args.worker_id,
                 args.lease_seconds,
                 args.ready_reconcile_limit,
@@ -346,12 +357,15 @@ async fn poll_once(
     triage_client: Option<&OpenAiTriageClient>,
     repo_context_config: &RepoContextConfig,
     github_token: Option<&str>,
-    label_synced_repositories: &mut HashSet<String>,
+    configured_repositories: &[donkeyspace_core::repository::RepositoryName],
     worker_id: &str,
     lease_seconds: i32,
     ready_reconcile_limit: i64,
     repair_reconcile_limit: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !configured_repositories.is_empty() {
+        donkeyspace_db::repository_retirement::reconcile(pool, configured_repositories).await?;
+    }
     donkeyspace_db::cancellation::reconcile_closed_workflows(
         pool,
         &policy
@@ -394,7 +408,18 @@ async fn poll_once(
     if let Some(github_token) = github_token.filter(|token| !token.trim().is_empty()) {
         process_pending_publications(pool, github_token, repo_context_config).await?;
         let client = configured_github_client(github_token)?;
-        ensure_policy_labels(pool, policy, &client, label_synced_repositories).await?;
+        repository_maintenance::synchronize_labels(
+            pool,
+            configured_repositories,
+            &policy_managed_labels(policy),
+            async |repository, labels| {
+                client
+                    .ensure_labels(&repository.owner, &repository.name, labels)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await?;
         process_outbound_actions(pool, &client).await?;
     } else {
         tracing::debug!("DONKEYSPACE_GITHUB_TOKEN is unset; outbound actions remain pending");
@@ -409,9 +434,8 @@ async fn process_pending_publications(
     repo_context_config: &RepoContextConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for publication in list_pending_agent_publications(pool, 20).await? {
-        let workspace = workspace_path(publication.coordinator_job_id, repo_context_config);
         let push_succeeded = if let Err(error) =
-            push_existing_publication(pool, Some(github_token), &workspace, &publication).await
+            push_existing_publication(pool, Some(github_token), &publication).await
         {
             tracing::warn!(publication_id = publication.id, %error, "agent publication failed");
             false
@@ -427,7 +451,8 @@ async fn process_pending_publications(
                 .await?
                 .is_some_and(|job| matches!(job.status.as_str(), "completed" | "failed"))
         {
-            let _ = cleanup_repository_context(publication.coordinator_job_id, repo_context_config);
+            cleanup_published_workspace(pool, publication.coordinator_job_id, repo_context_config)
+                .await;
         }
     }
     Ok(())
@@ -438,6 +463,23 @@ async fn cleanup_published_workspace(
     coordinator_job_id: uuid::Uuid,
     repo_context_config: &RepoContextConfig,
 ) {
+    // A coordinator can fail before registering a publication (for example
+    // while committing a task wave). No pending publication is not proof that
+    // its task output and diagnostics have been preserved.
+    match get_job(pool, coordinator_job_id).await {
+        Ok(Some(job))
+            if job.status == "failed"
+                && job.input.get("donkeyspace_lifecycle_coordinator") == Some(&json!(true)) =>
+        {
+            tracing::warn!(job_id = %coordinator_job_id, "preserving failed lifecycle workspace for recovery and diagnostics");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(job_id = %coordinator_job_id, %error, "could not determine lifecycle cleanup state; preserving workspace");
+            return;
+        }
+        _ => {}
+    }
     match unpublished_agent_publications_exist(pool, coordinator_job_id).await {
         Ok(false) => {
             let _ = cleanup_repository_context(coordinator_job_id, repo_context_config);
@@ -452,43 +494,6 @@ async fn cleanup_published_workspace(
             "could not determine publication cleanup state; preserving workspace"
         ),
     }
-}
-
-async fn ensure_policy_labels(
-    pool: &donkeyspace_db::PgPool,
-    policy: &Policy,
-    client: &GitHubClient,
-    label_synced_repositories: &mut HashSet<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let labels = policy_managed_labels(policy);
-    if labels.is_empty() {
-        return Ok(());
-    }
-
-    let repositories = match env::var("DONKEYSPACE_GITHUB_INSTALLATION_ID") {
-        Ok(installation_id) if !installation_id.trim().is_empty() => {
-            list_github_repositories_for_installation(pool, &installation_id).await?
-        }
-        _ => list_github_repositories(pool).await?,
-    };
-    for repository in repositories {
-        let sync_key = format!("{}/{}", repository.owner, repository.name);
-        if label_synced_repositories.contains(&sync_key) {
-            continue;
-        }
-
-        client
-            .ensure_labels(&repository.owner, &repository.name, &labels)
-            .await?;
-        label_synced_repositories.insert(sync_key.clone());
-        tracing::info!(
-            repository = sync_key,
-            label_count = labels.len(),
-            "ensured donkeyspace github labels"
-        );
-    }
-
-    Ok(())
 }
 
 fn policy_managed_labels(policy: &Policy) -> Vec<String> {
@@ -688,6 +693,7 @@ async fn execute_job(
     match running_job.role.as_str() {
         "triage" => {
             let repository_context = match build_repository_context(
+                pool,
                 &running_job.input,
                 running_job.id,
                 github_token,
@@ -716,7 +722,7 @@ async fn execute_job(
                 enrich_input_with_repository_context(&running_job.input, repository_context);
 
             let triage_result = if *triage_provider == TriageProvider::Agent {
-                run_agent_triage(
+                run_configured_agent(
                     pool,
                     policy,
                     &running_job,
@@ -724,6 +730,7 @@ async fn execute_job(
                     repo_context_config,
                 )
                 .await
+                .map(|result| (result, "external triage agent completed"))
             } else {
                 run_triage(triage_client, &enriched_input).await
             };
@@ -953,10 +960,7 @@ async fn execute_developer_job(
         .await?;
         return Ok(());
     }
-    if lifecycle_selection.is_none()
-        && policy.agents.developer.command.is_empty()
-        && policy.agents.developer.plugin.is_none()
-    {
+    if lifecycle_selection.is_none() && policy.agents.developer.command.is_empty() {
         fail_role_job(
             pool,
             &running_job,
@@ -1060,6 +1064,7 @@ async fn execute_developer_job(
     }
 
     let repository_context = match build_repository_context(
+        pool,
         &running_job.input,
         running_job.id,
         github_token,
@@ -1069,6 +1074,41 @@ async fn execute_developer_job(
     {
         Ok(context) => context,
         Err(error) => {
+            if lifecycle_selection.is_some()
+                && running_job
+                    .input
+                    .pointer("/donkeyspace_resume")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            {
+                let mut result =
+                    role_failure_result("Lifecycle recovery needs attention.", &error.to_string());
+                let checkpoint = donkeyspace_db::lifecycle_checkpoints::load(pool, running_job.id)
+                    .await
+                    .ok()
+                    .flatten();
+                result.outcome = if checkpoint
+                    .as_ref()
+                    .and_then(|c| c.state.pointer("/last_result/outcome"))
+                    .and_then(Value::as_str)
+                    == Some("needs_info")
+                {
+                    Outcome::NeedsInfo
+                } else {
+                    Outcome::NeedsHuman
+                };
+                result.human_review_reason = Some(error.to_string());
+                result.questions.push("Restore the recorded checkpoint revision, then repeat the pending approval or clarification; alternatively start a new run with renewed approval.".into());
+                stop_role_job(
+                    pool,
+                    &running_job,
+                    &result,
+                    true,
+                    "lifecycle recovery blocked; accepted state retained",
+                )
+                .await?;
+                return Ok(());
+            }
             fail_role_job(
                 pool,
                 &running_job,
@@ -1098,48 +1138,56 @@ async fn execute_developer_job(
         workspace_path: &publication_workspace,
         token: github_token,
     };
-    if let Err(error) = publish_checkpoint(
-        &publication_context,
-        &repository_checkout_path(&repository_context)?,
-        &format!(
-            "chore({}): start issue #{}",
-            active_facade().command,
-            publication_context.issue_number
-        ),
-    )
-    .await
+    if running_job
+        .input
+        .pointer("/donkeyspace_resume")
+        .and_then(Value::as_bool)
+        != Some(true)
     {
-        tracing::warn!(job_id = %running_job.id, %error, "initial issue branch publication failed");
+        if let Err(error) = publish_checkpoint(
+            &publication_context,
+            &repository_checkout_path(&repository_context)?,
+            &format!(
+                "chore({}): start issue #{}",
+                active_facade().command,
+                publication_context.issue_number
+            ),
+            &[],
+        )
+        .await
+        {
+            tracing::warn!(job_id = %running_job.id, %error, "initial issue branch publication failed");
+        }
     }
     let plugin_github_client = github_token
         .filter(|token| !token.trim().is_empty())
         .map(configured_github_client)
         .transpose()?;
-    let developer_result =
-        if let Some(selection) = lifecycle_selection.or(policy.agents.developer.plugin.as_ref()) {
-            plugin_flow::run(
-                selection,
-                &repository_checkout_path(&repository_context)?,
-                &workspace_path(running_job.id, repo_context_config),
-                &enriched_input,
-                Some(plugin_flow::LifecycleTracking {
-                    pool,
-                    coordinator: &running_job,
-                    github: plugin_github_client.as_ref(),
-                    publication: Some(publication_context),
-                }),
-            )
-            .await
-        } else {
-            run_agent_developer(
+    let developer_result = if let Some(selection) = lifecycle_selection {
+        plugin_flow::run(
+            selection,
+            &repository_checkout_path(&repository_context)?,
+            &workspace_path(running_job.id, repo_context_config),
+            &enriched_input,
+            Some(plugin_flow::LifecycleTracking {
                 pool,
                 policy,
-                &running_job,
-                &enriched_input,
-                repo_context_config,
-            )
-            .await
-        };
+                coordinator: &running_job,
+                github: plugin_github_client.as_ref(),
+                publication: Some(publication_context),
+            }),
+        )
+        .await
+    } else {
+        run_configured_agent(
+            pool,
+            policy,
+            &running_job,
+            &enriched_input,
+            repo_context_config,
+        )
+        .await
+    };
 
     let mut result = match developer_result {
         Ok(result) => result,
@@ -1216,6 +1264,15 @@ async fn execute_developer_job(
         }
     };
 
+    // Human pauses committed by the plugin must not be overwritten. A new
+    // approval may have requeued it by now; never overwrite that newer state.
+    if lifecycle_selection.is_some()
+        && matches!(result.outcome, Outcome::NeedsHuman | Outcome::NeedsInfo)
+    {
+        queue_lifecycle_status_for_job(pool, &running_job).await?;
+        return Ok(());
+    }
+
     if result.outcome != Outcome::Implemented {
         if lifecycle_selection.is_none() {
             publish_job_attempt(
@@ -1231,13 +1288,8 @@ async fn execute_developer_job(
         }
         let result_value = serde_json::to_value(&result)?;
         let workflow_state = workflow_state_for_outcome(result.outcome);
-        let paused = result.outcome == Outcome::NeedsHuman && lifecycle_selection.is_some();
-        if paused {
-            pause_job(pool, running_job.id, &result_value).await?;
-        } else {
-            complete_job(pool, running_job.id, &result_value).await?;
-            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
-        }
+        complete_job(pool, running_job.id, &result_value).await?;
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
             update_workflow_state_for_job(
@@ -1272,18 +1324,6 @@ async fn execute_developer_job(
                 )
                 .await?;
             }
-            if paused {
-                record_coordinator_event(
-                    pool,
-                    &running_job,
-                    "approval_required",
-                    "The workflow is waiting for a human decision.",
-                    result.human_review_reason.as_deref(),
-                    Some(result.outcome),
-                    json!([]),
-                )
-                .await?;
-            }
         }
 
         queue_lifecycle_status_for_job(pool, &running_job).await?;
@@ -1291,7 +1331,6 @@ async fn execute_developer_job(
         tracing::info!(
             job_id = %running_job.id,
             outcome = ?result.outcome,
-            paused,
             "implementation job stopped without implementation"
         );
         return Ok(());
@@ -1409,13 +1448,12 @@ async fn execute_developer_job(
         None => conventional_commit_title(&running_job.input, &changed_files),
     };
     let commit_body = developer_commit_body(&running_job, &result, &changed_files);
-    let workspace = workspace_path(running_job.id, repo_context_config);
     if let Err(error) = cancellation::side_effect(
         pool,
         running_job.id,
         push_developer_branch(
             &repo_path,
-            &workspace,
+            &repository_remote(&running_job.input)?,
             github_token,
             &uncommitted_files,
             &branch_name,
@@ -1446,7 +1484,9 @@ async fn execute_developer_job(
         cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         return Ok(());
     }
-    if let Err(error) = publish_checkpoint(&publication_context, &repo_path, &commit_title).await {
+    if let Err(error) =
+        publish_checkpoint(&publication_context, &repo_path, &commit_title, &[]).await
+    {
         tracing::warn!(job_id = %running_job.id, %error, "final issue branch publication record failed");
     }
 
@@ -1626,6 +1666,7 @@ async fn execute_reviewer_job(
     }
 
     let (enriched_input, repository_context) = match prepare_reviewer_input(
+        pool,
         &running_job.input,
         running_job.id,
         github_token,
@@ -1649,7 +1690,7 @@ async fn execute_reviewer_job(
         }
     };
 
-    let reviewer_result = run_agent_reviewer(
+    let reviewer_result = run_configured_agent(
         pool,
         policy,
         &running_job,
@@ -1779,6 +1820,7 @@ async fn execute_repair_job(
     }
 
     let repair_input = match prepare_repair_input(
+        pool,
         &running_job.input,
         running_job.id,
         github_token,
@@ -1875,7 +1917,7 @@ async fn execute_repair_job(
     };
     let repair_repo_path = repository_checkout_path(&repair_input.repository_context)?;
 
-    let repair_result = run_agent_repair(
+    let repair_result = run_configured_agent(
         pool,
         policy,
         &running_job,
@@ -2092,7 +2134,7 @@ async fn execute_repair_job(
         running_job.id,
         push_repair_branch(
             &repo_path,
-            &repair_input.workspace_path,
+            &repository_remote(&running_job.input)?,
             github_token,
             &changed_files,
             &pull_request_head_ref(&running_job.input)?,
@@ -2160,40 +2202,58 @@ async fn fail_role_job(
     blocked_reason: &str,
     transition_reason: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result_value = serde_json::to_value(role_failure_result(summary, blocked_reason))?;
-    fail_job(pool, running_job.id, &result_value).await?;
+    stop_role_job(
+        pool,
+        running_job,
+        &role_failure_result(summary, blocked_reason),
+        false,
+        transition_reason,
+    )
+    .await
+}
 
+async fn stop_role_job(
+    pool: &donkeyspace_db::PgPool,
+    running_job: &JobRecord,
+    result: &RunResult,
+    pause: bool,
+    transition_reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result_value = serde_json::to_value(result)?;
+    if pause {
+        donkeyspace_db::pause_job(pool, running_job.id, &result_value).await?;
+    } else {
+        fail_job(pool, running_job.id, &result_value).await?;
+    }
+    let state = workflow_state_for_outcome(result.outcome);
     if let Some(workflow_item_id) = running_job.workflow_item_id {
-        update_workflow_state_for_job(
-            pool,
-            workflow_item_id,
-            running_job.id,
-            WorkflowState::Blocked.as_str(),
-        )
-        .await?;
+        update_workflow_state_for_job(pool, workflow_item_id, running_job.id, state.as_str())
+            .await?;
         record_state_transition(
             pool,
             workflow_item_id,
             Some(running_job.id),
             None,
-            WorkflowState::Blocked.as_str(),
+            state.as_str(),
             transition_reason,
         )
         .await?;
         record_coordinator_event(
             pool,
             running_job,
-            "workflow_failed",
-            summary,
-            Some(blocked_reason),
-            Some(Outcome::Failed),
+            if pause {
+                "workflow_paused"
+            } else {
+                "workflow_failed"
+            },
+            &result.summary,
+            result.blocked_reason.as_deref(),
+            Some(result.outcome),
             json!([]),
         )
         .await?;
     }
-
     queue_lifecycle_status_for_job(pool, running_job).await?;
-
     Ok(())
 }
 
@@ -2252,200 +2312,66 @@ fn token_usage_exceeded_triage_result() -> RunResult {
     }
 }
 
-async fn run_agent_triage(
-    pool: &donkeyspace_db::PgPool,
-    policy: &Policy,
-    running_job: &JobRecord,
-    input: &Value,
-    repo_context_config: &RepoContextConfig,
-) -> Result<(RunResult, &'static str), Box<dyn std::error::Error>> {
-    if !policy.agents.triage.enabled {
-        return Err("triage agent is disabled by policy".into());
-    }
-    if policy.agents.triage.command.is_empty() {
-        return Err("triage agent command is empty".into());
-    }
-
-    let workspace_path = workspace_path(running_job.id, repo_context_config);
-    let donkeyspace_path = workspace_path.join(".donkeyspace");
-    let input_path = donkeyspace_path.join("run-input.json");
-    let result_path = donkeyspace_path.join("run-result.json");
-    let contract_result_path = ".donkeyspace/run-result.json";
-    tokio_fs::create_dir_all(&donkeyspace_path).await?;
-    let run_input = agent_run_input(
-        running_job.id,
-        &running_job.role,
-        input,
-        contract_result_path,
-    );
-    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
-
-    let command =
-        AgentCommand::from_parts(&policy.agents.triage.command, &workspace_path, &result_path)?;
-    let command_result = run_agent_command(&command).await?;
-    record_agent_command_result(pool, running_job.id, "triage agent", &command_result).await?;
-
-    if command_result.status != AgentCommandStatus::Passed {
-        return Err(format!(
-            "triage agent exited unsuccessfully with code {:?}",
-            command_result.exit_code
-        )
-        .into());
-    }
-
-    Ok((
-        read_run_result(&result_path).await?,
-        "external triage agent completed",
-    ))
-}
-
-async fn run_agent_developer(
+async fn run_configured_agent(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
     running_job: &JobRecord,
     input: &Value,
     repo_context_config: &RepoContextConfig,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
-    let workspace_path = workspace_path(running_job.id, repo_context_config);
-    let donkeyspace_path = workspace_path.join(".donkeyspace");
-    let input_path = donkeyspace_path.join("run-input.json");
-    let result_path = donkeyspace_path.join("run-result.json");
-    let contract_result_path = ".donkeyspace/run-result.json";
-    tokio_fs::create_dir_all(&donkeyspace_path).await?;
-    let run_input = agent_run_input(
+    let role = match running_job.role.as_str() {
+        "triage" => &policy.agents.triage,
+        "developer" => &policy.agents.developer,
+        "reviewer" => &policy.agents.reviewer,
+        "repair" => &policy.agents.repair,
+        other => return Err(format!("unknown built-in agent role `{other}`").into()),
+    };
+    if !role.enabled {
+        return Err(format!("{} agent is disabled by policy", running_job.role).into());
+    }
+    let workspace = workspace_path(running_job.id, repo_context_config);
+    let input = agent_run_input(
         running_job.id,
         &running_job.role,
         input,
-        contract_result_path,
+        ".donkeyspace/run-result.json",
     );
-    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
-
-    let command = AgentCommand::from_parts(
-        &policy.agents.developer.command,
-        &workspace_path,
-        &result_path,
-    )?;
-    let command_result = run_agent_command(&command).await?;
-    record_agent_command_result(pool, running_job.id, "developer agent", &command_result).await?;
-    write_command_logs(&donkeyspace_path, &command_result).await?;
-
-    if command_result.status != AgentCommandStatus::Passed {
-        return Err(format!(
-            "developer agent exited unsuccessfully with code {:?}",
-            command_result.exit_code
-        )
-        .into());
-    }
-
-    Ok(read_run_result(&result_path).await?)
-}
-
-async fn run_agent_reviewer(
-    pool: &donkeyspace_db::PgPool,
-    policy: &Policy,
-    running_job: &JobRecord,
-    input: &Value,
-    repo_context_config: &RepoContextConfig,
-) -> Result<RunResult, Box<dyn std::error::Error>> {
-    let workspace_path = workspace_path(running_job.id, repo_context_config);
-    let donkeyspace_path = workspace_path.join(".donkeyspace");
-    let input_path = donkeyspace_path.join("run-input.json");
-    let result_path = donkeyspace_path.join("run-result.json");
-    let contract_result_path = ".donkeyspace/run-result.json";
-    tokio_fs::create_dir_all(&donkeyspace_path).await?;
-    let run_input = agent_run_input(
-        running_job.id,
-        &running_job.role,
-        input,
-        contract_result_path,
-    );
-    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
-
-    let command = AgentCommand::from_parts(
-        &policy.agents.reviewer.command,
-        &workspace_path,
-        &result_path,
-    )?;
-    let command_result = run_agent_command(&command).await?;
-    record_agent_command_result(pool, running_job.id, "reviewer agent", &command_result).await?;
-
-    if command_result.status != AgentCommandStatus::Passed {
-        return Err(format!(
-            "reviewer agent exited unsuccessfully with code {:?}",
-            command_result.exit_code
-        )
-        .into());
-    }
-
-    Ok(read_run_result(&result_path).await?)
-}
-
-async fn run_agent_repair(
-    pool: &donkeyspace_db::PgPool,
-    policy: &Policy,
-    running_job: &JobRecord,
-    input: &Value,
-    repo_context_config: &RepoContextConfig,
-) -> Result<RunResult, Box<dyn std::error::Error>> {
-    let workspace_path = workspace_path(running_job.id, repo_context_config);
-    let donkeyspace_path = workspace_path.join(".donkeyspace");
-    let input_path = donkeyspace_path.join("run-input.json");
-    let result_path = donkeyspace_path.join("run-result.json");
-    let contract_result_path = ".donkeyspace/run-result.json";
-    tokio_fs::create_dir_all(&donkeyspace_path).await?;
-    let run_input = agent_run_input(
-        running_job.id,
-        &running_job.role,
-        input,
-        contract_result_path,
-    );
-    tokio_fs::write(&input_path, serde_json::to_vec_pretty(&run_input)?).await?;
-
-    let command =
-        AgentCommand::from_parts(&policy.agents.repair.command, &workspace_path, &result_path)?;
-    let command_result = run_agent_command(&command).await?;
-    record_agent_command_result(pool, running_job.id, "repair agent", &command_result).await?;
-    write_command_logs(&donkeyspace_path, &command_result).await?;
-
-    if command_result.status != AgentCommandStatus::Passed {
-        return Err(format!(
-            "repair agent exited unsuccessfully with code {:?}",
-            command_result.exit_code
-        )
-        .into());
-    }
-
-    Ok(read_run_result(&result_path).await?)
-}
-
-async fn write_command_logs(
-    donkeyspace_path: &Path,
-    result: &donkeyspace_runner::AgentCommandResult,
-) -> Result<(), Box<dyn std::error::Error>> {
-    tokio_fs::write(
-        donkeyspace_path.join("agent.stdout.log"),
-        truncate_chars(&result.stdout, 1_000_000),
+    let files = donkeyspace_runner::RunFiles::prepare(&workspace, &input).await?;
+    donkeyspace_runner::write_run_metadata(&workspace, "policy.json", policy).await?;
+    let output = plugin_container::run_builtin(
+        &role.command,
+        &workspace,
+        plugin_container::ExecutionKind::Agent,
     )
     .await?;
-    tokio_fs::write(
-        donkeyspace_path.join("agent.stderr.log"),
-        truncate_chars(&result.stderr, 1_000_000),
+    record_agent_command_result(
+        pool,
+        running_job.id,
+        &format!("{} agent", running_job.role),
+        &output,
     )
     .await?;
-    Ok(())
+    files
+        .write_logs(output.stdout.as_bytes(), output.stderr.as_bytes())
+        .await?;
+    if output.status != AgentCommandStatus::Passed {
+        return Err(format!(
+            "{} agent exited unsuccessfully with code {:?}",
+            running_job.role, output.exit_code
+        )
+        .into());
+    }
+    let result: RunResult = files.read().await?;
+    result.validate_for_orchestration()?;
+    Ok(result)
 }
 
 async fn write_required_check_diagnostics(
     workspace_path: &Path,
     results: &[TestResult],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let donkeyspace_path = workspace_path.join(".donkeyspace");
-    tokio_fs::create_dir_all(&donkeyspace_path).await?;
-    tokio_fs::write(
-        donkeyspace_path.join("required-checks.json"),
-        serde_json::to_vec_pretty(results)?,
-    )
-    .await?;
+    donkeyspace_runner::write_run_metadata(workspace_path, "required-checks.json", &results)
+        .await?;
     Ok(())
 }
 
@@ -2457,16 +2383,16 @@ struct RepairInput {
 }
 
 async fn prepare_repair_input(
+    pool: &donkeyspace_db::PgPool,
     input: &Value,
     job_id: uuid::Uuid,
     github_token: Option<&str>,
     repo_context_config: &RepoContextConfig,
 ) -> Result<RepairInput, Box<dyn std::error::Error>> {
     let mut repository_context =
-        build_repository_context(input, job_id, github_token, repo_context_config).await?;
+        build_repository_context(pool, input, job_id, github_token, repo_context_config).await?;
     let repo_path = repository_checkout_path(&repository_context)?;
-    checkout_pull_request_branch(input, job_id, &repo_path, github_token, repo_context_config)
-        .await?;
+    checkout_pull_request_branch(input, &repo_path, github_token).await?;
 
     if let Value::Object(map) = &mut repository_context {
         map.insert("checkout_ref".to_string(), json!("pull_request_head"));
@@ -2475,7 +2401,7 @@ async fn prepare_repair_input(
     let base_ref = pull_request_base_ref(input).unwrap_or_else(|| repository_default_branch(input));
     fetch_base_branch(
         &repo_path,
-        &workspace_path(job_id, repo_context_config),
+        &repository_remote(input)?,
         &base_ref,
         github_token,
     )
@@ -2524,36 +2450,53 @@ async fn prepare_repair_input(
     })
 }
 
+fn repository_remote(input: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    let owner = input
+        .pointer("/repository/owner/login")
+        .and_then(Value::as_str)
+        .ok_or("input is missing repository owner")?;
+    let repo = input
+        .pointer("/repository/name")
+        .and_then(Value::as_str)
+        .ok_or("input is missing repository name")?;
+    trusted_git::github_remote(owner, repo)
+}
+
 async fn fetch_base_branch(
     repo_path: &Path,
-    workspace_path: &Path,
+    remote: &str,
     base_ref: &str,
     github_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let askpass_path = workspace_path.join("git-askpass.sh");
     let current_token = current_github_token(github_token).await?;
     let token = current_token
         .as_deref()
         .filter(|token| !token.trim().is_empty());
-    if token.is_some() {
-        write_askpass_script(&askpass_path)?;
-    }
-    let askpass = token.map(|_| askpass_path.as_path());
-    run_git(repo_path, &["fetch", "origin", base_ref], token, askpass).await?;
+    run_git(
+        repo_path,
+        &[
+            "fetch",
+            "--",
+            remote,
+            &format!("refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"),
+        ],
+        token,
+    )
+    .await?;
     Ok(())
 }
 
 async fn prepare_reviewer_input(
+    pool: &donkeyspace_db::PgPool,
     input: &Value,
     job_id: uuid::Uuid,
     github_token: Option<&str>,
     repo_context_config: &RepoContextConfig,
 ) -> Result<(Value, Value), Box<dyn std::error::Error>> {
     let mut repository_context =
-        build_repository_context(input, job_id, github_token, repo_context_config).await?;
+        build_repository_context(pool, input, job_id, github_token, repo_context_config).await?;
     let repo_path = repository_checkout_path(&repository_context)?;
-    checkout_pull_request_head(input, job_id, &repo_path, github_token, repo_context_config)
-        .await?;
+    checkout_pull_request_head(input, &repo_path, github_token).await?;
 
     if let Value::Object(map) = &mut repository_context {
         map.insert("checkout_ref".to_string(), json!("pull_request_head"));
@@ -2579,65 +2522,38 @@ async fn prepare_reviewer_input(
 
 async fn checkout_pull_request_head(
     input: &Value,
-    job_id: uuid::Uuid,
     repo_path: &Path,
     github_token: Option<&str>,
-    repo_context_config: &RepoContextConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pr_number =
         pull_request_number(input).ok_or("reviewer input is missing pull request number")?;
-    let workspace = workspace_path(job_id, repo_context_config);
-    let askpass_path = workspace.join("git-askpass.sh");
+    let remote = repository_remote(input)?;
     let current_token = current_github_token(github_token).await?;
     let token = current_token
         .as_deref()
         .filter(|token| !token.trim().is_empty());
-    if token.is_some() {
-        write_askpass_script(&askpass_path)?;
-    }
-    let askpass = token.map(|_| askpass_path.as_path());
     let pr_ref = format!("pull/{pr_number}/head");
-    run_git(repo_path, &["fetch", "origin", &pr_ref], token, askpass).await?;
-    run_git(
-        repo_path,
-        &["checkout", "--detach", "FETCH_HEAD"],
-        None,
-        None,
-    )
-    .await?;
+    run_git(repo_path, &["fetch", "--", &remote, &pr_ref], token).await?;
+    run_git(repo_path, &["checkout", "--detach", "FETCH_HEAD"], None).await?;
     Ok(())
 }
 
 async fn checkout_pull_request_branch(
     input: &Value,
-    job_id: uuid::Uuid,
     repo_path: &Path,
     github_token: Option<&str>,
-    repo_context_config: &RepoContextConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let head_ref = pull_request_head_ref(input)?;
-    let workspace = workspace_path(job_id, repo_context_config);
-    let askpass_path = workspace.join("git-askpass.sh");
+    let remote = repository_remote(input)?;
     let current_token = current_github_token(github_token).await?;
     let token = current_token
         .as_deref()
         .filter(|token| !token.trim().is_empty());
-    if token.is_some() {
-        write_askpass_script(&askpass_path)?;
-    }
-    let askpass = token.map(|_| askpass_path.as_path());
     let head_refspec = format!("refs/heads/{head_ref}");
-    run_git(
-        repo_path,
-        &["fetch", "origin", &head_refspec],
-        token,
-        askpass,
-    )
-    .await?;
+    run_git(repo_path, &["fetch", "--", &remote, &head_refspec], token).await?;
     run_git(
         repo_path,
         &["checkout", "-B", &head_ref, "FETCH_HEAD"],
-        None,
         None,
     )
     .await?;
@@ -2661,14 +2577,7 @@ async fn attempt_base_merge(
     }
     args.push(&base);
 
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
+    let output = trusted_git::output(repo_path, &args, None).await?;
 
     Ok(MergeAttempt {
         success: output.status.success(),
@@ -2681,13 +2590,7 @@ fn merge_refused_unrelated_histories(stderr: &str) -> bool {
 }
 
 async fn git_unmerged_files(repo_path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let output = run_git(
-        repo_path,
-        &["diff", "--name-only", "--diff-filter=U"],
-        None,
-        None,
-    )
-    .await?;
+    let output = run_git(repo_path, &["diff", "--name-only", "--diff-filter=U"], None).await?;
     Ok(output
         .lines()
         .map(str::trim)
@@ -2701,13 +2604,7 @@ async fn git_diff_name_only(
     base_ref: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let base = format!("origin/{base_ref}");
-    let output = run_git(
-        repo_path,
-        &["diff", "--name-only", &base, "HEAD"],
-        None,
-        None,
-    )
-    .await?;
+    let output = run_git(repo_path, &["diff", "--name-only", &base, "HEAD"], None).await?;
     Ok(output
         .lines()
         .map(str::trim)
@@ -2721,7 +2618,7 @@ async fn git_diff_summary(
     base_ref: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let base = format!("origin/{base_ref}");
-    run_git(repo_path, &["diff", "--stat", &base, "HEAD"], None, None).await
+    run_git(repo_path, &["diff", "--stat", &base, "HEAD"], None).await
 }
 
 async fn git_diff_patch(
@@ -2732,7 +2629,6 @@ async fn git_diff_patch(
     run_git(
         repo_path,
         &["diff", "--no-ext-diff", "--unified=80", &base, "HEAD"],
-        None,
         None,
     )
     .await
@@ -2783,9 +2679,13 @@ async fn run_required_command(
         });
     }
 
-    let command =
-        AgentCommand::from_parts(&required.command, repo_path, repo_path.join(".unused"))?;
-    let output = match run_agent_command(&command).await {
+    let output = match plugin_container::run_builtin(
+        &required.command,
+        repo_path,
+        plugin_container::ExecutionKind::Check,
+    )
+    .await
+    {
         Ok(output) => output,
         Err(error) => {
             let summary = format!("required command failed to start or complete: {error}");
@@ -2814,7 +2714,7 @@ async fn run_required_command(
     record_agent_command_result(pool, job_id, &required.name, &output).await?;
     let status = match output.status {
         AgentCommandStatus::Passed => TestStatus::Passed,
-        AgentCommandStatus::Failed | AgentCommandStatus::Cancelled => TestStatus::Failed,
+        AgentCommandStatus::Failed => TestStatus::Failed,
     };
     let summary = command_summary(&output.stdout, &output.stderr);
 
@@ -2862,7 +2762,7 @@ fn repository_checkout_path(context: &Value) -> Result<PathBuf, Box<dyn std::err
 }
 
 async fn git_changed_files(repo_path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let output = run_git(repo_path, &["status", "--porcelain"], None, None).await?;
+    let output = run_git(repo_path, &["status", "--porcelain"], None).await?;
     Ok(parse_porcelain_status(&output))
 }
 
@@ -2881,10 +2781,9 @@ async fn git_changed_files_since(
             "--",
         ],
         None,
-        None,
     )
     .await?;
-    let status = run_git(repo_path, &["status", "--porcelain"], None, None).await?;
+    let status = run_git(repo_path, &["status", "--porcelain"], None).await?;
     let mut files = diff
         .lines()
         .map(str::trim)
@@ -2933,7 +2832,7 @@ async fn publish_job_attempt(
 
 async fn push_developer_branch(
     repo_path: &Path,
-    workspace_path: &Path,
+    remote: &str,
     github_token: Option<&str>,
     uncommitted_files: &[String],
     branch_name: &str,
@@ -2944,42 +2843,33 @@ async fn push_developer_branch(
     let token = current_token
         .as_deref()
         .ok_or("configured GitHub authentication is required to push developer branches")?;
-    let askpass_path = workspace_path.join("git-askpass.sh");
-    write_askpass_script(&askpass_path)?;
 
     configure_git_author(repo_path).await?;
-    let current_branch = run_git(repo_path, &["branch", "--show-current"], None, None).await?;
+    let current_branch = run_git(repo_path, &["branch", "--show-current"], None).await?;
     if current_branch.trim() != branch_name {
-        run_git(repo_path, &["checkout", "-b", branch_name], None, None).await?;
+        run_git(repo_path, &["checkout", "-b", branch_name], None).await?;
     }
     if !uncommitted_files.is_empty() {
         stage_changed_files(repo_path, uncommitted_files).await?;
-        let staged = run_git(repo_path, &["diff", "--cached", "--name-only"], None, None).await?;
+        let staged = run_git(repo_path, &["diff", "--cached", "--name-only"], None).await?;
         if !staged.trim().is_empty() {
             run_git(
                 repo_path,
                 &["commit", "-m", commit_title, "-m", commit_body],
-                None,
                 None,
             )
             .await?;
         }
     }
     let push_ref = format!("HEAD:refs/heads/{branch_name}");
-    run_git(
-        repo_path,
-        &["push", "origin", &push_ref],
-        Some(token),
-        Some(&askpass_path),
-    )
-    .await?;
+    run_git(repo_path, &["push", "--", remote, &push_ref], Some(token)).await?;
 
     Ok(())
 }
 
 async fn push_repair_branch(
     repo_path: &Path,
-    workspace_path: &Path,
+    remote: &str,
     github_token: Option<&str>,
     changed_files: &[String],
     branch_name: &str,
@@ -2990,8 +2880,6 @@ async fn push_repair_branch(
     let token = current_token
         .as_deref()
         .ok_or("configured GitHub authentication is required to push repaired branches")?;
-    let askpass_path = workspace_path.join("git-askpass.sh");
-    write_askpass_script(&askpass_path)?;
 
     configure_git_author(repo_path).await?;
     stage_changed_files(repo_path, changed_files).await?;
@@ -2999,17 +2887,10 @@ async fn push_repair_branch(
         repo_path,
         &["commit", "-m", commit_title, "-m", commit_body],
         None,
-        None,
     )
     .await?;
     let push_ref = format!("HEAD:refs/heads/{branch_name}");
-    run_git(
-        repo_path,
-        &["push", "origin", &push_ref],
-        Some(token),
-        Some(&askpass_path),
-    )
-    .await?;
+    run_git(repo_path, &["push", "--", remote, &push_ref], Some(token)).await?;
 
     Ok(())
 }
@@ -3024,52 +2905,16 @@ async fn stage_changed_files(
 
     let mut args = vec!["add", "-A", "--"];
     args.extend(changed_files.iter().map(String::as_str));
-    run_git(repo_path, &args, None, None).await?;
+    run_git(repo_path, &args, None).await?;
     Ok(())
-}
-
-async fn run_git(
-    repo_path: &Path,
-    args: &[&str],
-    github_token: Option<&str>,
-    askpass_path: Option<&Path>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(repo_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(token) = github_token {
-        command.env("DONKEYSPACE_GIT_TOKEN", token);
-    }
-    if let Some(path) = askpass_path {
-        command.env("GIT_ASKPASS", path);
-    }
-
-    #[cfg(unix)]
-    let output =
-        donkeyspace_runner::process::run_command_until(&mut command, None, std::future::pending())
-            .await?
-            .output;
-    #[cfg(not(unix))]
-    let output = command.output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {:?} failed: {}", args, stderr.trim()).into());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 async fn configure_git_author(repo_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let facade = active_facade();
     let name = facade.git_author_name();
     let email = facade.git_author_email();
-    run_git(repo_path, &["config", "user.name", &name], None, None).await?;
-    run_git(repo_path, &["config", "user.email", &email], None, None).await?;
+    run_git(repo_path, &["config", "user.name", &name], None).await?;
+    run_git(repo_path, &["config", "user.email", &email], None).await?;
     Ok(())
 }
 
@@ -3607,13 +3452,10 @@ fn agent_run_input(
     result_path: &str,
 ) -> AgentRunInput {
     let issue = input.pointer("/issue").unwrap_or(input);
-    let repository_context = input.pointer("/repository_context").cloned();
-    let repo_path = repository_context
-        .as_ref()
-        .and_then(|context| context.pointer("/checkout_path"))
-        .and_then(Value::as_str)
-        .unwrap_or("repo")
-        .to_string();
+    let mut repository_context = input.pointer("/repository_context").cloned();
+    if let Some(Value::Object(context)) = repository_context.as_mut() {
+        context.insert("checkout_path".into(), json!("repo"));
+    }
 
     AgentRunInput {
         run_id: run_id.to_string(),
@@ -3655,12 +3497,11 @@ fn agent_run_input(
         },
         pull_request: input.pointer("/pull_request").cloned(),
         policy: AgentPolicyInput {
-            path: env::var("DONKEYSPACE_POLICY_PATH")
-                .unwrap_or_else(|_| ".donkeyspace/policy.yml".to_string()),
+            path: ".donkeyspace/policy.json".into(),
             snapshot_id: None,
         },
         workspace: AgentWorkspaceInput {
-            repo_path,
+            repo_path: "repo".into(),
             result_path: result_path.to_string(),
         },
         repository_context,
@@ -3959,10 +3800,7 @@ mod tests {
         assert_eq!(run_input.issue.number, Some(10));
         assert_eq!(run_input.issue.labels, vec!["ai:needs-info"]);
         assert_eq!(run_input.issue.comments[0].body, "Use cargo.");
-        assert_eq!(
-            run_input.workspace.repo_path,
-            "/tmp/donkeyspace/workspaces/run/repo"
-        );
+        assert_eq!(run_input.workspace.repo_path, "repo");
         assert_eq!(
             run_input.workspace.result_path,
             ".donkeyspace/run-result.json"
@@ -4160,11 +3998,10 @@ mod tests {
             std::env::temp_dir().join(format!("donkeyspace-checkpoint-diff-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&repo_path).unwrap();
 
-        run_git(&repo_path, &["init"], None, None).await.unwrap();
+        run_git(&repo_path, &["init"], None).await.unwrap();
         run_git(
             &repo_path,
             &["config", "user.name", "Donkeyspace Test"],
-            None,
             None,
         )
         .await
@@ -4173,21 +4010,19 @@ mod tests {
             &repo_path,
             &["config", "user.email", "test@example.invalid"],
             None,
-            None,
         )
         .await
         .unwrap();
         std::fs::write(repo_path.join("README.md"), "base\n").unwrap();
-        run_git(&repo_path, &["add", "README.md"], None, None)
+        run_git(&repo_path, &["add", "README.md"], None)
             .await
             .unwrap();
-        run_git(&repo_path, &["commit", "-m", "initial"], None, None)
+        run_git(&repo_path, &["commit", "-m", "initial"], None)
             .await
             .unwrap();
         run_git(
             &repo_path,
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
-            None,
             None,
         )
         .await
@@ -4196,20 +4031,19 @@ mod tests {
             &repo_path,
             &["checkout", "-b", "donkeyspace/issue-35-test"],
             None,
-            None,
         )
         .await
         .unwrap();
 
         std::fs::write(repo_path.join("README.md"), "implemented\n").unwrap();
-        run_git(&repo_path, &["add", "README.md"], None, None)
+        run_git(&repo_path, &["add", "README.md"], None)
             .await
             .unwrap();
-        run_git(&repo_path, &["commit", "-m", "checkpoint"], None, None)
+        run_git(&repo_path, &["commit", "-m", "checkpoint"], None)
             .await
             .unwrap();
         assert!(
-            run_git(&repo_path, &["status", "--porcelain"], None, None)
+            run_git(&repo_path, &["status", "--porcelain"], None)
                 .await
                 .unwrap()
                 .trim()
@@ -4230,11 +4064,10 @@ mod tests {
             std::env::temp_dir().join(format!("donkeyspace-checkpoint-rename-{}", Uuid::now_v7()));
         std::fs::create_dir_all(repo_path.join("tests")).unwrap();
 
-        run_git(&repo_path, &["init"], None, None).await.unwrap();
+        run_git(&repo_path, &["init"], None).await.unwrap();
         run_git(
             &repo_path,
             &["config", "user.name", "Donkeyspace Test"],
-            None,
             None,
         )
         .await
@@ -4243,21 +4076,19 @@ mod tests {
             &repo_path,
             &["config", "user.email", "test@example.invalid"],
             None,
-            None,
         )
         .await
         .unwrap();
         std::fs::write(repo_path.join("tests/count_typical.vec"), "base\n").unwrap();
-        run_git(&repo_path, &["add", "tests/count_typical.vec"], None, None)
+        run_git(&repo_path, &["add", "tests/count_typical.vec"], None)
             .await
             .unwrap();
-        run_git(&repo_path, &["commit", "-m", "initial"], None, None)
+        run_git(&repo_path, &["commit", "-m", "initial"], None)
             .await
             .unwrap();
         run_git(
             &repo_path,
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
-            None,
             None,
         )
         .await
@@ -4265,7 +4096,6 @@ mod tests {
         run_git(
             &repo_path,
             &["checkout", "-b", "donkeyspace/issue-41-test"],
-            None,
             None,
         )
         .await
@@ -4276,17 +4106,10 @@ mod tests {
             repo_path.join("tests/count_down_typical.vec"),
         )
         .unwrap();
-        run_git(&repo_path, &["add", "-A"], None, None)
+        run_git(&repo_path, &["add", "-A"], None).await.unwrap();
+        run_git(&repo_path, &["commit", "-m", "checkpoint rename"], None)
             .await
             .unwrap();
-        run_git(
-            &repo_path,
-            &["commit", "-m", "checkpoint rename"],
-            None,
-            None,
-        )
-        .await
-        .unwrap();
 
         let pr_files = git_changed_files_since(&repo_path, "origin/main")
             .await
@@ -4304,11 +4127,10 @@ mod tests {
             std::env::temp_dir().join(format!("donkeyspace-stage-changes-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&repo_path).unwrap();
 
-        run_git(&repo_path, &["init"], None, None).await.unwrap();
+        run_git(&repo_path, &["init"], None).await.unwrap();
         run_git(
             &repo_path,
             &["config", "user.name", "Donkeyspace Test"],
-            None,
             None,
         )
         .await
@@ -4317,15 +4139,14 @@ mod tests {
             &repo_path,
             &["config", "user.email", "test@example.invalid"],
             None,
-            None,
         )
         .await
         .unwrap();
         std::fs::write(repo_path.join("README.md"), "before\n").unwrap();
-        run_git(&repo_path, &["add", "README.md"], None, None)
+        run_git(&repo_path, &["add", "README.md"], None)
             .await
             .unwrap();
-        run_git(&repo_path, &["commit", "-m", "initial"], None, None)
+        run_git(&repo_path, &["commit", "-m", "initial"], None)
             .await
             .unwrap();
 
@@ -4336,7 +4157,7 @@ mod tests {
             .await
             .unwrap();
 
-        let staged = run_git(&repo_path, &["diff", "--cached", "--name-only"], None, None)
+        let staged = run_git(&repo_path, &["diff", "--cached", "--name-only"], None)
             .await
             .unwrap();
         assert_eq!(staged.trim(), "README.md");
@@ -4371,12 +4192,7 @@ fn load_policy() -> Result<Policy, Box<dyn std::error::Error>> {
         env::var("DONKEYSPACE_POLICY_PATH").unwrap_or_else(|_| ".donkeyspace/policy.yml".into());
     let raw = fs::read_to_string(&path)?;
     let mut policy = Policy::from_yaml(&raw)?;
-    if let Some(selection) = policy.lifecycle.plugin.as_ref().or(policy
-        .agents
-        .developer
-        .plugin
-        .as_ref())
-    {
+    if let Some(selection) = policy.lifecycle.plugin.as_ref() {
         let manifest = PluginManifest::from_path(&selection.manifest_path)?;
         policy.facade = manifest.facade.overlay(&policy.facade);
     }

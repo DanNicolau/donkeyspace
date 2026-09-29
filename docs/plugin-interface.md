@@ -6,28 +6,14 @@ and result validation. Plugins own roles, prompts, images, and task graphs.
 
 ## Integration modes
 
-Plugins can integrate in two ways.
-
-### Default-lifecycle role plugin
-
-A serial flow may replace only the built-in developer command:
-
-```yaml
-agents:
-  developer:
-    enabled: true
-    plugin:
-      manifest_path: /plugins/example/donkeyspace-plugin.yml
-      flow: implementation
-```
-
-Triage, review, and repair retain their built-in semantics. Existing serial
-manifests using `agents`, `stages`, and `agent` remain accepted as compatibility
-aliases for `roles`, `tasks`, and `role`.
+Use the built-in software lifecycle, or select a full lifecycle plugin. Developer-only
+serial plugins are retired. Finish queued/running serial jobs with the previous
+release, then disconnect them or migrate to a lifecycle graph. New policy rejects
+`agents.developer.plugin` with migration guidance.
 
 ### Lifecycle replacement
 
-A repository can instead select an opt-in lifecycle flow:
+A repository can select an opt-in lifecycle flow:
 
 ```yaml
 lifecycle:
@@ -41,8 +27,7 @@ lifecycle:
 
 The selected manifest flow must declare `replaces_default_lifecycle: true`.
 Its start task's role is queued directly from an eligible issue; built-in
-triage, developer, reviewer, and repair webhook scheduling is bypassed. Plugins
-that do not opt in keep the default lifecycle.
+triage, developer, reviewer, and repair webhook scheduling is bypassed. Repositories without a plugin use the built-in software lifecycle.
 
 The environment map is `container variable: worker variable`. A value is
 injected only when the selected role allowlists that variable. Secret values
@@ -50,7 +35,7 @@ are not written into run input.
 
 ## Issue conversation input
 
-Both serial stages and lifecycle tasks receive the issue conversation in
+Lifecycle tasks receive the issue conversation in
 `.donkeyspace/run-input.json` at `issue.comments`. This is an array of comment
 objects with `id`, `body`, `user.login`, `user.type`, `author_association`,
 `created_at`, `updated_at`, and `html_url` (unavailable metadata is null).
@@ -58,7 +43,7 @@ The numeric GitHub comment count is retained separately as `issue.comment_count`
 
 For connected GitHub runs, the worker fetches every page of comments once per
 plugin invocation, including resumed workflows, and merges the triggering
-comment by ID without overwriting a newer edit. Every stage/task in that
+comment by ID without overwriting a newer edit. Every task in that
 invocation receives the same snapshot. A fetch failure stops execution instead
 of silently omitting clarification. Offline runs retain supplied comment arrays
 and the triggering comment. Reading conversation context does not authorize
@@ -310,11 +295,53 @@ Artifact types are behavioral and limited to `file` and `directory`; paths are
 exact and must remain within the task's write roots. For an `implemented`
 result, Donkeyspace validates reported changed paths, verifies the resource
 snapshot, validates artifacts, and runs validators before copying any changes
-back. Validators run in the task's image with the same workspace, allowed
-environment, and resources. Their exit codes and summaries are appended to the
-standard test results. A missing or wrong-type artifact, modified resource, or
-failed validator publishes nothing. Artifact and validator checks are skipped
-for non-publishable outcomes such as `needs_changes`.
+back. Validators run in the task's image with the same workspace and resources,
+but without its Codex home or role environment variables. Their exit codes and
+summaries are appended to the standard test results. A missing or wrong-type
+artifact or modified resource prevents retention. A failed validator prevents
+copying the task's write roots. Validators use their supplied files and read-only
+tools; do not depend on model/MCP credentials or agent environment defaults in a
+validator command.
+Artifact and validator checks are skipped for non-publishable outcomes such as
+`needs_changes`; result, changed-path, and resource checks still apply.
+
+Tasks can opt exact files or directories into `preserve_on_success`, using the
+same declaration shape as `artifacts`. After exit zero and a valid result, these
+paths are copied and checkpointed even for `needs_changes`, `needs_human`,
+`needs_info`, or a semantic `failed` result. This retains evidence without
+completing the task, satisfying its validators, or granting approval. For example:
+
+```yaml
+preserve_on_success:
+  - path: "build/{work_item}/reports"
+    type: directory
+```
+
+Only declared paths inside the effective write roots are retained on those
+outcomes. Undeclared output remains in the disposable attempt. An absent optional
+path leaves earlier evidence intact; `required: true` instead fails if absent.
+Symlinks and special files are rejected before replacing existing output.
+Nonzero exit or malformed/invalid results retain nothing through this contract.
+The coordinator checkpoints retained output before processing its semantic
+pause or handoff; failed publication remains an explicit publication failure.
+Explicitly retained paths are versioned even if a repository ignore rule would
+otherwise exclude them. Other ignored output remains excluded from the commit.
+Use this opt-in for reviewable reports or proposals, not raw build trees.
+This contract does not by itself restore a deleted aggregate checkout or certify
+that a proposal was accepted; those require checkpoint/publication provenance.
+
+An agent's `needs_info` result pauses the lifecycle coordinator and commits its
+questions and task context to the database. An authorized clarification reply
+resumes that coordinator and its retained checkout; it does not create a fresh
+planning run or accept a completed proposal. A required approval is still requested
+when the clarified task subsequently completes. Declare draft paths under
+`preserve_on_success` if the next attempt needs their exact bytes.
+
+Parallel clarification requests are collected before pausing, and completed
+independent siblings remain valid. If a wave also needs explicit approval, it
+stays in `needs_human`: each clarification target is listed alongside the approval
+targets, and the normal approve/revise commands apply. An ordinary reply cannot
+bypass that stronger gate. Revision feedback supplies the requested answers.
 
 Tasks may also declare optional forensic `diagnostics` using the same exact
 file-or-directory shape. Diagnostic paths must be inside a declared read or
@@ -394,8 +421,8 @@ high-risk, or tool-limited decisions. Repository risk policy is applied again
 before publication.
 
 `needs_human` pauses the lifecycle coordinator instead of completing it. Before
-pausing, donkeyspace writes a versioned handoff checkpoint in the coordinator's
-durable workspace. It records completed graph nodes, child jobs, projected
+pausing, donkeyspace writes a versioned handoff checkpoint to PostgreSQL and
+retains the coordinator's durable workspace. It records completed graph nodes, child jobs, projected
 GitHub issues, handoff counters, test evidence, and the exact task to resume.
 The GitHub comment explains what decision is needed, the exact approval command,
 and what work will be preserved. An explicit `/donkeyspace approve` or
@@ -426,6 +453,15 @@ the same isolated snapshot recorded as kind `diagnostic`. Publication errors
 are recorded independently of the agent outcome and retain the workspace for a
 dashboard-triggered retry. GitHub credentials are resolved immediately before
 every push so long-running jobs do not reuse expired App installation tokens.
+
+Attempt publication metadata includes `supporting_files`: regular files in the
+task's write scope at that exact commit. It includes unchanged retained drafts,
+which may already have been checkpointed before the attempt snapshot, and omits
+deleted paths, symlinks, submodules and `.donkeyspace` diagnostics. This inventory
+describes available supporting files, not which files the attempt created.
+It is persisted before pushing, so publication status must be checked separately
+before presenting remote file links. An absent inventory on an older record does
+not establish that no draft exists.
 
 ## Run input and result
 
@@ -474,6 +510,13 @@ Each task writes `.donkeyspace/run-result.json`, using the standard `RunResult`
 plus an optional handoff and optional `resources_used` array. Every reported
 resource ID must have been available to that attempt. Roles must not commit,
 push, apply labels, open pull requests, or edit outside the filtered workspace.
+
+`plugin.allowed_handoffs` lists the current task's manifest-authorized targets.
+Use it to choose a repair route; previous execution history is bounded and does
+not establish current permissions. `previous_tasks` includes structured handoffs
+with their full reason alongside abbreviated summaries, questions and blocker
+reasons. A repair target can therefore inspect the reported failure without
+depending on the source agent repeating every detail in its summary.
 
 ## GitHub relationship projection
 
@@ -530,3 +573,95 @@ mounted read-only, environment values are stored in mode-`0600` files and
 mounted as Compose secrets, and only the active worker receives the Docker
 socket. `donkeyspace plugin disable` returns to the default lifecycle while
 preserving installed plugin state.
+
+## Checkpoint authority
+
+### Answering current blockers
+
+The parent GitHub status comment and dashboard show current questions, blocking
+reasons, task/work-item identity, and the action needed to continue. Workflow
+cards preview the first question or reason and link to the complete blocker list.
+These views read persisted task results and checkpoint targets; waiting task
+reservations do not replace the result that asked the question. Resolved and
+superseded questions leave the current view. New task-completion timeline events
+retain complete questions and reasons for later inspection.
+
+For a `needs_info` pause, reply on the parent issue with the requested answers.
+If the same wave also requires approval, the workflow remains `needs_human`:
+use the displayed task-specific revision command with your answers. Other
+pending approvals remain required. Existing approval controls are unchanged.
+Recovery errors appear before outstanding task questions so a missing checkpoint
+is not mistaken for an ordinary clarification pause.
+
+Supporting-file links point to the exact published attempt commit. The view
+distinguishes an empty supporting-file inventory from pending or failed
+publication; publication problems never hide the questions. Failed or pending
+publications do not advertise remote file links. Older publications without an
+inventory, or attempts without publication evidence, display unknown draft
+availability rather than claiming that no draft was produced. A supporting file
+may be an unchanged retained draft, not necessarily new work from that attempt.
+
+### Revising completed upstream work
+
+While a lifecycle is paused in `needs_human`, an authorized approver can reopen
+a completed task that is an ancestor of a pending task. GitHub status and the
+dashboard list eligible targets and the exact tasks each revision supersedes.
+Workflow tasks use `TASK`; work-item tasks use `TASK/WORK-ITEM`. With the default
+command prefix, a planning revision looks like:
+
+```text
+/donkeyspace revise plan
+Change the accepted contract to address the validation finding.
+```
+
+The configured facade prefix applies. Feedback is mandatory. Approval remains
+restricted to pending targets: `/donkeyspace approve plan` cannot reopen a
+completed plan. Unknown, incorrectly scoped, unrelated, or unauthorized targets
+do not change accepted progress.
+
+The same coordinator records the human revision and invalidates the target and
+its transitive dependents. A work-item revision preserves unrelated completed
+siblings; a workflow revision can affect several work items. Affected pending
+and accepted approval records and child attempts become superseded, retaining
+their original evidence. Repository files remain available as repair inputs,
+but their prior results cannot release dependents. Unrelated pending approvals
+remain required. Revised tasks still obey their original write permissions.
+
+A task configured with required approval pauses on its new proposal before
+dependents run. A revised plan reconciles its work-item registry through the
+existing projected-issue flow. Revision feedback, invalidation and audit records
+commit with the durable checkpoint. Repeated delivery of the same comment cannot
+apply the decision again; a newly authored command is a new human decision.
+
+Revision choices require a saved graph from this version and a matching active
+flow. Older checkpoints without that graph do not offer completed-task revision;
+do not infer historical dependencies from a replacement plugin. Preserve their
+history and use a fresh approved run when the original authority is unavailable.
+
+### Persistence and repository recovery
+
+PostgreSQL `lifecycle_checkpoints` is authoritative for plugin progress. Each commit
+checks coordinator lease ownership, expiry, workflow generation and checkpoint
+revision. Pauses commit checkpoint state, pending approval identities, completed
+child results, coordinator/workflow state, audit and outbound actions together.
+Approval commands are rendered from task/work-item identities, not extracted from
+human-facing explanation text.
+
+Each new production checkpoint also records the repository identity, exact commit
+and tree, original base revision, and matching checkpoint publication. Resume
+verifies these before starting an agent. A lost or modified aggregate checkout
+is restored from retained local Git objects or by fetching those exact revisions
+from GitHub. A later branch head cannot substitute for the saved content. Recovery
+preserves an unexpected local checkout in `repo-unverified-*` for inspection.
+Disposable task directories can be recreated from the verified aggregate.
+
+The database records identity and progress, not a second copy of repository files.
+If the exact objects are unavailable, or checkpoint provenance is missing or
+inconsistent, the same coordinator pauses with a restoration/reapproval request.
+Legacy filesystem checkpoints and older database checkpoints without immutable
+repository provenance cannot resume automatically in production. Restore and
+reconcile the original authority, or start a fresh run with renewed approval;
+neither current `main` nor a reconstructed summary proves prior acceptance.
+Completed checkpoints remain as tombstones, and expired model executions are
+never automatically replayed. See
+[upgrade and rollback](refactor-rollout.md) before upgrading an existing deployment.

@@ -389,7 +389,7 @@ async fn run() -> Result<(), SetupError> {
                     } => {
                         if instance.remove_repository(&repository, confirm)? {
                             println!(
-                                "Removed from saved selection. Future ingestion stops after apply; history is retained and work is not cancelled."
+                                "Removed from saved selection. Future ingestion stops after apply; history is retained and outstanding work is cancelled."
                             );
                         } else {
                             println!("Already untracked; unchanged.");

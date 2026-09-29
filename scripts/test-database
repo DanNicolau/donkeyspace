@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Runs only against a disposable database owned by this invocation.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+container="$(docker run --rm -d -e POSTGRES_PASSWORD=test-only -e POSTGRES_DB=donkeyspace_cancellation_test -p 127.0.0.1::5432 postgres:17)"
+trap 'docker rm -f "$container" >/dev/null' EXIT
+for attempt in {1..60}; do
+    if docker exec "$container" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+port="$(docker port "$container" 5432/tcp)"
+export DONKEYSPACE_CANCELLATION_TEST_DATABASE_URL="postgres://postgres:test-only@${port}/donkeyspace_cancellation_test"
+cargo test -p donkeyspace-db -- --ignored --test-threads=1
+cargo test -p donkeyspace-api -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker stalled_projection_releases_lock -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker database_checkpoint_import -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker fake_lifecycle_preserves -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker repository_maintenance_contains_failure -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker successful_process_retains_only_declared_evidence -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker clarification_retains_contract -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker isolated_execution_denies_other_jobs -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker lost_checkout_recovers_exact_contract -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker approved_wave_commits_output -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker upstream_revision_reuses_coordinator -- --ignored --test-threads=1
+cargo test -p donkeyspace-worker shared_repair_converges -- --ignored --test-threads=1

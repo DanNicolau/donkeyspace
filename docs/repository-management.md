@@ -33,7 +33,9 @@ Unavailable repositories and unsupported owners fail before changing `instance.j
 Saving uses a lock and atomic rename; a repository edit based on stale configuration
 must be reloaded and retried.
 
-The updated CLI automatically migrates local instance configuration to version 8.
+The updated CLI automatically migrates local instance configuration to version 9.
+The repository pending-apply field was introduced in version 8; version 9 also
+requires [dedicated automation authentication](installation.md#codex).
 Use the updated CLI for subsequent operations: older versions reject this format,
 which prevents them from silently discarding pending repository changes.
 
@@ -70,13 +72,59 @@ donkeyspace configure repositories remove OWNER/OLD_REPO --confirm
 Removal is explicit and offline, so a repository whose installation access was
 revoked can still be removed. After applying, new webhook deliveries for it are
 rejected and it is no longer polled. The command does not delete workflow/history
-data, revoke GitHub installation access, close issues, or cancel jobs. Existing
-queued work and outbound actions are retained: drain them before applying removal.
-Re-adding a removed repository starts with empty starter and approver scopes.
+data, revoke GitHub installation access, or close issues. Saving removal does not
+change the running stack. After apply, API/worker startup reconciliation cancels outstanding jobs,
+approvals, publications, issue projections, and outbound actions for removed
+repositories. Running jobs use the existing cancellation and container cleanup
+path. Results, checkpoint files, published commits, and history remain available.
+A `repository_retired` lifecycle event records the reason; `repositories.retired_at`
+is local tracking state, not a claim of deletion on GitHub.
+
+Removal advances each historical workflow's generation. Re-adding a repository
+starts with empty starter/approver scopes and permits new authorized work after
+configuration and apply. It does **not** resume cancelled jobs/checkpoints or
+replay old actions, publications, or managed-PR repair work. Start a fresh authorized
+request after checking the retained history. Retrying a run from the old generation
+is rejected. Repeated polling and restarts do not duplicate retirement events.
+
+Migration `0009_repository_retirement.sql` supplies the tracking flag, admission
+fences, and durable closure-cleanup retry timing. Authenticated standalone workers
+must provide a nonempty `DONKEYSPACE_GITHUB_REPOSITORIES`; an absent selection is
+an error, never permission to process arbitrary historical repositories.
 
 Keep at least one repository in a connected instance. Removing the last repository
 is rejected because an authenticated runtime requires a nonempty tracked selection;
 this command does not disconnect GitHub or invent a new installation boundary.
+
+## Repository maintenance failures
+
+The worker synchronizes policy labels only for `DONKEYSPACE_GITHUB_REPOSITORIES`,
+using the same case-insensitive identities as ingress. Historical database records
+and App installation membership do not add repositories to this selection. A label
+failure is logged with the repository and operation; it does not stop maintenance
+for other repositories. A 404 indicates unavailable access, not confirmed deletion.
+
+Migration `0008_repository_label_sync.sql` records each attempt before contacting
+GitHub. Failed attempts back off from one minute to one hour, including across
+worker restarts. Each call times out after 30 seconds. Successful synchronization
+is rechecked hourly; changing the managed label set triggers an immediate attempt.
+The `repository_label_sync` table exposes `last_error`, `last_success_at`, and
+`next_attempt_at` for diagnosis. These rules apply to both App and PAT credentials.
+
+Temporary GitHub failures do not change tracking selection or retire a repository.
+A failed job retains its result and requires an explicit retry. Publication failures
+retain their bounded retry behavior; restoring access does not automatically retry
+a publication already marked failed. Use the dashboard's publication retry after
+restoring access and reviewing the current workflow.
+
+Failed outbound actions are retained with `last_error`; comment creation is not
+automatically replayed because a failed response can hide a completed GitHub write.
+Review GitHub before creating a replacement comment/status update. The existing
+idempotent issue-closure label cleanup stops after eight failed attempts, with
+persisted 30-second exponential delays capped at 15 minutes. Access
+errors (including 401/403/404) stop automatic cleanup retries. After restoring
+access, reconcile the labels on GitHub explicitly. These terminal failures remain
+visible; they are not silently discarded or interpreted as repository deletion.
 
 ## TUI
 

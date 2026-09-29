@@ -620,7 +620,8 @@ a {
   color: #18548a;
 }
 
-.status-pill[data-status="needs_human"] {
+.status-pill[data-status="needs_human"],
+.status-pill[data-status="needs_info"] {
   background: #fff0bd;
   color: #775000;
 }
@@ -662,6 +663,14 @@ a {
   border-radius: 7px;
   padding: 12px;
 }
+
+.blocker-list { display: grid; gap: 12px; }
+.blocker-card { overflow-wrap: anywhere; }
+.blocker-card > .status-pill { margin-left: 10px; }
+.blocker-questions { white-space: pre-wrap; padding-left: 22px; }
+.blocker-questions li + li { margin-top: 8px; }
+.blocker-card .draft-status { margin-top: 12px; font-size: 14px; }
+.blocker-preview p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
 .attention-box p,
 .attention-box pre {

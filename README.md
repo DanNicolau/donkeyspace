@@ -33,7 +33,7 @@ It coordinates issue triage, clarification, agent implementation, automated chec
 - GitHub comments carry human clarification and agent summaries.
 - Repository policy selects either the built-in lifecycle or an opt-in plugin
   that replaces it with its own roles and task graph.
-- Agent work runs in ephemeral workspaces inside the worker container.
+- Agents and required checks run in disposable execution containers with isolated workspace mounts.
 - Tool-using agent work runs through external CLIs in a prepared workspace; bounded prompt context is only used for OpenAI-compatible triage.
 - PostgreSQL stores run history, decisions, locks, and audit records.
 - Rust powers the backend and worker; TypeScript React powers the dashboard.
@@ -153,7 +153,7 @@ If the OpenAI-compatible triage path has no usable key, hits provider quota, or 
 
 Set `DONKEYSPACE_TRIAGE_PROVIDER=agent` to run the configured `agents.triage.command` from `.donkeyspace/policy.yml` inside the prepared workspace. In this mode the worker writes `.donkeyspace/run-input.json`, expects `.donkeyspace/run-result.json`, and records the command exit code plus captured stdout/stderr in command results.
 
-The default agent triage command is `donkeyspace-codex-triage`, a small wrapper around Codex CLI. The wrapper uses `schemas/run-result.codex.schema.json` for Codex structured output, then donkeyspace validates the result against the stricter Rust orchestration rules. It disables Codex's inner bubblewrap sandbox because the worker already runs inside Docker and common Docker hosts do not allow the user namespaces bubblewrap needs. The setup command delegates authentication to Codex CLI and supports ChatGPT browser login or an API key piped through stdin:
+The default agent triage command is `donkeyspace-codex-triage`, a small wrapper around Codex CLI. The wrapper uses `schemas/run-result.codex.schema.json` for Codex structured output, then donkeyspace validates the result against the stricter Rust orchestration rules. It disables Codex's inner bubblewrap sandbox because each agent runs in an isolated execution container and common Docker hosts do not allow the user namespaces bubblewrap needs. The setup command delegates authentication to Codex CLI and supports ChatGPT browser login or an API key piped through stdin:
 
 ```sh
 donkeyspace connect codex --method chatgpt
@@ -161,13 +161,13 @@ donkeyspace connect codex --method api-key
 ```
 
 The installer never stores the API key in instance configuration. See the
-[official Codex authentication documentation](https://learn.chatgpt.com/docs/auth).
+[official Codex authentication documentation](https://learn.chatgpt.com/docs/auth). Setup creates a dedicated automation login and mounts only its credential file into agents. API-key jobs can run in parallel; ChatGPT jobs sharing credentials serialize to preserve refreshes. Existing instances must reconnect explicitly; see [migration and credential boundaries](docs/installation.md#codex).
 
 When triage returns `ready`, the worker queues a developer job if `agents.developer.enabled` is true. The default developer command is `donkeyspace-codex-developer`, which runs Codex CLI against the cloned checkout. If it returns `implemented`, donkeyspace commits the changed files, pushes a branch named `donkeyspace/issue-{number}-{job-id}`, opens a GitHub PR with a Conventional Commit title, and moves the issue to `ai:pr-open`.
 
 Before pushing a developer branch, the worker runs every command in `checks.required_commands` from the policy file inside the repository checkout. Each command result is recorded in `command_results` and exposed through `/api/runs/{id}`. If any required command fails or cannot start, donkeyspace marks the developer job failed, moves the issue to `ai:blocked`, and writes the failed command summary to the issue through the GitHub action outbox.
 
-The default local policy runs `git diff --check`, `cargo test --workspace`, and the dashboard build before pushing a developer branch. Repo-specific commands must be available inside the worker image or wrapped by a custom worker image.
+The default local policy runs `git diff --check`, `cargo test --workspace`, and the dashboard build before pushing a developer branch. Repo-specific commands must be available in the image configured by `DONKEYSPACE_AGENT_IMAGE`. See [execution isolation](docs/execution-isolation.md) for setup and the remaining Git/credential audit work.
 
 Policy lives in `.donkeyspace/policy.yml`. It gates automation with allow/block labels, defines agent commands, runs required local checks, and routes high-risk, unknown-risk, or sensitive-path work to humans. See [the policy guide](docs/policy.md) for the supported fields and current limitations.
 

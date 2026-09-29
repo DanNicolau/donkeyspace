@@ -10,11 +10,12 @@ use donkeyspace_db::{
 use donkeyspace_github::{branch_url, commit_url, compare_url, file_url};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, env, fs, io::Read, path::Path, process::Stdio};
-use tokio::process::Command;
+use std::{collections::BTreeMap, env, fs, io::Read, path::Path};
 use uuid::Uuid;
 
-use crate::{active_dashboard_public_url, active_facade, repo_context::write_askpass_script};
+use crate::{
+    active_dashboard_public_url, active_facade, configure_git_author, trusted_git::run as git,
+};
 
 const MAX_DIAGNOSTIC_FILES: usize = 256;
 const MAX_DIAGNOSTIC_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -62,6 +63,7 @@ pub async fn publish_checkpoint(
     context: &PublicationContext<'_>,
     repo_path: &Path,
     commit_title: &str,
+    retained: &[PluginArtifact],
 ) -> Result<AgentPublicationRecord, Box<dyn std::error::Error>> {
     if let Some(workflow_item_id) = context.workflow_item_id {
         update_workflow_state_for_job(
@@ -78,19 +80,27 @@ pub async fn publish_checkpoint(
         context.coordinator_job_id,
     );
     configure_git_author(repo_path).await?;
-    let base_sha = git(repo_path, &["rev-parse", "HEAD"], None, None)
+    let base_sha = git(repo_path, &["rev-parse", "HEAD"], None)
         .await?
         .trim()
         .to_string();
-    let current = git(repo_path, &["branch", "--show-current"], None, None).await?;
+    let current = git(repo_path, &["branch", "--show-current"], None).await?;
     if current.trim() != branch {
-        git(repo_path, &["checkout", "-b", &branch], None, None).await?;
+        git(repo_path, &["checkout", "-B", &branch, "HEAD"], None).await?;
+    }
+    // Retention is explicit authorization to version these artifacts even when
+    // a broad repository ignore rule would otherwise omit them from recovery.
+    for artifact in retained {
+        donkeyspace_core::plugin::validate_repository_path(&artifact.path)?;
+        if repo_path.join(&artifact.path).exists() {
+            git(repo_path, &["add", "-f", "-A", "--", &artifact.path], None).await?;
+        }
     }
     if !git_status(repo_path).await?.trim().is_empty() {
-        git(repo_path, &["add", "-A"], None, None).await?;
-        git(repo_path, &["commit", "-m", commit_title], None, None).await?;
+        git(repo_path, &["add", "-A"], None).await?;
+        git(repo_path, &["commit", "-m", commit_title], None).await?;
     }
-    let sha = git(repo_path, &["rev-parse", "HEAD"], None, None)
+    let sha = git(repo_path, &["rev-parse", "HEAD"], None)
         .await?
         .trim()
         .to_string();
@@ -156,41 +166,28 @@ pub async fn publish_attempt(
         .workspace_path
         .join("publication-attempts")
         .join(safe_segment(&branch));
+    crate::repository_files::validate_directory(&local_repo)?;
     if !local_repo.exists() {
         fs::create_dir_all(local_repo.parent().expect("attempt repository has parent"))?;
-        let output = Command::new("git")
-            .args(["clone", "--shared", "--no-hardlinks"])
-            .arg(aggregate_repo)
-            .arg(&local_repo)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
-        if !output.status.success() {
-            return Err(format!(
-                "git clone for forensic branch failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
+        crate::trusted_git::clone_local(aggregate_repo, &local_repo).await?;
     }
     configure_git_author(&local_repo).await?;
-    let base_sha = git(&local_repo, &["rev-parse", "HEAD"], None, None)
+    let base_sha = git(&local_repo, &["rev-parse", "HEAD"], None)
         .await?
         .trim()
         .to_string();
-    for root in attempt.write_roots {
-        sync_root(
-            &attempt.task_root.join("repo").join(root),
-            &local_repo.join(root),
-        )?;
-    }
+    crate::repository_files::replace_roots(
+        &attempt.task_root.join("repo"),
+        &local_repo,
+        attempt.write_roots,
+    )?;
     let diagnostic_root = local_repo.join(".donkeyspace/diagnostics").join(format!(
         "{}-{}-a{}",
         safe_segment(attempt.task),
         safe_segment(attempt.work_item.unwrap_or("workflow")),
         attempt.attempt
     ));
+    crate::repository_files::validate_directory(&diagnostic_root)?;
     fs::create_dir_all(&diagnostic_root)?;
     let mut manifest = Vec::<Value>::new();
     let mut budget = DiagnosticBudget::default();
@@ -244,13 +241,12 @@ pub async fn publish_attempt(
         }))?,
     )?;
     redact_diagnostic_tree(&diagnostic_root, context.token, attempt.redactions)?;
-    git(&local_repo, &["add", "-A"], None, None).await?;
+    git(&local_repo, &["add", "-A"], None).await?;
     let diagnostic_relative = diagnostic_root.strip_prefix(&local_repo)?.to_string_lossy();
     let kind = publication_kind(attempt.outcome);
     git(
         &local_repo,
         &["add", "-f", "--", diagnostic_relative.as_ref()],
-        None,
         None,
     )
     .await?;
@@ -269,12 +265,15 @@ pub async fn publish_attempt(
             context.issue_number
         ),
     };
-    git(&local_repo, &["commit", "-m", &commit_title], None, None).await?;
-    let sha = git(&local_repo, &["rev-parse", "HEAD"], None, None)
+    git(&local_repo, &["commit", "-m", &commit_title], None).await?;
+    let sha = git(&local_repo, &["rev-parse", "HEAD"], None)
         .await?
         .trim()
         .to_string();
     let changed_files = changed_files(&local_repo, &base_sha, &sha).await?;
+    // Retained output may already be in the aggregate checkpoint, so an
+    // attempt's diff alone cannot tell a reviewer whether a draft exists.
+    let supporting_files = supporting_files(&local_repo, &sha, attempt.write_roots).await?;
     let record = upsert_agent_publication(
         context.pool,
         &AgentPublicationInput {
@@ -305,6 +304,7 @@ pub async fn publish_attempt(
             metadata: json!({
                 "reason": attempt.reason,
                 "diagnostic_files": budget.files,
+                "supporting_files": supporting_files,
                 "owner": context.owner,
                 "repo": context.repo,
                 "issue_number": context.issue_number,
@@ -324,6 +324,33 @@ pub async fn publish_attempt(
         .await?;
     }
     Ok(record)
+}
+
+/// Inventory actual regular files at the immutable attempt revision. Do not
+/// infer availability from agent-reported changes, deleted paths or diagnostics.
+async fn supporting_files(
+    repo: &Path,
+    commit: &str,
+    write_roots: &[String],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let tree = git(repo, &["ls-tree", "-r", "-z", commit], None).await?;
+    Ok(tree
+        .split('\0')
+        .filter_map(|entry| {
+            let (metadata, path) = entry.split_once('\t')?;
+            let mode = metadata.split_whitespace().next()?;
+            // Symlinks and submodules are not supporting documents.
+            if !matches!(mode, "100644" | "100755")
+                || Path::new(path).starts_with(".donkeyspace")
+                || !write_roots
+                    .iter()
+                    .any(|root| Path::new(path).starts_with(root))
+            {
+                return None;
+            }
+            Some(path.to_owned())
+        })
+        .collect())
 }
 
 async fn record_publication_event(
@@ -389,6 +416,22 @@ async fn queue_status_comment(
     .await?
     .ok_or("workflow item disappeared while publishing status")?;
     let jobs = list_jobs_for_workflow_item(context.pool, workflow_item_id).await?;
+    let coordinator = jobs.iter().find(|job| job.id == context.coordinator_job_id);
+    let checkpoint =
+        donkeyspace_db::lifecycle_checkpoints::load(context.pool, context.coordinator_job_id)
+            .await?;
+    let blockers = donkeyspace_db::workflow_blockers::project(
+        workflow.current_state.as_deref(),
+        coordinator,
+        checkpoint
+            .as_ref()
+            .filter(|checkpoint| !checkpoint.completed)
+            .map(|checkpoint| &checkpoint.state),
+        &jobs,
+        &publications,
+        active_facade(),
+        |sha, path| file_url(context.owner, context.repo, sha, path),
+    );
     let events = list_lifecycle_events(context.pool, workflow_item_id, None, true, 8).await?;
     let marker = "<!-- donkeyspace-lifecycle-status -->".to_string();
     let mut lines = vec![
@@ -400,11 +443,43 @@ async fn queue_status_comment(
             workflow.current_state.as_deref().unwrap_or("unclassified")
         ),
         String::new(),
+    ];
+    if !blockers.is_empty() {
+        lines.extend(["#### Current blockers".into(), String::new()]);
+        for blocker in &blockers {
+            lines.push(format!("**{}** — `{}`", blocker.label(), blocker.outcome));
+            if let Some(reason) = &blocker.reason {
+                lines.extend([String::new(), reason.clone()]);
+            }
+            lines.push(String::new());
+            lines.extend(
+                blocker
+                    .questions
+                    .iter()
+                    .map(|question| format!("- {question}")),
+            );
+            lines.extend([
+                String::new(),
+                blocker.action.clone(),
+                String::new(),
+                blocker.evidence.message.into(),
+            ]);
+            if let Some(command) = &blocker.response_command {
+                lines.extend([String::new(), format!("Response command: `{command}`")]);
+            }
+            lines.push(String::new());
+            for file in &blocker.evidence.files {
+                lines.push(format!("- [`{}`]({})", file.path, file.url));
+            }
+            lines.push(String::new());
+        }
+    }
+    lines.extend([
         "#### Current agents".into(),
         String::new(),
         "| Agent task | State | Outcome |".into(),
         "| --- | --- | --- |".into(),
-    ];
+    ]);
     let mut current = BTreeMap::new();
     let coordinator_id = context.coordinator_job_id.to_string();
     for job in &jobs {
@@ -454,7 +529,31 @@ async fn queue_status_comment(
             .unwrap_or("—");
         lines.push(format!("| {} | {} | {} |", label, job.status, outcome));
     }
-    let coordinator = jobs.iter().find(|job| job.id == context.coordinator_job_id);
+    if workflow.current_state.as_deref() == Some("needs_human")
+        && coordinator.is_some_and(|job| job.status == "paused")
+        && let Some(checkpoint) = &checkpoint
+        && !checkpoint.completed
+    {
+        let revisions =
+            donkeyspace_core::approval::revision_previews(&checkpoint.state, active_facade());
+        if !revisions.is_empty() {
+            lines.extend([String::new(), "#### Revise completed upstream work".into(), String::new(),
+                "These commands reopen completed work and supersede the listed dependent results. Include specific feedback on the following lines. Required approval will be requested again for revised output.".into()]);
+            for revision in revisions {
+                lines.push(format!(
+                    "- `{}` — supersedes: {}. Command: `{}`",
+                    revision.target,
+                    revision
+                        .affected
+                        .iter()
+                        .map(|target| format!("`{target}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    revision.revise_command
+                ));
+            }
+        }
+    }
     let pending_approval = (workflow.current_state.as_deref() == Some("needs_human"))
         .then(|| {
             coordinator
@@ -542,7 +641,9 @@ async fn queue_status_comment(
             format!("Final pull request: {pull_request_url}"),
         ]);
     } else {
-        let explanation = if let Some(reason) = pending_approval {
+        let explanation = if let Some(blocker) = blockers.first() {
+            blocker.preview()
+        } else if let Some(reason) = pending_approval {
             truncate(reason.split("\n\n").next().unwrap_or(reason), 300)
         } else if let Some(job) = jobs.iter().find(|job| job.status == "running") {
             format!("Agent `{}` is still running.", job.role)
@@ -569,6 +670,13 @@ async fn queue_status_comment(
         lines.extend([String::new(), "#### Artifacts".into(), String::new()]);
         for publication in &publications {
             let task = publication.task.as_deref().unwrap_or("workspace");
+            if publication.status != "published" {
+                lines.push(format!(
+                    "- {} `{task}`: publication {}; file links unavailable.",
+                    publication.kind, publication.status
+                ));
+                continue;
+            }
             lines.push(format!(
                 "- {} `{task}`: [commit `{}`]({}){}",
                 publication.kind,
@@ -703,7 +811,6 @@ pub async fn queue_publication_status(
 pub async fn push_existing_publication(
     pool: &PgPool,
     token: Option<&str>,
-    workspace_path: &Path,
     publication: &AgentPublicationRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !donkeyspace_db::cancellation::job_execution_allowed(pool, publication.coordinator_job_id)
@@ -711,13 +818,11 @@ pub async fn push_existing_publication(
     {
         return Err(donkeyspace_db::DbError::ExecutionCancelled.into());
     }
-    let askpass = workspace_path.join("git-askpass-publication.sh");
     let result = async {
         let token = crate::current_github_token(token)
             .await?
             .ok_or("configured GitHub authentication is required to publish branches")?;
         let remote = github_remote(&publication.metadata)?;
-        write_askpass_script(&askpass)?;
         let refspec = format!(
             "{}:refs/heads/{}",
             publication.commit_sha, publication.branch_name
@@ -727,9 +832,8 @@ pub async fn push_existing_publication(
             publication.coordinator_job_id,
             git(
                 Path::new(&publication.local_repo_path),
-                &["push", &remote, &refspec],
+                &["push", "--", &remote, &refspec],
                 Some(&token),
-                Some(&askpass),
             ),
         )
         .await
@@ -756,20 +860,14 @@ fn github_remote(metadata: &Value) -> Result<String, Box<dyn std::error::Error>>
         .get("repo")
         .and_then(Value::as_str)
         .ok_or("publication metadata is missing repository")?;
-    Ok(format!("https://github.com/{owner}/{repo}.git"))
+    crate::trusted_git::github_remote(owner, repo)
 }
 
 async fn push_publication(
     context: &PublicationContext<'_>,
     publication: &AgentPublicationRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    push_existing_publication(
-        context.pool,
-        context.token,
-        context.workspace_path,
-        publication,
-    )
-    .await
+    push_existing_publication(context.pool, context.token, publication).await
 }
 
 fn attempt_branch_name(
@@ -835,7 +933,7 @@ async fn changed_files(
     if base == head {
         return Ok(Vec::new());
     }
-    Ok(git(repo, &["diff", "--name-only", base, head], None, None)
+    Ok(git(repo, &["diff", "--name-only", base, head], None)
         .await?
         .lines()
         .filter(|path| !path.trim().is_empty())
@@ -856,95 +954,8 @@ fn safe_segment(value: &str) -> String {
         .collect()
 }
 
-async fn configure_git_author(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let facade = active_facade();
-    let name = facade.git_author_name();
-    let email = facade.git_author_email();
-    git(repo, &["config", "user.name", &name], None, None).await?;
-    git(repo, &["config", "user.email", &email], None, None).await?;
-    Ok(())
-}
-
 async fn git_status(repo: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    git(repo, &["status", "--porcelain"], None, None).await
-}
-
-async fn git(
-    repo: &Path,
-    args: &[&str],
-    token: Option<&str>,
-    askpass: Option<&Path>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(token) = token {
-        command.env("DONKEYSPACE_GIT_TOKEN", token);
-    }
-    if let Some(askpass) = askpass {
-        command.env("GIT_ASKPASS", askpass);
-    }
-    #[cfg(unix)]
-    let output =
-        donkeyspace_runner::process::run_command_until(&mut command, None, std::future::pending())
-            .await?
-            .output;
-    #[cfg(not(unix))]
-    let output = command.output().await?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn sync_root(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Ok(());
-    }
-    if target.exists() {
-        if target.is_dir() {
-            fs::remove_dir_all(target)?;
-        } else {
-            fs::remove_file(target)?;
-        }
-    }
-    if source.is_dir() {
-        copy_tree(source, target)?;
-    } else if source.is_file() {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, target)?;
-    }
-    Ok(())
-}
-
-fn copy_tree(source: &Path, target: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(target)?;
-    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
-            continue;
-        }
-        let destination = target.join(entry.file_name());
-        if metadata.is_dir() {
-            copy_tree(&entry.path(), &destination)?;
-        } else {
-            fs::copy(entry.path(), destination)?;
-        }
-    }
-    Ok(())
+    git(repo, &["status", "--porcelain"], None).await
 }
 
 fn collect_child_task_diagnostics(
@@ -959,6 +970,7 @@ fn collect_child_task_diagnostics(
         ("plugin-stages", "child-stages"),
     ] {
         let source_root = task_root.join(source_name);
+        crate::repository_files::validate_directory(&source_root)?;
         if !source_root.is_dir() {
             continue;
         }
@@ -971,8 +983,8 @@ fn collect_child_task_diagnostics(
             let task_name = entry.file_name().to_string_lossy().into_owned();
             let source_diagnostics = entry.path().join(".donkeyspace");
             let result_path = source_diagnostics.join("run-result.json");
-            let parsed_result = fs::read_to_string(&result_path)
-                .ok()
+            let parsed_result = crate::repository_files::regular_file(&result_path)?
+                .and_then(|_| fs::read_to_string(&result_path).ok())
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
             if let Some(parsed) = &parsed_result {
                 summaries.push(json!({
@@ -1022,6 +1034,9 @@ fn collect_diagnostic(
         manifest.push(json!({"path": source, "status": "skipped", "reason": "symlink"}));
         return Ok(());
     }
+    if let Some(parent) = source.parent() {
+        crate::repository_files::validate_directory(parent)?;
+    }
     match kind {
         PluginArtifactType::File => copy_diagnostic_file(source, target, budget, manifest),
         PluginArtifactType::Directory => {
@@ -1060,10 +1075,10 @@ fn copy_diagnostic_file(
         manifest.push(json!({"path": source, "status": "skipped", "reason": "symlink"}));
         return Ok(());
     }
-    if !source.is_file() {
+    let Some(metadata) = crate::repository_files::regular_file(source)? else {
         return Ok(());
-    }
-    let metadata = fs::metadata(source)?;
+    };
+    crate::repository_files::regular_file(target)?;
     let size = metadata.len();
     let reason = if budget.files >= MAX_DIAGNOSTIC_FILES {
         Some("file_count_limit")
@@ -1147,9 +1162,13 @@ fn redact_diagnostic_tree(
     fn visit(directory: &Path, secrets: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
-            if entry.path().is_dir() {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() {
                 visit(&entry.path(), secrets)?;
                 continue;
+            }
+            if !metadata.is_file() {
+                return Err("diagnostic contains a link or special file".into());
             }
             let Ok(mut value) = fs::read_to_string(entry.path()) else {
                 continue;
@@ -1171,6 +1190,76 @@ fn redact_diagnostic_tree(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn supporting_files_use_exact_revision_and_task_scope() {
+        let root = env::temp_dir().join(format!("publication-files-{}", Uuid::now_v7()));
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("docs-other")).unwrap();
+        fs::create_dir_all(root.join(".donkeyspace/diagnostics")).unwrap();
+        let command = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        command(&["init", "--quiet"]);
+        fs::write(
+            root.join("docs/proposal with space.md"),
+            "accepted contract",
+        )
+        .unwrap();
+        fs::write(root.join("docs/deleted.md"), "old proposal").unwrap();
+        fs::write(root.join("docs-other/sibling.md"), "unrelated").unwrap();
+        fs::write(root.join(".donkeyspace/diagnostics/result.json"), "{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("proposal with space.md", root.join("docs/link.md")).unwrap();
+        command(&["add", "-A"]);
+        command(&["commit", "-qm", "fixture"]);
+        fs::remove_file(root.join("docs/deleted.md")).unwrap();
+        command(&["add", "-A"]);
+        command(&["commit", "-qm", "remove obsolete draft"]);
+        let revision = command(&["rev-parse", "HEAD"]);
+        fs::write(root.join("docs/later.md"), "not in the reviewed revision").unwrap();
+        command(&["add", "-A"]);
+        command(&["commit", "-qm", "later work"]);
+        assert_eq!(
+            supporting_files(&root, &revision, &["docs".into(), ".donkeyspace".into()])
+                .await
+                .unwrap(),
+            ["docs/proposal with space.md"]
+        );
+        assert!(
+            supporting_files(&root, &revision, &["absent".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            supporting_files(&root, &revision, &["docs/proposal with space.md".into()])
+                .await
+                .unwrap(),
+            ["docs/proposal with space.md"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn branch_names_are_safe_and_stable() {
@@ -1258,6 +1347,30 @@ mod tests {
                 .iter()
                 .any(|entry| { entry["reason"] == "binary" && entry["sha256"].as_str().is_some() })
         );
+        #[cfg(unix)]
+        {
+            let link = root.join("redirect");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            assert!(
+                copy_diagnostic_file(
+                    &link.join("tool.log"),
+                    &target.join("copy.log"),
+                    &mut budget,
+                    &mut manifest
+                )
+                .is_err()
+            );
+            assert!(
+                copy_diagnostic_file(
+                    &source.join("tool.log"),
+                    &link.join("overwrite.log"),
+                    &mut budget,
+                    &mut manifest
+                )
+                .is_err()
+            );
+            assert!(!source.join("overwrite.log").exists());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

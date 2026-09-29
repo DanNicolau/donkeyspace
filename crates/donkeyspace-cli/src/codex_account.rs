@@ -97,14 +97,20 @@ async fn response(
 }
 
 pub(crate) async fn read_account(home: &Path) -> CodexAccount {
+    let Ok(_credentials) = super::codex_auth::credential_read_lock(home) else {
+        return CodexAccount::Unavailable;
+    };
     let mut command = Command::new("codex");
-    command.arg("app-server");
+    command.args(["-c", "cli_auth_credentials_store=\"file\"", "app-server"]);
     query_account(&mut command, home, Duration::from_secs(5)).await
 }
 
 async fn query_account(command: &mut Command, home: &Path, timeout: Duration) -> CodexAccount {
     // Match the configured mount, even when this CLI was launched with another
     // CODEX_HOME. Avoid loading the current repository's Codex configuration.
+    for name in super::codex_auth::auth_environment_removals() {
+        command.env_remove(name);
+    }
     command
         .env("CODEX_HOME", home)
         .current_dir(home)

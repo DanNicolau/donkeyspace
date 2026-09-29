@@ -5,9 +5,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
 };
-use tokio::process::Command;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -59,6 +57,7 @@ pub struct FileExcerpt {
 }
 
 pub async fn build_repository_context(
+    pool: &donkeyspace_db::PgPool,
     input: &Value,
     job_id: Uuid,
     github_token: Option<&str>,
@@ -85,11 +84,17 @@ pub async fn build_repository_context(
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        if !repo_path.join(".git").is_dir() {
-            return Err(
-                format!("paused lifecycle workspace is missing for resumed job {job_id}").into(),
-            );
-        }
+        let token = crate::current_github_token(github_token).await?;
+        crate::checkout_recovery::ensure(
+            pool,
+            job_id,
+            &repo_path,
+            owner,
+            repo,
+            default_branch,
+            token.as_deref(),
+        )
+        .await?;
         let context = summarize_checkout(owner, repo, default_branch, &repo_path, input, config)?;
         return Ok(serde_json::to_value(context)?);
     }
@@ -99,12 +104,11 @@ pub async fn build_repository_context(
     fs::create_dir_all(&workspace_path)?;
 
     let current_token = crate::current_github_token(github_token).await?;
-    clone_repository(
+    crate::trusted_git::clone_remote(
         owner,
         repo,
         default_branch,
         &repo_path,
-        &workspace_path,
         current_token.as_deref(),
     )
     .await?;
@@ -132,58 +136,6 @@ pub fn cleanup_repository_context(
     Ok(())
 }
 
-async fn clone_repository(
-    owner: &str,
-    repo: &str,
-    default_branch: &str,
-    repo_path: &Path,
-    workspace_path: &Path,
-    github_token: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut command = Command::new("git");
-    command
-        .arg("clone")
-        .arg("--depth")
-        .arg("1")
-        .arg("--branch")
-        .arg(default_branch)
-        .arg("--single-branch")
-        .arg(format!("https://github.com/{owner}/{repo}.git"))
-        .arg(repo_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(Stdio::null());
-
-    if let Some(token) = github_token.filter(|token| !token.trim().is_empty()) {
-        let askpass_path = workspace_path.join("git-askpass.sh");
-        write_askpass_script(&askpass_path)?;
-        command.env("GIT_ASKPASS", &askpass_path);
-        command.env("DONKEYSPACE_GIT_TOKEN", token);
-    }
-
-    let output = command.output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git clone failed for {owner}/{repo}: {}", stderr.trim()).into());
-    }
-
-    Ok(())
-}
-
-pub(crate) fn write_askpass_script(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    fs::write(
-        path,
-        "#!/bin/sh\ncase \"$1\" in\n*Username*) printf '%s' 'x-access-token' ;;\n*Password*) printf '%s' \"$DONKEYSPACE_GIT_TOKEN\" ;;\n*) printf '%s' '' ;;\nesac\n",
-    )?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-
-    Ok(())
-}
-
 fn summarize_checkout(
     owner: &str,
     repo: &str,
@@ -192,6 +144,7 @@ fn summarize_checkout(
     input: &Value,
     config: &RepoContextConfig,
 ) -> Result<RepositoryContext, Box<dyn std::error::Error>> {
+    crate::repository_files::validate_directory(repo_path)?;
     let files = list_files(repo_path)?;
     let selected = select_files(input, &files, config.max_files);
     let selected_set = selected.iter().cloned().collect::<BTreeSet<_>>();
@@ -277,9 +230,10 @@ fn visit_dir(
             continue;
         }
 
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
             visit_dir(root, &path, files)?;
-        } else if path.is_file() {
+        } else if metadata.is_file() {
             let relative = path.strip_prefix(root)?;
             files.push(relative.to_string_lossy().replace('\\', "/"));
         }
@@ -407,16 +361,8 @@ fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        path_matches_reference, referenced_file_tokens, select_files, write_askpass_script,
-    };
+    use super::{path_matches_reference, referenced_file_tokens, select_files};
     use serde_json::json;
-    use std::{
-        fs,
-        process::Command,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     #[test]
     fn readme_reference_selects_readme_file() {
         let selected = select_files(
@@ -445,47 +391,16 @@ mod tests {
         assert!(path_matches_reference("docs/README.md", "README.md"));
         assert!(path_matches_reference("README.md", "README"));
     }
-
+    #[cfg(unix)]
     #[test]
-    fn askpass_reads_token_from_environment_without_embedding_it() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("donkeyspace-askpass-{unique}"));
-        fs::create_dir_all(&directory).unwrap();
-        let script = directory.join("git-askpass.sh");
-        write_askpass_script(&script).unwrap();
-
-        let contents = fs::read_to_string(&script).unwrap();
-        assert!(!contents.contains("installation-token-value"));
-        let username = Command::new(&script)
-            .arg("Username for 'https://github.com':")
-            .env("DONKEYSPACE_GIT_TOKEN", "installation-token-value")
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(username.stdout).unwrap(),
-            "x-access-token"
-        );
-        let password = Command::new(&script)
-            .arg("Password for 'https://github.com':")
-            .env("DONKEYSPACE_GIT_TOKEN", "installation-token-value")
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(password.stdout).unwrap(),
-            "installation-token-value"
-        );
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(&script).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-        }
-        fs::remove_dir_all(directory).unwrap();
+    fn repository_context_does_not_follow_file_or_directory_links() {
+        let root = std::env::temp_dir().join(format!("ds-context-{}", uuid::Uuid::now_v7()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(root.join("secret"), "outside checkout").unwrap();
+        std::os::unix::fs::symlink(root.join("secret"), repo.join("README.md")).unwrap();
+        std::os::unix::fs::symlink(&root, repo.join("linked-directory")).unwrap();
+        assert!(super::list_files(&repo).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

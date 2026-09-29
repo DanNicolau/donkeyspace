@@ -12,8 +12,11 @@ pub enum PolicyError {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub version: u32,
+    #[serde(skip)]
+    pub migration_warnings: Vec<String>,
     #[serde(default)]
     pub facade: FacadeConfig,
     pub workflow: WorkflowPolicy,
@@ -23,34 +26,88 @@ pub struct Policy {
     pub agents: AgentConfig,
     pub checks: CheckPolicy,
     pub risk: RiskPolicy,
-    pub automation: AutomationPolicy,
     #[serde(default)]
     pub dashboard: DashboardPolicy,
 }
 
 impl Policy {
     pub fn from_yaml(input: &str) -> Result<Self, PolicyError> {
-        let policy: Self = serde_yaml::from_str(input)?;
+        let mut raw: serde_json::Value = serde_yaml::from_str(input)?;
+        let version = raw
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| PolicyError::Invalid("policy version must be 1 or 2".into()))?;
+        if !matches!(version, 1 | 2) {
+            return Err(PolicyError::Invalid(format!(
+                "unsupported policy version {version}"
+            )));
+        }
+        let mut warnings = Vec::new();
+        for (section, fields) in [
+            ("checks", &["require_github_checks"][..]),
+            ("risk", &["default", "agent_classification"][..]),
+            (
+                "automation",
+                &["auto_merge", "max_concurrent_jobs", "retry_failed_jobs"][..],
+            ),
+            ("dashboard", &["expose_policy", "allow_cancel"][..]),
+        ] {
+            if let Some(mapping) = raw
+                .get_mut(section)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for field in fields {
+                    if mapping.contains_key(*field) {
+                        if version == 2 {
+                            return Err(PolicyError::Invalid(format!(
+                                "{section}.{field} is retired; remove this unenforced setting"
+                            )));
+                        }
+                        mapping.remove(*field);
+                        warnings.push(format!("Removed unenforced version-1 setting {section}.{field}; save this policy as version 2."));
+                    }
+                }
+            }
+        }
+        if raw
+            .get("automation")
+            .is_some_and(|value| value.as_object().is_some_and(|map| map.is_empty()))
+        {
+            raw.as_object_mut()
+                .expect("policy mapping")
+                .remove("automation");
+        }
+        if let Some(roles) = raw
+            .get_mut("agents")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for (name, role) in roles {
+                if let Some(plugin) = role.as_object_mut().and_then(|role| role.remove("plugin"))
+                    && !plugin.is_null()
+                {
+                    return Err(PolicyError::Invalid(format!(
+                        "agents.{name}.plugin uses retired serial plugins; finish old runs with the previous release, then select the built-in lifecycle or lifecycle.plugin"
+                    )));
+                }
+            }
+        }
+        raw["version"] = 2.into();
+        let mut policy: Self =
+            serde_json::from_value(raw).map_err(|error| PolicyError::Invalid(error.to_string()))?;
+        policy.migration_warnings = warnings;
+        for warning in &policy.migration_warnings {
+            eprintln!("warning: {warning}");
+        }
         for (name, role) in [
             ("triage", &policy.agents.triage),
             ("developer", &policy.agents.developer),
             ("reviewer", &policy.agents.reviewer),
             ("repair", &policy.agents.repair),
         ] {
-            if role.enabled && role.command.is_empty() && role.plugin.is_none() {
+            if role.enabled && role.command.is_empty() {
                 return Err(PolicyError::Invalid(format!(
-                    "enabled agent `{name}` requires command or plugin"
+                    "enabled agent `{name}` requires a command"
                 )));
-            }
-            if !role.command.is_empty() && role.plugin.is_some() {
-                return Err(PolicyError::Invalid(format!(
-                    "agent `{name}` cannot specify both command and plugin"
-                )));
-            }
-            if name != "developer" && role.plugin.is_some() {
-                return Err(PolicyError::Invalid(
-                    "plugin flows are currently supported only for developer".to_string(),
-                ));
             }
         }
         if let Some(selection) = &policy.lifecycle.plugin
@@ -413,12 +470,11 @@ pub struct AgentConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRoleConfig {
     pub enabled: bool,
     #[serde(default)]
     pub command: Vec<String>,
-    #[serde(default)]
-    pub plugin: Option<PluginFlowSelection>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -447,11 +503,10 @@ pub struct TaskAccessOverride {
 pub type StageAccessOverride = TaskAccessOverride;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckPolicy {
     #[serde(default)]
     pub required_commands: Vec<RequiredCommand>,
-    #[serde(default)]
-    pub require_github_checks: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -461,9 +516,8 @@ pub struct RequiredCommand {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RiskPolicy {
-    pub default: String,
-    pub agent_classification: bool,
     pub route_unknown_to_human: bool,
     pub route_high_to_human: bool,
     #[serde(default)]
@@ -527,23 +581,13 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     false
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct AutomationPolicy {
-    pub max_concurrent_jobs: u32,
-    pub retry_failed_jobs: bool,
-    pub auto_merge: bool,
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DashboardPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
     #[serde(default)]
-    pub expose_policy: bool,
-    #[serde(default)]
     pub allow_retry: bool,
-    #[serde(default)]
-    pub allow_cancel: bool,
 }
 
 #[cfg(test)]
@@ -555,7 +599,7 @@ mod tests {
     fn parses_example_policy() {
         let policy = Policy::from_yaml(include_str!("../../../docs/policy.example.yml")).unwrap();
 
-        assert_eq!(policy.version, 1);
+        assert_eq!(policy.version, 2);
         assert!(policy.agents.triage.enabled);
         assert!(policy.agents.repair.enabled);
         assert_eq!(policy.workflow.state_labels["ready"], "ai:ready");
@@ -809,5 +853,50 @@ automation:
 
         assert_eq!(result.outcome, Outcome::NeedsHuman);
         assert!(reason.contains("**/security/**"));
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    #[test]
+    fn legacy_noops_warn_and_serialize_only_the_current_policy() {
+        let input = "version: 1\nworkflow: {state_labels: {}}\nchecks: {require_github_checks: true}\nrisk: {default: unknown, agent_classification: true, route_unknown_to_human: true, route_high_to_human: true}\nautomation: {auto_merge: true, max_concurrent_jobs: 99, retry_failed_jobs: true}\ndashboard: {expose_policy: true, allow_cancel: true}";
+        let policy = Policy::from_yaml(input).unwrap();
+        assert_eq!(policy.version, 2);
+        assert_eq!(policy.migration_warnings.len(), 8);
+        let current = serde_yaml::to_string(&policy).unwrap();
+        assert!(!current.contains("auto_merge"));
+        assert!(!current.contains("require_github_checks"));
+        assert!(
+            Policy::from_yaml(&current)
+                .unwrap()
+                .migration_warnings
+                .is_empty()
+        );
+        assert!(
+            Policy::from_yaml(&input.replace("version: 1", "version: 2"))
+                .unwrap_err()
+                .to_string()
+                .contains("retired")
+        );
+    }
+    #[test]
+    fn serial_selection_and_unknown_current_fields_fail_explicitly() {
+        let base = "version: 2\nworkflow: {state_labels: {}}\nchecks: {}\nrisk: {route_unknown_to_human: true, route_high_to_human: true}\n";
+        assert!(
+            Policy::from_yaml(&format!(
+                "{base}agents: {{developer: {{plugin: {{flow: serial}}}}}}\n"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("retired serial")
+        );
+        assert!(
+            Policy::from_yaml(&format!("{base}dashboard: {{allow_rety: true}}\n"))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
     }
 }

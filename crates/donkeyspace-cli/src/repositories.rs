@@ -88,7 +88,7 @@ impl Instance {
         validate_repository_identity(repository)?;
         let existing = self.repositories()?;
         if !confirm {
-            return Err(SetupError::Config("removal requires --confirm; future ingestion stops after apply, history is retained, and work is not cancelled".into()));
+            return Err(SetupError::Config("removal requires --confirm; future ingestion stops after apply, history is retained, and outstanding work is cancelled after apply".into()));
         }
         if !existing
             .iter()
@@ -211,7 +211,7 @@ impl Instance {
         self.save_unlocked()
     }
 
-    pub(crate) fn configuration_lock(&self) -> Result<fs::File, SetupError> {
+    pub(crate) fn configuration_lock(&self) -> Result<OperationLock, SetupError> {
         fs::create_dir_all(&self.directory)?;
         set_directory_mode(&self.directory)?;
         let lock = fs::OpenOptions::new()
@@ -225,7 +225,7 @@ impl Instance {
                 "another configuration operation is in progress; retry after it finishes: {error}"
             ))
         })?;
-        Ok(lock)
+        Ok(OperationLock(lock))
     }
 
     pub(crate) fn require_unchanged_configuration(
@@ -352,6 +352,11 @@ mod tests {
             let trusted = vec![GitHubAccessSubject::User {
                 login: "alice".into(),
             }];
+            write_secret(
+                &directory.join("codex-automation/auth.json"),
+                b"synthetic-auth",
+            )
+            .unwrap();
             let instance = Instance {
                 saved_bytes: std::sync::Mutex::new(None),
                 directory: directory.clone(),
@@ -361,7 +366,8 @@ mod tests {
                     runtime_source: RuntimeSource::LocalBuild,
                     api_port: 18080,
                     web_port: 15173,
-                    codex_home: Some(directory.join("auth")),
+                    codex_home: Some(directory.join("codex-automation")),
+                    codex_auth_method: Some(CodexLoginMethod::ApiKey),
                     github: Some(GitHubInstanceConfig::App {
                         app_id: 42,
                         installation_id: 43,
@@ -524,6 +530,22 @@ mod tests {
     }
 
     #[test]
+    fn releasing_configuration_lock_does_not_wait_for_duplicate_descriptors() {
+        let fixture = Fixture::new(IngressMode::polling());
+        let lock = fixture.0.configuration_lock().unwrap();
+        // A process spawned by another thread can briefly inherit this open
+        // file description before close-on-exec. Reproduce that lifetime with dup.
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(fixture.0.configuration_lock().is_err());
+        drop(lock);
+        let replacement = fixture.0.configuration_lock().unwrap();
+        drop(inherited);
+        assert!(fixture.0.configuration_lock().is_err());
+        drop(replacement);
+        assert!(fixture.0.configuration_lock().is_ok());
+    }
+
+    #[test]
     fn concurrent_and_stale_repository_edit_cannot_overwrite_saved_work() {
         let mut fixture = Fixture::new(IngressMode::polling());
         let instance = &mut fixture.0;
@@ -586,7 +608,7 @@ mod tests {
             .remove("repositories_pending_apply");
         fs::write(fixture.0.config_path(), serde_json::to_vec(&old).unwrap()).unwrap();
         let migrated = Instance::open(Some(fixture.0.directory.clone())).unwrap();
-        old["schema_version"] = json!(8);
+        old["schema_version"] = json!(SCHEMA_VERSION);
         old["repositories_pending_apply"] = json!(false);
         assert_eq!(serde_json::to_value(migrated.config()).unwrap(), old);
         assert_eq!(

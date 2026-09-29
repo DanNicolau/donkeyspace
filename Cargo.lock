@@ -651,6 +651,7 @@ dependencies = [
  "donkeyspace-github",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tower-http",
  "tracing",
@@ -689,6 +690,7 @@ name = "donkeyspace-db"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "donkeyspace-core",
  "serde",
  "serde_json",
  "sqlx",
@@ -721,8 +723,8 @@ dependencies = [
 name = "donkeyspace-runner"
 version = "0.1.0"
 dependencies = [
- "donkeyspace-core",
  "libc",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -733,6 +735,7 @@ dependencies = [
 name = "donkeyspace-worker"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "donkeyspace-core",
  "donkeyspace-db",
@@ -744,6 +747,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

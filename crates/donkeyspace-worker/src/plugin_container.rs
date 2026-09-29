@@ -1,4 +1,6 @@
 //! Owned plugin containers with supervised process execution and cleanup.
+mod codex_auth;
+use codex_auth::AgentAuthentication;
 use donkeyspace_db::{
     PgPool,
     container_executions::{ContainerExecution, register_container_execution},
@@ -7,6 +9,78 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, env, future::Future, path::Path, process::Stdio};
 use tokio::process::Command;
 use uuid::Uuid;
+
+/// Selected by the coordinator call site, never by a repository or agent result.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionKind {
+    Agent,
+    Check,
+}
+
+/// Built-in agents and required checks use the same registered, supervised
+/// container path as plugins. A launch error is terminal; no host fallback.
+pub(crate) async fn run_builtin(
+    command: &[String],
+    workspace: &Path,
+    kind: ExecutionKind,
+) -> Result<donkeyspace_runner::AgentCommandResult, Box<dyn std::error::Error>> {
+    if command.is_empty() {
+        return Err("isolated command cannot be empty".into());
+    }
+    let image = env::var("DONKEYSPACE_AGENT_IMAGE")
+        .map_err(|_| "DONKEYSPACE_AGENT_IMAGE must name the built-in execution image")?;
+    let output = run_container(&image, command, workspace, &BTreeMap::new(), &[], kind).await?;
+    Ok(donkeyspace_runner::AgentCommandResult {
+        command: command.to_vec(),
+        status: if output.status.success() {
+            donkeyspace_runner::AgentCommandStatus::Passed
+        } else {
+            donkeyspace_runner::AgentCommandStatus::Failed
+        },
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn workspace_mount(
+    source: &Path,
+    volume: Option<&str>,
+    volume_root: &Path,
+    target: &str,
+    readonly: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source = source.canonicalize()?;
+    let mut mount = if let Some(volume) = volume {
+        if volume.is_empty()
+            || !volume
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+        {
+            return Err("invalid DONKEYSPACE_WORKSPACE_VOLUME".into());
+        }
+        let relative = source
+            .strip_prefix(volume_root.canonicalize()?)?
+            .to_str()
+            .ok_or("workspace path must be UTF-8")?;
+        if relative.is_empty() || relative.contains([',', '\n', '\r']) {
+            return Err(
+                "execution must mount a subdirectory, never the whole workspace volume".into(),
+            );
+        }
+        format!("type=volume,src={volume},dst={target},volume-subpath={relative},volume-nocopy")
+    } else {
+        let source = source.to_str().ok_or("workspace path must be UTF-8")?;
+        if source.contains([',', '\n', '\r']) {
+            return Err("unsupported workspace mount path".into());
+        }
+        format!("type=bind,src={source},dst={target}")
+    };
+    if readonly {
+        mount.push_str(",readonly");
+    }
+    Ok(mount)
+}
 
 tokio::task_local! {
     static EXECUTION_OWNER: (PgPool, Uuid, String);
@@ -32,6 +106,7 @@ pub(crate) async fn run_container(
     stage_root: &Path,
     configured: &BTreeMap<String, String>,
     allowed: &[String],
+    kind: ExecutionKind,
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
     let (pool, coordinator, owner) = EXECUTION_OWNER
         .try_with(Clone::clone)
@@ -52,6 +127,7 @@ pub(crate) async fn run_container(
         stage_root,
         configured,
         allowed,
+        kind,
         std::future::pending(),
     )
     .await
@@ -64,15 +140,28 @@ async fn run_container_until(
     stage_root: &Path,
     configured: &BTreeMap<String, String>,
     allowed: &[String],
+    kind: ExecutionKind,
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
     // The identity is already committed before any Docker request. Each agent
     // and validator invocation gets a distinct name, even in the same scope.
     let container_name = &execution.container_name;
+    if kind == ExecutionKind::Check && !allowed.is_empty() {
+        return Err("validation cannot receive agent environment variables".into());
+    }
+    if image.is_empty()
+        || image.starts_with('-')
+        || !image
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"/._-:@".contains(&c))
+    {
+        return Err("invalid execution image".into());
+    }
     let mut docker = Command::new("docker");
     docker.args([
         "run",
         "--rm",
+        "--pull=never",
         "--name",
         container_name,
         "--label",
@@ -81,34 +170,65 @@ async fn run_container_until(
         &format!("donkeyspace.execution-scope={}", execution.execution_scope),
         "--network",
         "bridge",
+        "--cap-drop=ALL",
+        // The worker can be a host user while the image runs as root. Retain
+        // only ordinary file access for that user's mounted checkout; this
+        // does not bypass read-only mounts or permit mount/namespace changes.
+        "--cap-add=DAC_OVERRIDE",
+        "--security-opt=no-new-privileges",
+        "--env=GIT_OPTIONAL_LOCKS=0",
     ]);
     for (key, value) in execution_labels(execution) {
         docker.args(["--label", &format!("{key}={value}")]);
     }
-    if let Ok(volume) = env::var("DONKEYSPACE_WORKSPACE_VOLUME") {
-        let workspace_root =
-            env::var("DONKEYSPACE_WORKSPACE_ROOT").unwrap_or_else(|_| "/workspaces".into());
-        docker.args([
-            "--mount",
-            &format!("type=volume,src={volume},dst={workspace_root}"),
-        ]);
-        docker.args(["--workdir", &stage_root.display().to_string()]);
-    } else {
-        docker.args([
-            "--mount",
-            &format!("type=bind,src={},dst=/workspace", stage_root.display()),
-        ]);
-        docker.args(["--workdir", "/workspace"]);
+    let volume = env::var("DONKEYSPACE_WORKSPACE_VOLUME").ok();
+    let volume_root =
+        env::var("DONKEYSPACE_WORKSPACE_ROOT").unwrap_or_else(|_| "/workspaces".into());
+    docker.args([
+        "--mount",
+        &workspace_mount(
+            stage_root,
+            volume.as_deref(),
+            Path::new(&volume_root),
+            "/workspace",
+            false,
+        )?,
+    ]);
+    docker.args(["--workdir", "/workspace"]);
+    // Pin the checkout and protocol directories too: otherwise an agent could
+    // rename their parent and substitute writable metadata at the original path.
+    for relative in ["repo", ".donkeyspace", ".git", "repo/.git"] {
+        let git = stage_root.join(relative);
+        match std::fs::symlink_metadata(&git) {
+            Ok(metadata) if metadata.is_dir() => {
+                docker.args([
+                    "--mount",
+                    &workspace_mount(
+                        &git,
+                        volume.as_deref(),
+                        Path::new(&volume_root),
+                        &format!("/workspace/{relative}"),
+                        relative.ends_with(".git"),
+                    )?,
+                ]);
+            }
+            Ok(_) => return Err("execution checkout and metadata must be real directories".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
-    let codex_source = env::var("DONKEYSPACE_CODEX_HOME_SOURCE").ok();
-    let legacy_codex_volume = env::var("DONKEYSPACE_CODEX_VOLUME").ok();
-    let codex_mount_suffix = env::var("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX").ok();
-    if let Some(mount) = codex_home_mount(
-        codex_source.as_deref(),
-        legacy_codex_volume.as_deref(),
-        codex_mount_suffix.as_deref(),
-    )? {
-        docker.args(["--volume", &mount]);
+    let authentication = if kind == ExecutionKind::Agent {
+        AgentAuthentication::from_environment()?
+    } else {
+        None
+    };
+    if let Some(auth) = &authentication {
+        docker.args([
+            "--volume",
+            &auth.mount(),
+            "--env",
+            "CODEX_HOME=/root/.codex",
+        ]);
     }
     if let Ok(source) = env::var("DONKEYSPACE_OSS_TOOLS_PATH") {
         let source = source.trim();
@@ -139,6 +259,15 @@ async fn run_container_until(
         }
     }
     for name in allowed {
+        if authentication.is_some()
+            && ((name.starts_with("CODEX_") && name != "CODEX_CA_CERTIFICATE")
+                || name == "OPENAI_API_KEY")
+        {
+            return Err(format!(
+                "{name} cannot override coordinator-owned automation authentication"
+            )
+            .into());
+        }
         if let Some(source) = configured.get(name) {
             let value = if Path::new(source).is_absolute() {
                 std::fs::read_to_string(source)
@@ -157,8 +286,19 @@ async fn run_container_until(
             docker.arg("--env").arg(name).env(name, value);
         }
     }
+    if let Some(auth) = &authentication {
+        docker.args([
+            "--entrypoint",
+            "/bin/sh",
+            image,
+            "-c",
+            &auth.bootstrap(),
+            "donkeyspace-auth",
+        ]);
+    } else {
+        docker.arg(image);
+    }
     docker
-        .arg(image)
         .args(command)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -196,42 +336,6 @@ async fn run_container_until(
     }
 }
 
-// Resolve Docker-host paths, not paths inside the worker. The legacy volume is
-// supported for standalone workers, but must never override an explicit source.
-fn codex_home_mount(
-    source: Option<&str>,
-    legacy_volume: Option<&str>,
-    suffix: Option<&str>,
-) -> Result<Option<String>, String> {
-    let Some(source) = source.or(legacy_volume) else {
-        return Ok(None);
-    };
-    let is_bind = Path::new(source).is_absolute();
-    let valid_volume = source
-        .as_bytes()
-        .first()
-        .is_some_and(u8::is_ascii_alphanumeric)
-        && source
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-    if source.contains([':', '\n', '\r', '\0']) || (!is_bind && !valid_volume) {
-        return Err(
-            "Codex credential source must be an absolute host path or a Docker volume name; check DONKEYSPACE_CODEX_HOME_SOURCE (or legacy DONKEYSPACE_CODEX_VOLUME)".into(),
-        );
-    }
-    let suffix = match suffix.unwrap_or("") {
-        "" => "",
-        // Older setup versions emitted :Z. Sharing the home requires :z so a
-        // new job cannot revoke access for the worker or concurrent jobs.
-        ":z" | ":Z" => ":z",
-        _ => return Err("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX must be empty or :z".into()),
-    };
-    Ok(Some(format!(
-        "{source}:/root/.codex{}",
-        if is_bind { suffix } else { "" }
-    )))
-}
-
 fn execution_labels(execution: &ContainerExecution) -> Vec<(&'static str, String)> {
     let mut labels = vec![
         ("donkeyspace.execution-id", execution.id.to_string()),
@@ -256,121 +360,38 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     #[test]
-    fn configured_codex_home_overrides_legacy_credentials() {
+    fn workspace_volume_requires_a_contained_execution_subdirectory() {
+        let root = env::temp_dir().join(format!("workspace-mount-{}", Uuid::now_v7()));
+        let stage = root.join("job/task");
+        std::fs::create_dir_all(&stage).unwrap();
         assert_eq!(
-            codex_home_mount(
-                Some("/home/user/custom codex"),
-                Some("old-personal-credentials"),
-                Some(":z"),
-            )
-            .unwrap(),
-            Some("/home/user/custom codex:/root/.codex:z".into()),
+            workspace_mount(&stage, Some("workspaces"), &root, "/workspace", false).unwrap(),
+            "type=volume,src=workspaces,dst=/workspace,volume-subpath=job/task,volume-nocopy"
         );
-    }
-
-    #[test]
-    fn codex_named_volume_defaults_and_legacy_workers_remain_supported() {
-        for (source, legacy) in [
-            (Some("donkeyspace-codex-home"), None),
-            (None, Some("donkeyspace-codex-home")),
-        ] {
-            assert_eq!(
-                codex_home_mount(source, legacy, None).unwrap(),
-                Some("donkeyspace-codex-home:/root/.codex".into()),
-            );
-        }
-        assert_eq!(codex_home_mount(None, None, None).unwrap(), None);
-    }
-
-    #[test]
-    fn codex_bind_mounts_share_selinux_labels() {
-        for suffix in [":z", ":Z"] {
-            assert_eq!(
-                codex_home_mount(Some("/custom/codex"), None, Some(suffix)).unwrap(),
-                Some("/custom/codex:/root/.codex:z".into()),
-            );
-        }
-        assert_eq!(
-            codex_home_mount(Some("/custom/codex"), None, None).unwrap(),
-            Some("/custom/codex:/root/.codex".into()),
-        );
-    }
-
-    #[test]
-    fn invalid_codex_source_does_not_fall_back_to_another_account() {
-        for source in [
-            "",
-            "./codex",
-            "~/codex",
-            "path/relative",
-            "/codex:ro",
-            "/codex\n",
-        ] {
-            assert!(
-                codex_home_mount(Some(source), Some("old-credentials"), None).is_err(),
-                "accepted invalid source {source:?}",
-            );
-        }
-        assert!(codex_home_mount(Some("/codex"), None, Some(":ro")).is_err());
-    }
-
-    #[test]
-    #[ignore = "requires Docker Compose CLI (no daemon or credentials needed)"]
-    fn compose_worker_and_plugin_jobs_resolve_the_same_codex_source() {
-        let compose = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker-compose.yml");
-        for source in [None, Some("/tmp/custom codex home")] {
-            let mut command = std::process::Command::new("docker");
-            command
-                .args(["compose", "--env-file", "/dev/null", "-f"])
-                .arg(&compose)
-                .args(["config", "--format", "json"])
-                .env("DONKEYSPACE_DEPLOYMENT_MODE", "minimal")
-                .env_remove("DONKEYSPACE_CODEX_HOME_SOURCE")
-                .env_remove("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX")
-                .env("DONKEYSPACE_CODEX_VOLUME", "stale-personal-volume");
-            if let Some(source) = source {
-                command
-                    .env("DONKEYSPACE_CODEX_HOME_SOURCE", source)
-                    .env("DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX", ":z");
-            }
-            let output = command.output().unwrap();
-            assert!(output.status.success(), "Compose configuration failed");
-            let config: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            let worker = &config["services"]["worker"];
-            let mount = worker["volumes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|mount| mount["target"] == "/root/.codex")
-                .unwrap();
-            let resolved_source = if mount["type"] == "volume" {
-                config["volumes"][mount["source"].as_str().unwrap()]["name"]
-                    .as_str()
-                    .unwrap()
-            } else {
-                assert_eq!(mount["bind"]["selinux"], "z");
-                mount["source"].as_str().unwrap()
-            };
-            let environment = &worker["environment"];
-            assert_eq!(
-                environment["DONKEYSPACE_CODEX_HOME_SOURCE"],
-                resolved_source
-            );
-            let plugin_mount = codex_home_mount(
-                environment["DONKEYSPACE_CODEX_HOME_SOURCE"].as_str(),
-                Some("stale-personal-volume"),
-                environment["DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX"].as_str(),
+        assert!(workspace_mount(&root, Some("workspaces"), &root, "/workspace", false).is_err());
+        assert!(
+            workspace_mount(
+                &stage,
+                Some("workspaces,readonly"),
+                &root,
+                "/workspace",
+                false
             )
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                plugin_mount,
-                format!(
-                    "{resolved_source}:/root/.codex{}",
-                    if source.is_some() { ":z" } else { "" },
-                ),
-            );
-        }
+            .is_err()
+        );
+        assert!(workspace_mount(&root, Some("workspaces"), &stage, "/workspace", false).is_err());
+        std::os::unix::fs::symlink(env::temp_dir(), root.join("escape")).unwrap();
+        assert!(
+            workspace_mount(
+                &root.join("escape"),
+                Some("workspaces"),
+                &root,
+                "/workspace",
+                false
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn fixture_execution(root: &Path) -> ContainerExecution {
@@ -422,16 +443,45 @@ mod tests {
             root,
             configured,
             allowed,
+            ExecutionKind::Agent,
             cancel,
         )
         .await
     }
 
     #[tokio::test]
+    async fn checks_reject_agent_environment_before_launch() {
+        let root = Path::new("/unused");
+        let error = run_container_until(
+            &fixture_execution(root),
+            "unused",
+            &[],
+            root,
+            &BTreeMap::from([("MODEL_TOKEN".into(), "WORKER_TOKEN".into())]),
+            &["MODEL_TOKEN".into()],
+            ExecutionKind::Check,
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "validation cannot receive agent environment variables"
+        );
+    }
+
+    #[tokio::test]
     async fn unscoped_container_launch_is_rejected_before_docker() {
-        let error = run_container("unused", &[], Path::new("/unused"), &BTreeMap::new(), &[])
-            .await
-            .unwrap_err();
+        let error = run_container(
+            "unused",
+            &[],
+            Path::new("/unused"),
+            &BTreeMap::new(),
+            &[],
+            ExecutionKind::Agent,
+        )
+        .await
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -468,6 +518,9 @@ mod tests {
             // Never borrow an installed worker's credentials, volumes, or tools.
             for key in [
                 "DONKEYSPACE_WORKSPACE_VOLUME",
+                "DONKEYSPACE_CODEX_AUTH_SOURCE",
+                "DONKEYSPACE_CODEX_AUTH_METHOD",
+                "DONKEYSPACE_CODEX_AUTH_MOUNT_SUFFIX",
                 "DONKEYSPACE_CODEX_VOLUME",
                 "DONKEYSPACE_CODEX_HOME_SOURCE",
                 "DONKEYSPACE_CODEX_HOME_MOUNT_SUFFIX",

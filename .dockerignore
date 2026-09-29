@@ -3,5 +3,7 @@
 /web/dist
 .git
 .env
+.donkeyspace/secrets/
+/docs/stability-work.md
 *.log
 *.tsbuildinfo
