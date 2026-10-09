@@ -1,3 +1,7 @@
+mod pr_revision;
+pub(crate) use pr_revision::{
+    persist_checkpoint as persist_pr_revision_checkpoint, prepare_pr_revision,
+};
 #[cfg(test)]
 mod clarification_tests;
 #[cfg(test)]

@@ -157,6 +157,130 @@ async fn fake_lifecycle_preserves_completed_siblings_through_partial_approval_an
     donkeyspace_db::complete_job(&pool, coordinator.id, &result)
         .await
         .unwrap();
+    // A PR revision starts a new coordinator from the completed database
+    // checkpoint. It reruns only the selected work item and keeps the source
+    // checkpoint immutable, including across another human approval.
+    let source_checkpoint = donkeyspace_db::lifecycle_checkpoints::load(&pool, coordinator.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .state;
+    let mut revision_input = input.clone();
+    revision_input["pr_revision"] =
+        json!({"source_job_id":coordinator.id,"base_sha":"fixture-head"});
+    revision_input["donkeyspace_resume"] = json!(true);
+    revision_input["donkeyspace_human_decision"] =
+        json!({"action":"revise","target":"rtl/one","feedback":"Update this item"});
+    let revision = create_job(&pool, Some(workflow), "architect", &revision_input)
+        .await
+        .unwrap();
+    let revision_workspace =
+        env::temp_dir().join(format!("donkeyspace-fake-revision-{}", revision.id));
+    let revision_repo = revision_workspace.join("repo");
+    fs::create_dir_all(revision_repo.join("docs")).unwrap();
+    for path in ["items.json", "one.md", "two.md"] {
+        fs::copy(
+            repo.join("docs").join(path),
+            revision_repo.join("docs").join(path),
+        )
+        .unwrap();
+    }
+    prepare_pr_revision(
+        &selection,
+        source_checkpoint.clone(),
+        "rtl/one",
+        &revision_repo,
+        &revision_workspace,
+        &[],
+    )
+    .unwrap();
+    for step in 0..2 {
+        if step == 1 {
+            let approval =
+                json!({"donkeyspace_human_decision":{"action":"approve","target":"rtl/one"}});
+            let resumed = resume_latest_paused_job(&pool, workflow, &approval)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(resumed.input["pr_revision"], revision_input["pr_revision"]);
+        }
+        acquire_job_lease(&pool, revision.id, "fake-test", 120)
+            .await
+            .unwrap()
+            .unwrap();
+        let job = mark_job_running(&pool, revision.id).await.unwrap().unwrap();
+        let tracking = LifecycleTracking {
+            pool: &pool,
+            policy: &policy,
+            coordinator: &job,
+            github: None,
+            publication: None,
+        };
+        if step == 0 {
+            persist_pr_revision_checkpoint(&selection, &revision_workspace, &job.input, &tracking)
+                .await
+                .unwrap();
+            fs::remove_file(revision_workspace.join(".donkeyspace/lifecycle-checkpoint.json"))
+                .unwrap();
+        }
+        let outcome = crate::plugin_container::with_execution_owner(
+            &pool,
+            job.id,
+            "fake-test",
+            run(
+                &selection,
+                &revision_repo,
+                &revision_workspace,
+                &job.input,
+                Some(tracking),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.outcome,
+            if step == 0 {
+                Outcome::NeedsHuman
+            } else {
+                Outcome::Implemented
+            }
+        );
+        if step == 1 {
+            donkeyspace_db::complete_job(
+                &pool,
+                revision.id,
+                &serde_json::to_value(outcome).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let revision_children = list_jobs_for_workflow_item(&pool, workflow)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|job| {
+            job.input.pointer("/plugin_execution/coordinator_run_id") == Some(&json!(revision.id))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(revision_children.len(), 1);
+    assert_eq!(
+        revision_children[0]
+            .input
+            .pointer("/plugin_execution/work_item/id"),
+        Some(&json!("one"))
+    );
+    assert_eq!(revision_children[0].status, "completed");
+    assert_eq!(
+        donkeyspace_db::lifecycle_checkpoints::load(&pool, coordinator.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        source_checkpoint
+    );
+    fs::remove_dir_all(revision_workspace).unwrap();
+
     let failed_run = create_job(&pool, Some(workflow), "architect", &input)
         .await
         .unwrap();

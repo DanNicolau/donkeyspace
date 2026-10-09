@@ -144,7 +144,7 @@ template for the final aggregate commit and PR.
 
 ## Reviewer PR Behavior
 
-Reviewer agents review donkeyspace-managed PRs after `pull_request` webhooks. A reviewer result of `needs_changes` posts a PR comment and keeps the issue in `pr_open`; it does not automatically requeue implementation in the default lifecycle. A lifecycle plugin may define its own bounded feedback edges between tasks.
+Reviewer agents review donkeyspace-managed PRs after `pull_request` webhooks. A reviewer result of `needs_changes` posts a PR comment and keeps the issue in `pr_open`; it does not automatically requeue implementation in the default lifecycle. A lifecycle plugin may define its own bounded feedback edges between tasks. An authorized explicit [PR revision command](pr-revisions.md) can schedule implementation against the existing PR head. During these runs, `pr_revision` contains the requested feedback and review context; preserve unrelated changes and address that feedback using the original issue as background.
 
 A reviewer result of `reviewed` also posts a PR comment and leaves the issue in `pr_open`; it is an audit signal, not automatic approval or merge authority.
 

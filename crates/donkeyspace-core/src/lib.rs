@@ -3,6 +3,7 @@ pub mod facade;
 pub mod github_workflow;
 pub mod plugin;
 pub mod policy;
+pub mod pr_revision;
 pub mod repository;
 pub mod run_result;
 pub mod state;

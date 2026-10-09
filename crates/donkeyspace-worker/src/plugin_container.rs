@@ -308,7 +308,7 @@ async fn run_container_until(
         // surviving its CLI process. Docker rm --force is idempotent for an
         // absent name. The supervisor owns cleanup if this future is dropped.
         let mut cleanup = Command::new("docker");
-        cleanup.args(["rm", "--force", &container_name]);
+        cleanup.args(["rm", "--force", container_name]);
         let output =
             donkeyspace_runner::process::run_command_until(&mut docker, Some(cleanup), cancel)
                 .await?;

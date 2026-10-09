@@ -3,6 +3,7 @@ pub mod container_executions;
 pub mod execution_recovery;
 pub mod ingress;
 pub mod lifecycle_checkpoints;
+pub mod pr_revisions;
 pub mod repository_label_sync;
 pub mod repository_retirement;
 pub mod workflow_blockers;
@@ -112,6 +113,9 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
     ))
     .execute(&mut *transaction)
     .await?;
+    sqlx::raw_sql(include_str!("../../../migrations/0010_pr_revisions.sql"))
+        .execute(&mut *transaction)
+        .await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -1132,7 +1136,7 @@ pub async fn resume_latest_paused_job<'a>(
         UPDATE jobs
         SET
             status = 'queued',
-            input = $2,
+            input = CASE WHEN input ? 'pr_revision' THEN input || $2 ELSE $2 END,
             result = NULL,
             lease_owner = NULL,
             lease_expires_at = NULL,

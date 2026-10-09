@@ -540,6 +540,16 @@ immediately. Donkeyspace's durable projection records remain authoritative for
 scheduling, retries, managed dependency edges, and reconciliation. An approval
 command is not exposed while publication or GitHub projection is incomplete.
 
+## Revisions after PR publication
+
+[PR revision commands](pr-revisions.md) can reopen a completed task and its
+dependents on an existing managed PR. They use manifest task names and scopes,
+retain independent work, and repeat required approvals. Each task receives
+`pr_revision` feedback and `pull_request` context alongside its usual input.
+Successful lifecycle snapshots are retained in PostgreSQL after workspace
+cleanup. Human changes on the PR are preserved; declared filesystem roots
+determine which prior task evidence those changes invalidate.
+
 ## MCP boundary and limitations
 
 Named stdio and HTTP MCP definitions are validated and included in task input

@@ -343,10 +343,14 @@ fi
                 .contains("drain agent jobs")
         );
         assert_eq!(fs::read(&auth).unwrap(), bytes);
+        // Other parallel tests may fork while this descriptor is open.
+        // Release the lock explicitly instead of waiting for inherited copies.
+        reader.unlock().unwrap();
         drop(reader);
         let writer = fs::File::open(&auth).unwrap();
         writer.try_lock().unwrap();
         assert!(credential_read_lock(&home).is_err());
+        writer.unlock().unwrap();
         drop(writer);
         fs::write(&f.program, "#!/bin/sh\nexit 7\n").unwrap();
         assert!(f.connect(CodexLoginMethod::ChatGpt).is_err());

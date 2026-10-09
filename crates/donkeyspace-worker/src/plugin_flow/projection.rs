@@ -31,7 +31,7 @@ pub(super) async fn synchronize_work_items(
         return Ok(());
     };
     crate::cancellation::side_effect(tracking.pool, tracking.coordinator.id, async {
-        let publications = list_agent_publications_for_run(
+        let mut publications = list_agent_publications_for_run(
             tracking.pool,
             tracking.coordinator.id,
             Some(tracking.coordinator.id),
@@ -39,9 +39,22 @@ pub(super) async fn synchronize_work_items(
         .await?;
         let records =
             list_projected_work_items_for_run(tracking.pool, tracking.coordinator.id).await?;
+        for record in &records {
+            if let Some(id) = record.accepted_publication_id
+                && !publications.iter().any(|publication| publication.id == id)
+                && let Some(publication) =
+                    donkeyspace_db::get_agent_publication(tracking.pool, id).await?
+            {
+                publications.push(publication);
+            }
+        }
         let proposed = publications
             .iter()
-            .filter(|item| item.kind == "checkpoint" && item.status == "published")
+            .filter(|item| {
+                item.kind == "checkpoint"
+                    && item.status == "published"
+                    && item.coordinator_job_id == tracking.coordinator.id
+            })
             .max_by_key(|item| item.id);
         if phase == ProjectionPhase::Proposed && proposed.is_none() {
             return Err("architect revision has no published checkpoint".into());

@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+donkeyspace-core = { path = "../donkeyspace-core" }
 hex.workspace = true
 hmac.workspace = true
 http.workspace = true

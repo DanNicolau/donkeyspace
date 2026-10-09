@@ -40,6 +40,7 @@ mod plugin_container;
 mod plugin_flow;
 mod plugin_input;
 mod plugin_task_graph;
+mod pr_revision;
 mod publication;
 mod repo_context;
 mod repository_files;
@@ -633,6 +634,7 @@ fn attach_repair_pull_request_input(
     base_ref: String,
     base_sha: Option<String>,
 ) {
+    donkeyspace_core::pr_revision::clear_execution_context(input);
     if let Value::Object(map) = input {
         map.insert(
             "pull_request".to_string(),
@@ -948,6 +950,7 @@ async fn execute_developer_job(
     github_token: Option<&str>,
     running_job: JobRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut running_job = running_job;
     let lifecycle_selection = policy.lifecycle.plugin.as_ref();
     if lifecycle_selection.is_none() && !policy.agents.developer.enabled {
         fail_role_job(
@@ -1063,10 +1066,10 @@ async fn execute_developer_job(
         }
     }
 
-    let repository_context = match build_repository_context(
+    let repository_context = match pr_revision::prepare(
         pool,
-        &running_job.input,
-        running_job.id,
+        policy,
+        &mut running_job,
         github_token,
         repo_context_config,
     )
@@ -1264,6 +1267,14 @@ async fn execute_developer_job(
         }
     };
 
+    if result.outcome == Outcome::Implemented {
+        pr_revision::save_checkpoint(pool, &running_job, repo_context_config).await?;
+    }
+    let is_pr_revision = running_job.input.get("pr_revision").is_some();
+    if is_pr_revision && result.outcome != Outcome::Implemented {
+        pr_revision::report(pool, &running_job, &result, None).await?;
+    }
+
     // Human pauses committed by the plugin must not be overwritten. A new
     // approval may have requeued it by now; never overwrite that newer state.
     if lifecycle_selection.is_some()
@@ -1288,8 +1299,20 @@ async fn execute_developer_job(
         }
         let result_value = serde_json::to_value(&result)?;
         let workflow_state = workflow_state_for_outcome(result.outcome);
-        complete_job(pool, running_job.id, &result_value).await?;
-        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
+        let paused = result.outcome == Outcome::NeedsHuman
+            && (lifecycle_selection.is_some() || is_pr_revision);
+        if paused {
+            pr_revision::save_builtin_pause(
+                &running_job,
+                &publication_context,
+                &repository_checkout_path(&repository_context)?,
+            )
+            .await?;
+            donkeyspace_db::pause_job(pool, running_job.id, &result_value).await?;
+        } else {
+            complete_job(pool, running_job.id, &result_value).await?;
+            cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
+        }
 
         if let Some(workflow_item_id) = running_job.workflow_item_id {
             update_workflow_state_for_job(
@@ -1338,10 +1361,17 @@ async fn execute_developer_job(
 
     let repo_path = repository_checkout_path(&repository_context)?;
     let base_branch = repository_default_branch(&running_job.input);
-    let changed_files =
-        git_changed_files_since(&repo_path, &format!("origin/{base_branch}")).await?;
+    let comparison_base = if is_pr_revision {
+        running_job.input["pr_revision"]["base_sha"]
+            .as_str()
+            .ok_or("missing revision base")?
+            .to_owned()
+    } else {
+        format!("origin/{base_branch}")
+    };
+    let changed_files = git_changed_files_since(&repo_path, &comparison_base).await?;
     let uncommitted_files = git_changed_files(&repo_path).await?;
-    if changed_files.is_empty() {
+    if changed_files.is_empty() && !is_pr_revision {
         publish_job_attempt(
             &publication_context,
             &repo_path,
@@ -1376,6 +1406,9 @@ async fn execute_developer_job(
         result.outcome = Outcome::Failed;
         result.summary = "Implementation failed required checks.".to_string();
         result.blocked_reason = Some(required_check_failure_summary(&result.tests));
+        if is_pr_revision {
+            pr_revision::report(pool, &running_job, &result, None).await?;
+        }
         publish_job_attempt(
             &publication_context,
             &repo_path,
@@ -1435,6 +1468,69 @@ async fn execute_developer_job(
             job_id = %running_job.id,
             "implementation job blocked by required checks"
         );
+        return Ok(());
+    }
+
+    if is_pr_revision {
+        let published = pr_revision::publish(
+            pool,
+            &running_job,
+            repo_context_config,
+            github_token,
+            &result,
+            &repo_path,
+            &uncommitted_files,
+        )
+        .await;
+        let commit = match published {
+            Ok(sha) => Some(sha),
+            Err(error) => {
+                result.outcome = Outcome::NeedsHuman;
+                result.summary =
+                    "PR revision publication needs attention; existing PR commits were preserved."
+                        .into();
+                result.human_review_reason = Some(error.to_string());
+                publish_job_attempt(
+                    &publication_context,
+                    &repo_path,
+                    &publication_workspace,
+                    &running_job,
+                    "pr-revision",
+                    Some(result.outcome),
+                    &error.to_string(),
+                )
+                .await;
+                None
+            }
+        };
+        // Publication conflicts terminate this attempt. A new explicit command
+        // starts from the latest remote head; an approval cannot overwrite it.
+        complete_job(pool, running_job.id, &serde_json::to_value(&result)?).await?;
+        let state = if commit.is_some() {
+            WorkflowState::PrOpen
+        } else {
+            WorkflowState::NeedsHuman
+        };
+        if let Some(workflow) = running_job.workflow_item_id {
+            update_workflow_state_for_job(pool, workflow, running_job.id, state.as_str()).await?;
+            for action in triage_github_issue_actions(policy, &running_job.input, &result, state) {
+                create_outbound_action(
+                    pool,
+                    &OutboundActionInput {
+                        workflow_item_id: workflow,
+                        job_id: Some(running_job.id),
+                        provider: "github".into(),
+                        action_type: action.action_type,
+                        payload: action.payload,
+                    },
+                )
+                .await?;
+            }
+        }
+        pr_revision::report(pool, &running_job, &result, commit.as_deref()).await?;
+        record_coordinator_event(pool, &running_job, "pr_revision_completed", &result.summary, result.human_review_reason.as_deref(), Some(result.outcome), json!([{ "kind":"pull_request", "url":running_job.input["pull_request"]["html_url"], "commit":commit }])).await?;
+        queue_lifecycle_status_for_job(pool, &running_job).await?;
+        cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
         return Ok(());
     }
 
@@ -2252,6 +2348,10 @@ async fn stop_role_job(
             json!([]),
         )
         .await?;
+    }
+
+    if running_job.input.get("pr_revision").is_some() {
+        pr_revision::report(pool, running_job, result, None).await?;
     }
     queue_lifecycle_status_for_job(pool, running_job).await?;
     Ok(())
@@ -3406,6 +3506,7 @@ struct AgentRunInput {
     repository: AgentRepositoryInput,
     issue: AgentIssueInput,
     pull_request: Option<Value>,
+    pr_revision: Option<Value>,
     policy: AgentPolicyInput,
     workspace: AgentWorkspaceInput,
     repository_context: Option<Value>,
@@ -3496,6 +3597,7 @@ fn agent_run_input(
                 .unwrap_or_default(),
         },
         pull_request: input.pointer("/pull_request").cloned(),
+        pr_revision: input.get("pr_revision").cloned(),
         policy: AgentPolicyInput {
             path: ".donkeyspace/policy.json".into(),
             snapshot_id: None,
@@ -3805,6 +3907,26 @@ mod tests {
             run_input.workspace.result_path,
             ".donkeyspace/run-result.json"
         );
+    }
+
+    #[test]
+    fn developer_receives_revision_feedback_and_current_pr_head() {
+        let input = json!({
+            "issue":{"number":1,"body":"Original requirement"},
+            "pull_request":{"number":2,"head":{"sha":"current-head"}},
+            "pr_revision":{"base_sha":"current-head","feedback":{"instructions":"Fix the boundary","inline_comments":[{"path":"src/lib.rs","line":4,"body":"Off by one"}]}},
+            "comment":{"body":"/studio revise\nFix the boundary"},
+        });
+        let agent = serde_json::to_value(agent_run_input(
+            Uuid::now_v7(),
+            "developer",
+            &input,
+            "result.json",
+        ))
+        .unwrap();
+        assert_eq!(agent["pr_revision"], input["pr_revision"]);
+        assert_eq!(agent["pull_request"]["head"]["sha"], "current-head");
+        assert_eq!(agent["issue"]["body"], "Original requirement");
     }
 
     #[test]
