@@ -136,7 +136,7 @@ pub fn cleanup_repository_context(
     Ok(())
 }
 
-fn summarize_checkout(
+pub(crate) fn summarize_checkout(
     owner: &str,
     repo: &str,
     default_branch: &str,

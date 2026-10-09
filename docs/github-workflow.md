@@ -39,7 +39,8 @@ The current implementation handles these GitHub events:
 - `push` to the default branch: schedule repair checks for open donkeyspace-managed PRs targeting that branch.
 
 Draft and unmanaged PRs do not queue review. Duplicate review and repair jobs
-for the same recorded PR head/base pair are suppressed. Other webhook event
+for the same recorded PR head/base pair are suppressed. PR conversation revision commands are handled separately from issue triggers.
+Other webhook event
 types are recorded for idempotency and otherwise ignored; check-run and
 check-suite handling is not implemented.
 
@@ -88,6 +89,13 @@ each action completed or failed.
 There is no cancellation API. A block label prevents new jobs but does not stop
 an already running command. Approval commands work only on the parent issue and
 still require an authorized `needs_human_resume` actor.
+
+## Open PR revisions
+
+An explicit `/donkeyspace revise` comment on a managed PR runs a revision against
+its current head and updates the same branch after validation. Lifecycle plugins
+require a task target. See [PR revisions](pr-revisions.md) for authorization,
+review/thread selection, approval, and recovery behavior.
 
 ## Conflict Handling
 

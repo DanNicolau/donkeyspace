@@ -205,6 +205,21 @@ pub async fn apply_pull_request_effects_on(
     if current.provider_state == "closed" || pr_generation != Some(current.generation) {
         return Ok(None);
     }
+    let revision_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pr_revisions r JOIN jobs j ON j.id=r.job_id WHERE r.workflow_item_id=$1 AND j.generation=$2 AND j.status IN ('queued','leased','running','paused','cancel_requested'))",
+    ).bind(workflow).bind(current.generation).fetch_one(&mut *tx).await?;
+    if revision_active && state == Some("pr_open") {
+        // A synchronize webhook must not replace an active revision's running
+        // or approval state with pr_open merely because the PR still exists.
+        tx.commit().await?;
+        return Ok(Some(current.generation));
+    }
+    if revision_active && matches!(state, Some("pr_closed" | "pr_merged")) {
+        sqlx::query("UPDATE jobs SET status=CASE WHEN status='running' THEN 'cancel_requested' ELSE 'cancelled' END,updated_at=now() WHERE workflow_item_id=$1 AND generation=$2 AND input ? 'pr_revision' AND status IN ('waiting','queued','leased','running','paused')")
+            .bind(workflow).bind(current.generation).execute(&mut *tx).await?;
+        sqlx::query("UPDATE approval_requests SET state='cancelled',updated_at=now() WHERE coordinator_job_id IN (SELECT job_id FROM pr_revisions WHERE workflow_item_id=$1) AND state='pending'")
+            .bind(workflow).execute(&mut *tx).await?;
+    }
     if let Some(state) = state
         && current.current_state.as_deref() != Some(state)
     {

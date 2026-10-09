@@ -122,6 +122,8 @@ pub(super) async fn execute_task(
             "parameters": parameters,
             "resources": resources,
             "previous_tasks": previous.iter().rev().take(64).rev().collect::<Vec<_>>(),
+            "pr_revision": issue_input.get("pr_revision"),
+            "pull_request": issue_input.get("pull_request"),
             "mcp_servers": selected_mcp,
         })).await?;
     let image = role

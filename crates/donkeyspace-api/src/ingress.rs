@@ -38,6 +38,9 @@ pub(super) async fn persist_issue_webhook(
     let policy = &app_state.policy;
     let payload: GitHubIssueWebhook = serde_json::from_slice(body)?;
     let mut payload_value: Value = serde_json::from_slice(body)?;
+    if payload_value.pointer("/issue/pull_request").is_some() {
+        return pr_revision::persist(pool, app_state, event, delivery, body).await;
+    }
     let repository_id = upsert_repository(
         pool,
         &RepositoryInput {
@@ -418,6 +421,9 @@ pub(super) async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Queued(Box::new(job)));
     }
 
+    if event == "issue_comment" && donkeyspace_db::pr_revisions::has_revision(&mut *connection, workflow_item_id).await? {
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
     let lifecycle_role = lifecycle_start_role(policy)?;
     let initial_role = lifecycle_role.unwrap_or_else(|| AgentRole::Triage.as_str().to_string());
     let job = create_job(&mut *connection, Some(workflow_item_id), &initial_role, &payload_value).await?;

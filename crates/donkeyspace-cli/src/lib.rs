@@ -2744,6 +2744,38 @@ mod tests {
     }
 
     #[test]
+    fn opens_schema_nine_without_rewriting_authentication_settings() {
+        let directory = env::temp_dir().join(format!(
+            "donkeyspace-schema-nine-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        let bytes = br#"{
+            "schema_version": 9, "source_tree": "/src", "runtime_source": "local-build",
+            "api_port": 8080, "codex_home": "/config/automation-codex",
+            "codex_auth_method": "chatgpt",
+            "github_access": {"example/project": [{"type":"user","login":"maintainer"}]},
+            "github_approvers": {"example/project": [{"type":"user","login":"reviewer"}]}
+        }"#;
+        fs::write(&path, bytes).unwrap();
+        let instance = Instance::open(Some(directory.clone())).unwrap();
+        let config = instance.config().unwrap();
+        assert_eq!(config.schema_version, 9);
+        assert_eq!(config.codex_auth_method, Some(CodexLoginMethod::ChatGpt));
+        assert_eq!(
+            config.codex_home.as_deref(),
+            Some(Path::new("/config/automation-codex"))
+        );
+        assert_ne!(config.github_access, config.github_approvers);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn migrates_legacy_configurations_atomically() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

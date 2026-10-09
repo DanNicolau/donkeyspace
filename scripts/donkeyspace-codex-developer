@@ -32,7 +32,7 @@ codex exec \
   --dangerously-bypass-approvals-and-sandbox \
   --output-schema "$SCHEMA_PATH" \
   --output-last-message "$RESULT_PATH" \
-  "You are the Donkeyspace developer agent. Read ${INPUT_ABS}. Implement the issue by modifying files in ${REPO_PATH}. You may inspect and edit the repository checkout, but do not commit, push, open pull requests, or edit files outside the checkout. If the issue is still ambiguous, return needs_info with concrete questions. If blocked, return blocked or needs_human with a reason. If you implement changes, return outcome implemented, include changed_files, and include at least one tests entry; use status not_run with command [\"not_run\"] when no command was run. Return only a valid Donkeyspace run-result JSON object."
+  "You are the Donkeyspace developer agent. Read ${INPUT_ABS}. When pr_revision is present, address its feedback using the supplied PR review context and preserve existing unrelated changes; the original issue is background context. Implement the requested work by modifying files in ${REPO_PATH}. You may inspect and edit the repository checkout, but do not commit, push, open pull requests, or edit files outside the checkout. If the issue is still ambiguous, return needs_info with concrete questions. If blocked, return blocked or needs_human with a reason. If you implement changes, return outcome implemented, include changed_files, and include at least one tests entry; use status not_run with command [\"not_run\"] when no command was run. Return only a valid Donkeyspace run-result JSON object."
 
 if [ ! -s "$RESULT_PATH" ]; then
   echo "codex did not write $RESULT_PATH" >&2

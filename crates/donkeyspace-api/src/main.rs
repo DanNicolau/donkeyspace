@@ -1,4 +1,5 @@
 mod ingress;
+mod pr_revision;
 use ingress::*;
 
 use axum::{
@@ -2405,6 +2406,9 @@ fn lifecycle_start_role(policy: &Policy) -> Result<Option<String>, Box<dyn std::
 }
 
 fn can_retry_job(job: &JobRecord) -> bool {
+    if job.input.get("pr_revision").is_some() {
+        return false;
+    }
     if job.status != "failed" {
         return false;
     }
@@ -2457,6 +2461,7 @@ fn parse_positive_i64(value: &str) -> Option<i64> {
 }
 
 fn attach_pull_request_input(input: &mut Value, pull_request: Value) {
+    donkeyspace_core::pr_revision::clear_execution_context(input);
     if let Value::Object(map) = input {
         map.insert("pull_request".to_string(), pull_request);
     }

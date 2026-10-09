@@ -1,3 +1,5 @@
+mod pr_revision;
+
 use hmac::{Hmac, Mac};
 use http::{
     StatusCode,
