@@ -1483,7 +1483,18 @@ async fn execute_developer_job(
         )
         .await;
         let commit = match published {
-            Ok(sha) => Some(sha),
+            Ok(sha) => {
+                if let Err(error) =
+                    pr_revision::mark_ready(pool, policy, &running_job, github_token, &sha).await
+                {
+                    result.outcome = Outcome::NeedsHuman;
+                    result.summary = "PR changes were published, but returning the PR to ready for review needs attention.".into();
+                    result.human_review_reason = Some(format!(
+                        "{error}. Review the published commit and PR state before marking it ready manually."
+                    ));
+                }
+                Some(sha)
+            }
             Err(error) => {
                 result.outcome = Outcome::NeedsHuman;
                 result.summary =
@@ -1506,7 +1517,7 @@ async fn execute_developer_job(
         // Publication conflicts terminate this attempt. A new explicit command
         // starts from the latest remote head; an approval cannot overwrite it.
         complete_job(pool, running_job.id, &serde_json::to_value(&result)?).await?;
-        let state = if commit.is_some() {
+        let state = if commit.is_some() && result.outcome == Outcome::Implemented {
             WorkflowState::PrOpen
         } else {
             WorkflowState::NeedsHuman
@@ -1590,6 +1601,10 @@ async fn execute_developer_job(
         let owner = repository_owner(&running_job.input)?;
         let repo = repository_name(&running_job.input)?;
         let pull_request_body = developer_pull_request_body(&running_job, &result, &changed_files);
+        let guidance =
+            pr_revision::instructions(pool, policy, &running_job, running_job.id).await?;
+        let pull_request_body =
+            donkeyspace_core::pr_revision::with_instructions(&pull_request_body, &guidance);
         let github_token = github_token.ok_or(
             "configured GitHub authentication is required to open implementation pull requests",
         )?;

@@ -1,6 +1,11 @@
 # Revising an open pull request
 
 An authorized maintainer can ask Donkeyspace to revise an existing managed PR.
+Generated PR descriptions include a Requesting changes section with the configured
+command prefix, available task targets, and a link to the parent issue. Existing
+PRs receive this section when a revision starts or resumes; unrelated description
+text is preserved.
+
 Post a new top-level conversation comment **on the PR**:
 
 ```text
@@ -9,7 +14,12 @@ Handle the empty input case without changing the public interface.
 ```
 
 This runs the built-in developer and configured required checks, then updates
-the same PR branch. It does not approve or merge the PR or resolve review
+the same PR branch. The worker converts the PR to draft before editing and marks
+it ready for review only after successful validation and publication, using
+[GitHub’s draft/ready mutations](https://docs.github.com/en/graphql/reference/pulls#convertpullrequesttodraft). Paused or
+failed revisions remain draft; failure to enter draft prevents execution. A
+readiness update failure is reported separately from a successful code push, so
+the published commit remains visible. It does not approve or merge the PR or resolve review
 threads automatically. Use your configured facade command instead of
 `/donkeyspace` when applicable.
 
@@ -20,6 +30,12 @@ For a lifecycle plugin, explicitly select a manifest task. Workflow tasks use
 /donkeyspace revise implement/queue
 Apply the review's reset correction and update the affected tests.
 ```
+
+A behavior change that also changes the approved specification should start with
+the planning task. An implementation-only target may pause if its write scope or
+role contract prevents it from updating that specification. Continue such a pause
+with the permitted upstream revision command on the parent issue, rather than
+approving unchanged work or creating another PR revision.
 
 A planning/specification revision can target a workflow task, for example
 `/donkeyspace revise plan`. Tasks with required approval request a new approval
