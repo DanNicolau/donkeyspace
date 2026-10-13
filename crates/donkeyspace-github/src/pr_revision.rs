@@ -21,9 +21,10 @@ impl GitHubClient {
             ));
         }
         if expected_head.is_some_and(|head| pr["head"]["sha"].as_str() != Some(head)) {
-            return Err(GitHubClientError::InvalidResponse(
-                "PR head changed before draft/ready transition".into(),
-            ));
+            return Err(GitHubClientError::PullRequestHeadMismatch {
+                expected: expected_head.unwrap().into(),
+                actual: pr["head"]["sha"].as_str().map(str::to_owned),
+            });
         }
         if pr["draft"].as_bool() == Some(draft) {
             return Ok(());
@@ -87,9 +88,10 @@ impl GitHubClient {
         {
             // GraphQL has no expected-head argument. If a push races the
             // transition, restore draft rather than endorse an unchecked head.
-            return Err(GitHubClientError::InvalidResponse(
-                "PR head moved during readiness transition".into(),
-            ));
+            return Err(GitHubClientError::PullRequestHeadMismatch {
+                expected: expected_head.unwrap().into(),
+                actual: updated["headRefOid"].as_str().map(str::to_owned),
+            });
         }
         Ok(())
     }
@@ -413,6 +415,37 @@ mod tests {
             );
             assert_eq!(f.pr.lock().unwrap()["draft"], true);
         }
+    }
+
+    #[tokio::test]
+    async fn stale_heads_are_identifiable_before_and_after_the_ready_mutation() {
+        let f = fixture(true, vec![]);
+        let error = f
+            .client
+            .set_pull_request_draft("example", "project", 2, false, Some("published"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GitHubClientError::PullRequestHeadMismatch { expected, actual }
+            if expected == "published" && actual.as_deref() == Some("accepted"))
+        );
+        assert!(f.writes.lock().unwrap().is_empty());
+
+        let f = fixture(
+            true,
+            vec![response(false, "previous"), response(true, "previous")],
+        );
+        let error = f
+            .client
+            .set_pull_request_draft("example", "project", 2, false, Some("accepted"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GitHubClientError::PullRequestHeadMismatch { expected, actual }
+            if expected == "accepted" && actual.as_deref() == Some("previous"))
+        );
+        assert_eq!(f.pr.lock().unwrap()["draft"], true);
+        assert_eq!(f.writes.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

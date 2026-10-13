@@ -1490,7 +1490,7 @@ async fn execute_developer_job(
                     result.outcome = Outcome::NeedsHuman;
                     result.summary = "PR changes were published, but returning the PR to ready for review needs attention.".into();
                     result.human_review_reason = Some(format!(
-                        "{error}. Review the published commit and PR state before marking it ready manually."
+                        "The PR branch was updated to {sha}. Readiness confirmation failed: {error}\n\nReview the published commit and PR state before marking it ready manually; the implementation does not need to be rerun."
                     ));
                 }
                 Some(sha)

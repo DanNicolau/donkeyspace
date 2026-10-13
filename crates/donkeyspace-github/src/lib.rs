@@ -65,6 +65,11 @@ pub enum GitHubClientError {
     Octocrab(#[from] octocrab::Error),
     #[error("invalid github response: {0}")]
     InvalidResponse(String),
+    #[error("PR head does not match expected commit {expected}; GitHub reported {actual:?}")]
+    PullRequestHeadMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
     #[error("github rate limit requires waiting {retry_after_seconds} seconds")]
     RateLimited { retry_after_seconds: u64 },
     #[error("github authentication configuration is invalid: {0}")]
