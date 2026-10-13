@@ -261,7 +261,7 @@ fn validate_live_pr(
     expected_head: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if live["state"] != "open" || live["merged"] == true {
-        return Err("The PR is closed or merged; revision publication stopped.".into());
+        return Err("The PR is closed or merged.".into());
     }
     if live["head"]["ref"] != input["pull_request"]["head"]["ref"]
         || live["base"]["ref"] != input["pull_request"]["base"]["ref"]
@@ -270,7 +270,13 @@ fn validate_live_pr(
         return Err("The PR branch or target changed; request a fresh revision against its current configuration.".into());
     }
     if expected_head.is_some_and(|head| live["head"]["sha"].as_str() != Some(head)) {
-        return Err("The PR head changed during this revision. No update was pushed. Review the retained attempt and submit a new PR revision command to apply feedback to the latest head; human commits have been preserved.".into());
+        return Err(
+            donkeyspace_github::GitHubClientError::PullRequestHeadMismatch {
+                expected: expected_head.unwrap().into(),
+                actual: live["head"]["sha"].as_str().map(str::to_owned),
+            }
+            .into(),
+        );
     }
     Ok(())
 }
@@ -367,20 +373,67 @@ pub async fn mark_ready(
     let owner = repository_owner(&job.input)?;
     let repo = repository_name(&job.input)?;
     let guidance = instructions(pool, policy, job, job.id).await?;
-    cancellation::side_effect(pool, job.id, async {
-        let live = client
-            .pull_request(&owner, &repo, number(&job.input)? as u64)
-            .await?;
-        validate_live_pr(&job.input, &live, Some(sha))?;
-        client
-            .ensure_revision_instructions(&owner, &repo, number(&job.input)? as u64, &guidance)
-            .await?;
-        client
-            .set_pull_request_draft(&owner, &repo, number(&job.input)? as u64, false, Some(sha))
-            .await?;
-        Ok::<_, Box<dyn std::error::Error>>(())
+    let previous_head = job.input["pr_revision"]["base_sha"]
+        .as_str()
+        .ok_or("Revision base is missing")?;
+    let delays = [1, 2, 4, 8, 16].map(Duration::from_secs);
+    retry_readiness(previous_head, sha, &delays, || {
+        cancellation::side_effect(pool, job.id, async {
+            let live = client
+                .pull_request(&owner, &repo, number(&job.input)? as u64)
+                .await?;
+            validate_live_pr(&job.input, &live, Some(sha))?;
+            client
+                .ensure_revision_instructions(&owner, &repo, number(&job.input)? as u64, &guidance)
+                .await?;
+            client
+                .set_pull_request_draft(&owner, &repo, number(&job.input)? as u64, false, Some(sha))
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
     })
     .await
+}
+
+/// GitHub can briefly return the pre-push PR head after a successful push.
+/// Retry only that known stale head; unrelated commits, closure, retargeting,
+/// permissions errors, and failed draft restoration require attention.
+async fn retry_readiness<F, Fut>(
+    previous_head: &str,
+    published_head: &str,
+    delays: &[Duration],
+    mut attempt: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    let mut delays = delays.iter();
+    loop {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let stale = matches!(error.downcast_ref::<donkeyspace_github::GitHubClientError>(),
+                    Some(donkeyspace_github::GitHubClientError::PullRequestHeadMismatch { expected, actual })
+                    if expected == published_head && actual.as_deref() == Some(previous_head) && previous_head != published_head);
+                if !stale {
+                    return Err(error);
+                }
+                let Some(delay) = delays.next() else {
+                    return Err(format!("Commit {published_head} was published, but GitHub still reports the previous head {previous_head}. Readiness confirmation timed out; the PR remains draft.").into());
+                };
+                tracing::info!(
+                    published_head,
+                    previous_head,
+                    delay_seconds = delay.as_secs(),
+                    "waiting for GitHub to expose the published PR head"
+                );
+                // Release the side-effect lock between attempts so cancellation
+                // can proceed. Every retry revalidates execution and PR state.
+                tokio::time::sleep(*delay).await;
+            }
+        }
+    }
 }
 
 fn push_arguments(remote: &str, branch: &str) -> Vec<String> {
@@ -578,6 +631,72 @@ mod tests {
             let mut changed = pr.clone();
             *changed.pointer_mut(path).unwrap() = value;
             assert!(validate_live_pr(&input, &changed, Some("a")).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_retries_stale_pre_push_reads_until_publication_is_visible() {
+        let pr = json!({"state":"open","head":{"ref":"work","sha":"old","repo":{"full_name":"o/r"}},"base":{"ref":"main","repo":{"full_name":"o/r"}}});
+        let input = json!({"pull_request":pr});
+        let mut attempts = 0;
+        retry_readiness("old", "published", &[Duration::ZERO; 3], || {
+            attempts += 1;
+            let mut live = pr.clone();
+            if attempts == 3 {
+                live["head"]["sha"] = json!("published");
+            }
+            std::future::ready(validate_live_pr(&input, &live, Some("published")))
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_retains_successful_publication_in_its_error() {
+        let mut attempts = 0;
+        let error = retry_readiness("old", "published", &[Duration::ZERO; 2], || {
+            attempts += 1;
+            std::future::ready(Err(
+                donkeyspace_github::GitHubClientError::PullRequestHeadMismatch {
+                    expected: "published".into(),
+                    actual: Some("old".into()),
+                }
+                .into(),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert!(error.to_string().contains("Commit published was published"));
+        assert!(error.to_string().contains("PR remains draft"));
+        assert!(!error.to_string().contains("No update was pushed"));
+    }
+
+    #[tokio::test]
+    async fn readiness_never_retries_human_updates_closure_or_retargeting() {
+        let pr = json!({"state":"open","head":{"ref":"work","sha":"published","repo":{"full_name":"o/r"}},"base":{"ref":"main","repo":{"full_name":"o/r"}}});
+        let input = json!({"pull_request":pr});
+        for (path, value) in [
+            ("/head/sha", json!("human-update")),
+            ("/head/sha", Value::Null),
+            ("/state", json!("closed")),
+            ("/base/ref", json!("other")),
+            ("/head/ref", json!("other")),
+            ("/head/repo/full_name", json!("fork/r")),
+        ] {
+            let mut live = pr.clone();
+            *live.pointer_mut(path).unwrap() = value;
+            let mut attempts = 0;
+            assert!(
+                retry_readiness("old", "published", &[Duration::ZERO; 3], || {
+                    attempts += 1;
+                    std::future::ready(validate_live_pr(&input, &live, Some("published")))
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(attempts, 1, "{path}");
         }
     }
 }

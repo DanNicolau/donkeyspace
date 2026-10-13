@@ -98,6 +98,14 @@ published commit. The dashboard's existing run history and lifecycle timeline
 show revision progress and approval decisions. No separate dashboard control
 is required.
 
+After pushing, readiness checks allow up to five retries with waits of 1, 2, 4,
+8, and 16 seconds while GitHub still reports the known pre-push head. Each retry
+rechecks execution eligibility, PR state, branches, and the published commit.
+An unrelated head, closure, or retargeting stops readiness immediately. A push
+racing the ready mutation restores draft before any retry. If confirmation
+still fails, the result retains the published commit and reports a readiness
+failure; rerunning implementation is unnecessary.
+
 ## Failures and upgrades
 
 Only one revision/lifecycle execution may be active or paused for a workflow.
