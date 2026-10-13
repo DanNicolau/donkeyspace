@@ -1,4 +1,5 @@
 pub mod cancellation;
+pub mod comment_polling;
 pub mod container_executions;
 pub mod execution_recovery;
 pub mod ingress;
@@ -116,6 +117,11 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
     sqlx::raw_sql(include_str!("../../../migrations/0010_pr_revisions.sql"))
         .execute(&mut *transaction)
         .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0011_github_comment_polling.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -887,11 +893,14 @@ pub async fn record_webhook_delivery<'a>(
     event_name: &str,
     payload: &Value,
 ) -> Result<Option<i64>, DbError> {
+    let comment_id = (event_name == "issue_comment" && payload["action"] == "created")
+        .then(|| payload["comment"]["id"].as_i64())
+        .flatten();
     let inserted = sqlx::query_scalar::<_, i64>(
         r#"
-        INSERT INTO webhook_deliveries (repository_id, delivery_id, event_name, payload)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (delivery_id) DO NOTHING
+        INSERT INTO webhook_deliveries (repository_id, delivery_id, event_name, payload, github_comment_id)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT DO NOTHING
         RETURNING id
         "#,
     )
@@ -899,10 +908,20 @@ pub async fn record_webhook_delivery<'a>(
     .bind(delivery_id)
     .bind(event_name)
     .bind(payload)
+    .bind(comment_id)
     .fetch_optional(pool)
     .await?;
 
     Ok(inserted)
+}
+
+pub async fn github_comment_delivery_exists(
+    pool: &PgPool,
+    repository_id: i64,
+    comment_id: i64,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM webhook_deliveries WHERE repository_id=$1 AND github_comment_id=$2)")
+        .bind(repository_id).bind(comment_id).fetch_one(pool).await?)
 }
 
 pub async fn webhook_delivery_exists<'a>(

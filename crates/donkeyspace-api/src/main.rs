@@ -1,3 +1,4 @@
+mod comment_polling;
 mod ingress;
 mod pr_revision;
 use ingress::*;
@@ -456,6 +457,21 @@ impl GitHubPollConfig {
 }
 
 impl GitHubPollController {
+    async fn observe_server_interval(&self, repository: &PolledRepository, seconds: Option<u64>) {
+        if let Some(seconds) = seconds
+            && let Some(runtime) = self
+                .runtime
+                .lock()
+                .await
+                .repositories
+                .get_mut(&repository.full_name())
+        {
+            runtime.server_interval = runtime
+                .server_interval
+                .max(Some(Duration::from_secs(seconds)));
+        }
+    }
+
     fn new(config: GitHubPollConfig) -> Self {
         let now = Utc::now();
         let repositories = config
@@ -840,12 +856,24 @@ async fn poll_github_repository(
         repository = format_args!("{}/{}", repository_input.owner, repository_input.name),
         "registered polled github repository"
     );
+    let comment_interval = comment_polling::poll(
+        state,
+        client,
+        repository,
+        repository_id,
+        &repository_payload,
+        config.max_pages,
+    )
+    .await?;
     let poll = client
         .repository_events_conditional(&repository.owner, &repository.name, config.max_pages, etag)
         .await?;
     let outcome = GitHubRepositoryPollOutcome {
         etag: poll.etag,
-        server_interval: poll.poll_interval_seconds.map(Duration::from_secs),
+        server_interval: poll
+            .poll_interval_seconds
+            .map(Duration::from_secs)
+            .max(comment_interval),
     };
     let mut events = poll.events;
     events.reverse();
@@ -3238,6 +3266,30 @@ mod tests {
         assert_eq!(poll_backoff(interval, 1).as_secs(), 8);
         assert_eq!(poll_backoff(interval, 2).as_secs(), 16);
         assert_eq!(poll_backoff(interval, 10).as_secs(), 300);
+    }
+
+    #[tokio::test]
+    async fn comment_poll_minimum_survives_a_later_failure_in_the_cycle() {
+        let repository = PolledRepository {
+            owner: "team".into(),
+            name: "project".into(),
+        };
+        let controller = GitHubPollController::new(GitHubPollConfig {
+            repositories: vec![repository.clone()],
+            interval: std::time::Duration::from_secs(60),
+            max_pages: 2,
+        });
+        controller
+            .observe_server_interval(&repository, Some(120))
+            .await;
+        controller.observe_server_interval(&repository, None).await;
+        controller
+            .observe_server_interval(&repository, Some(60))
+            .await;
+        assert_eq!(
+            controller.status().await.repositories[0].server_interval_seconds,
+            Some(120)
+        );
     }
 
     #[tokio::test]
