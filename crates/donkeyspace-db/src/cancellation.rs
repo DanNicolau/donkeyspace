@@ -155,7 +155,7 @@ pub async fn lock_outbound_side_effect(
     action_id: i64,
 ) -> Result<Option<Transaction<'static, Postgres>>, DbError> {
     let mut tx = pool.begin().await?;
-    let allowed: Option<bool> = sqlx::query_scalar("SELECT workflow_repository_tracked(w.id) AND a.status='pending' AND a.generation=w.generation AND (j.id IS NULL OR j.status NOT IN ('cancel_requested','cancelled')) AND (w.provider_state <> 'closed' OR (a.job_id IS NULL AND a.action_type='issue.remove_labels' AND COALESCE(a.payload->>'closure_cleanup'='true',false))) FROM outbound_actions a JOIN workflow_items w ON w.id=a.workflow_item_id LEFT JOIN jobs j ON j.id=a.job_id WHERE a.id=$1 FOR NO KEY UPDATE OF w")
+    let allowed: Option<bool> = sqlx::query_scalar("SELECT workflow_repository_tracked(w.id) AND a.status='pending' AND a.generation=w.generation AND (j.id IS NULL OR j.status NOT IN ('cancel_requested','cancelled')) AND (w.provider_state <> 'closed' OR (a.job_id IS NULL AND a.action_type='issue.remove_labels' AND COALESCE(a.payload->>'closure_cleanup'='true',false))) FROM outbound_actions a JOIN workflow_items w ON w.id=a.workflow_item_id LEFT JOIN jobs j ON j.id=a.job_id WHERE a.id=$1 FOR NO KEY UPDATE OF w,a")
         .bind(action_id).fetch_optional(&mut *tx).await?;
     if allowed != Some(true) {
         sqlx::query("UPDATE outbound_actions SET status='cancelled',updated_at=now() WHERE id=$1 AND status='pending'")

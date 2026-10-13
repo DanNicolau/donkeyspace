@@ -1,4 +1,4 @@
-//! Explicit review revisions are separate from approvals of paused tasks.
+//! Commands and feedback for revisions of managed pull requests.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,9 +104,74 @@ pub fn instructions(
         text.push_str(&format!("\nFor specification or behavior changes, start with `{planning}` so the contract is updated before implementation.\n"));
     }
     text.push_str(&format!(
-        "\nThe PR becomes draft before revision work starts and returns to ready for review after the changes are published and required checks pass. Paused or failed revisions remain draft.\n\nIf a run pauses, follow the decision instructions on parent issue #{parent}; submit approvals or upstream revisions there to continue that run. Posting another PR command does not resume paused work.\n\nOrdinary comments, edited commands, and GitHub “Request changes” reviews do not start a run. Optional `review=ID` and `thread=COMMENT_ID` selectors can follow the target to select review feedback.\n"
+        "\nThe PR becomes draft before revision work starts and returns to ready for review after the changes are published and required checks pass. Paused or failed revisions remain draft.\n\nFollow the live revision progress comment below. When a run pauses, post its approval or revision command on **this PR** to continue the same run. Commands on parent issue #{parent} also work. For example: `/{prefix} approve TASK`. A running revision must finish or pause before another command can be accepted.\n\nOrdinary comments, edited commands, and GitHub “Request changes” reviews do not start a run. Optional `review=ID` and `thread=COMMENT_ID` selectors can follow the target when starting a new revision.\n"
     ));
     text
+}
+
+/// Validate selection against the authoritative pause before queueing a resume.
+/// The worker still verifies its saved flow and performs the actual transition.
+pub fn validate_decision(
+    checkpoint: &serde_json::Value,
+    decision: &serde_json::Value,
+) -> Result<(), String> {
+    if checkpoint["last_result"]["outcome"] == "needs_info" {
+        return Err("This pause needs clarification. Answer the questions on the parent issue to continue the same run.".into());
+    }
+    let pending = checkpoint["pending_approvals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| serde_json::from_value::<crate::TaskKey>(entry["key"].clone()).ok())
+        .map(|key| key.target())
+        .collect::<Vec<_>>();
+    let action = decision["action"].as_str().unwrap_or_default();
+    let target = decision["target"].as_str();
+    if action == "revise"
+        && decision["feedback"]
+            .as_str()
+            .is_none_or(|text| text.trim().is_empty())
+    {
+        return Err("Put the requested changes on lines after the revise command.".into());
+    }
+    if !matches!(action, "approve" | "revise") {
+        return Err("Use approve or revise to continue this run.".into());
+    }
+    if target == Some("all") && action == "approve" && !pending.is_empty()
+        || target.is_none() && pending.len() == 1
+        || target.is_some_and(|target| pending.iter().any(|key| key == target))
+    {
+        return Ok(());
+    }
+    let upstream = checkpoint["revision_options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| serde_json::from_value::<crate::RevisionOption>(entry.clone()).ok())
+        .filter(|option| {
+            option
+                .affected
+                .iter()
+                .any(|key| pending.contains(&key.target()))
+        })
+        .map(|option| option.target.target())
+        .collect::<Vec<_>>();
+    if action == "revise" && target.is_some_and(|target| upstream.iter().any(|key| key == target)) {
+        return Ok(());
+    }
+    Err(format!(
+        "That decision does not match the current pause. Pending targets: {}. Completed upstream targets available for revise: {}. Use a command from the live revision progress comment.",
+        if pending.is_empty() {
+            "none".into()
+        } else {
+            pending.join(", ")
+        },
+        if upstream.is_empty() {
+            "none".into()
+        } else {
+            upstream.join(", ")
+        }
+    ))
 }
 
 /// Replace only our marked section, preserving the rest of the PR description.
@@ -124,6 +189,53 @@ pub fn with_instructions(body: &str, instructions: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decisions_match_the_current_pause_and_relevant_upstream_work() {
+        use serde_json::json;
+        let mut checkpoint = json!({
+            "pending_approvals":[{"key":{"task":"build","work_item":"queue"}}],
+            "revision_options":[
+                {"target":{"task":"plan"},"affected":[{"task":"build","work_item":"queue"}]},
+                {"target":{"task":"unrelated"},"affected":[{"task":"build","work_item":"other"}]}
+            ]
+        });
+        for target in [serde_json::Value::Null, json!("all"), json!("build/queue")] {
+            assert!(
+                validate_decision(&checkpoint, &json!({"action":"approve","target":target}))
+                    .is_ok()
+            );
+        }
+        for target in [serde_json::Value::Null, json!("plan"), json!("build/queue")] {
+            assert!(
+                validate_decision(
+                    &checkpoint,
+                    &json!({"action":"revise","target":target,"feedback":"Fix reset"})
+                )
+                .is_ok()
+            );
+        }
+        for decision in [
+            json!({"action":"approve","target":"plan"}),
+            json!({"action":"revise","target":"unrelated","feedback":"Fix"}),
+            json!({"action":"revise","target":"plan","feedback":" "}),
+            json!({"action":"revise","target":"all","feedback":"Fix"}),
+        ] {
+            assert!(validate_decision(&checkpoint, &decision).is_err());
+        }
+        checkpoint["pending_approvals"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"key":{"task":"test","work_item":"queue"}}));
+        assert!(validate_decision(&checkpoint, &json!({"action":"approve"})).is_err());
+        assert!(
+            validate_decision(&checkpoint, &json!({"action":"approve","target":"all"})).is_ok()
+        );
+        checkpoint["pending_approvals"] = json!([]);
+        assert!(
+            validate_decision(&checkpoint, &json!({"action":"approve","target":"all"})).is_err()
+        );
+    }
 
     #[test]
     fn instructions_use_configured_targets_and_preserve_human_text() {

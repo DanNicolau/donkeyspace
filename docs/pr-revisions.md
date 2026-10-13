@@ -34,13 +34,15 @@ Apply the review's reset correction and update the affected tests.
 A behavior change that also changes the approved specification should start with
 the planning task. An implementation-only target may pause if its write scope or
 role contract prevents it from updating that specification. Continue such a pause
-with the permitted upstream revision command on the parent issue, rather than
-approving unchanged work or creating another PR revision.
+with the permitted upstream revision command on the PR. The live progress
+comment lists the target and the tasks that will rerun. Parent issue commands
+also continue the same run.
 
 A planning/specification revision can target a workflow task, for example
 `/donkeyspace revise plan`. Tasks with required approval request a new approval
-on the **parent issue** before their dependents execute. Follow the approval
-instructions there. The existing subissues are reused, and affected completed
+before their dependents execute. Follow the exact approval commands in the
+PR progress comment: `/donkeyspace approve TASK` or `/donkeyspace revise TASK`
+with feedback on the following lines. Use the configured command prefix. The existing subissues are reused, and affected completed
 subissues are reopened for the revision.
 
 ## Selecting feedback
@@ -93,8 +95,30 @@ moves, inspect the attempt and submit a **new PR revision command** to apply
 feedback to the latest head. Approving a terminal publication conflict on the
 parent issue does not start a new independent lifecycle.
 
-The PR receives a result comment with the run, summary, blockers, checks, and
-published commit. The dashboard's existing run history and lifecycle timeline
+Each revision gets one live PR progress comment, updated through acceptance,
+execution, pending decisions, publication, and readiness. It shows the original
+request, latest accepted decision, task progress, exact commands, checkpoint or
+published diff, and last-update time. Longer summaries and checks are collapsed.
+Approval decisions on the PR resume the same coordinator and retained workspace;
+webhook and polling copies of the same comment cannot apply twice. The API
+validates the requested target against the current checkpoint before accepting it.
+Clarification-only pauses still take answers on the parent issue; the progress
+comment includes the questions and directs the maintainer there.
+
+Malformed, unauthorized, or currently inapplicable commands receive a separate
+rejection notice explaining why they were not queued. A command sent while the
+revision is running is rejected; wait for a decision pause or completion. Review
+and thread selectors are supported only when starting a new revision.
+
+Feedback and outbound notices publish independently of agent execution. The
+worker checks for feedback every five seconds and normally refreshes active runs
+at most once per ten seconds. Unchanged content makes no GitHub request. Failed
+feedback publication backs off from 30 seconds to 15 minutes and survives worker
+restarts. Terminal runs stop polling until their state changes. With webhook
+forwarding to another machine, command discovery still depends on the configured
+comment poller before this feedback can appear.
+
+The dashboard's existing run history and lifecycle timeline
 show revision progress and approval decisions. No separate dashboard control
 is required.
 
@@ -109,8 +133,8 @@ failure; rerunning implementation is unnecessary.
 ## Failures and upgrades
 
 Only one revision/lifecycle execution may be active or paused for a workflow.
-Complete a pending approval on the parent issue before requesting another PR
-revision. Failed checks leave the PR unchanged and publish the available
+Complete a pending approval on the PR or parent issue before requesting another
+PR revision. Failed checks leave the PR unchanged and publish the available
 attempt evidence. After addressing the cause, use a new PR revision command;
 generic dashboard retry is disabled for revision jobs because it would bypass
 PR-head refresh and revision admission.
@@ -124,8 +148,11 @@ Duplicate webhook/poll deliveries of the same command never enqueue it twice.
 Closing or merging the PR cancels active revision work when observed, and
 publication independently checks the live PR state.
 
-Migration `0010_pr_revisions.sql` adds lifecycle snapshots and revision records;
-normal API/worker startup applies it. Rebuild and recreate the API and worker
+Migration `0010_pr_revisions.sql` adds lifecycle snapshots and revision records.
+Migration `0012_pr_revision_feedback.sql` adds durable feedback digests, retries,
+and wakeups; existing active revisions receive feedback after refresh, while
+historical terminal runs are not posted retrospectively. Normal API/worker
+startup applies these migrations. Rebuild and recreate the API and worker
 when deploying this change. Newly completed plugin workflows retain the
 snapshot needed for later revisions. Completed database checkpoints from the
 schema-9 baseline are also supported. A plugin PR completed by an older version
