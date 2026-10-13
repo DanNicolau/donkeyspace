@@ -5,6 +5,47 @@ use donkeyspace_core::pr_revision::parse_command;
 use donkeyspace_db::pr_revisions::{self, Admission};
 use donkeyspace_db::{OutboundActionInput, create_outbound_action};
 
+#[derive(Debug)]
+enum Command {
+    Revise(donkeyspace_core::pr_revision::RevisionCommand),
+    Approve { target: Option<String> },
+}
+
+fn parse_pr_command(body: &str, prefix: &str) -> Result<Option<Command>, String> {
+    if let Some(command) = parse_command(body, prefix)? {
+        return Ok(Some(Command::Revise(command)));
+    }
+    let first = body
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if first.first().copied() == Some(format!("/{prefix}").as_str())
+        && first.get(1).copied() == Some("approve")
+    {
+        return match parse_human_approval_command(body, prefix) {
+            Some(HumanApprovalAction::Approve { target }) => Ok(Some(Command::Approve { target })),
+            _ => Err(format!(
+                "Use /{prefix} approve TASK (or approve all) as the first line."
+            )),
+        };
+    }
+    Ok(None)
+}
+
+impl Command {
+    fn decision(&self) -> Value {
+        match self {
+            Self::Approve { target } => json!({"action":"approve","target":target}),
+            Self::Revise(command) => {
+                json!({"action":"revise","target":command.target,"feedback":command.feedback})
+            }
+        }
+    }
+}
+
 pub(super) async fn persist(
     pool: &PgPool,
     state: &AppState,
@@ -17,7 +58,7 @@ pub(super) async fn persist(
         return Ok(WebhookPersistOutcome::Ignored);
     }
     let comment = payload.comment.as_ref().expect("human command has comment");
-    let command = match parse_command(&comment.body, &state.policy.facade.resolve().command) {
+    let command = match parse_pr_command(&comment.body, &state.policy.facade.resolve().command) {
         Ok(None) => return Ok(WebhookPersistOutcome::Ignored),
         other => other,
     };
@@ -57,90 +98,119 @@ pub(super) async fn persist(
         .collect::<Vec<_>>();
     let authorization =
         authorize_engagement(state, EngagementGate::NeedsHumanResume, &labels, &payload).await;
-    if !authorization.allowed
-        || parent["state"] != "open"
-        || labels
-            .iter()
-            .any(|label| state.policy.workflow.block_labels.contains(label))
+    if authorization.verification_unavailable {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, authorization.reason).into(),
+        );
+    }
+    let mut outcome = WebhookPersistOutcome::Ignored;
+    let rejection = if !authorization.allowed {
+        Some("This account is not authorized to request or approve revisions. Ask an authorized maintainer to submit the command.".into())
+    } else if parent["state"] != "open" {
+        Some(format!(
+            "Parent issue #{} is closed. Reopen it before requesting a revision.",
+            source.issue_number
+        ))
+    } else if labels
+        .iter()
+        .any(|label| state.policy.workflow.block_labels.contains(label))
     {
-        record_authorization(
-            pool,
-            repository,
-            source.workflow_item_id,
-            delivery,
-            event,
-            body,
-            &payload,
-            authorization,
-        )
-        .await?;
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-    let pr = github.pull_request(owner, repo, pr_number as u64).await?;
-    if !open_same_repository_pr(&pr, owner, repo) {
-        return Ok(WebhookPersistOutcome::Ignored);
-    }
-    if let Some(pending) = pr_revisions::pending_publication(pool, repository, pr_number).await? {
-        let head = pr["head"]["sha"].as_str().ok_or("PR head is missing")?;
-        if head == pending.publication_sha
-            || github
-                .commit_is_ancestor(owner, repo, &pending.publication_sha, head)
-                .await?
-        {
-            // A prior push succeeded but its worker stopped before recording
-            // acknowledgment. Reuse that published continuation, never replay
-            // its already-published agent output.
-            pr_revisions::mark_publication(pool, pending.job_id, &pending.publication_sha, true)
-                .await?;
-            source = pr_revisions::source(pool, repository, pr_number)
-                .await?
-                .ok_or("Recovered PR continuation is unavailable")?;
-        }
-    }
-    let prepared = prepare_request(
-        state, &github, &source, &payload, body, &parent, &pr, command,
-    )
-    .await;
-    let (outcome, message, job_id) = match prepared {
-        Ok((mut input, role)) => {
-            input["pr_revision"]["authorization"] = json!({
-                "gate": EngagementGate::NeedsHumanResume.as_str(),
-                "matched_selector": authorization.matched_selector,
-                "reason": authorization.reason,
-            });
-            let admission = pr_revisions::enqueue(
-                pool,
-                repository,
-                pr_number,
-                comment.id.unwrap(),
-                &source,
-                &role,
-                &input,
-            )
-            .await?;
-            match admission {
-                Admission::Queued(job) => {
-                    let id = job.id;
-                    let message = format!("Revision queued for this PR (run `{id}`). Feedback will be applied to the current PR head; affected checks must pass before publication.");
-                    (WebhookPersistOutcome::Queued(job), message, Some(id))
+        Some(format!(
+            "Parent issue #{} has a blocking label. Resolve that block before requesting a revision.",
+            source.issue_number
+        ))
+    } else {
+        let pr = github.pull_request(owner, repo, pr_number as u64).await?;
+        if !open_same_repository_pr(&pr, owner, repo) {
+            Some("This PR is closed, merged, or uses an unsupported fork branch. Use an open managed PR in this repository.".into())
+        } else if let Err(error) = command {
+            Some(error)
+        } else {
+            let command = command?.expect("non-command already returned");
+            if let Some(active) = pr_revisions::active(pool, repository, pr_number).await? {
+                if active.status != "paused" {
+                    Some(format!(
+                        "Revision run `{}` is {}. Your command was not queued. Wait for its progress comment to request a decision or confirm completion.",
+                        active.id, active.status
+                    ))
+                } else if matches!(&command, Command::Revise(c) if c.review.is_some() || c.thread.is_some())
+                {
+                    Some("To continue this paused run, use approve TASK or revise TASK with feedback. Review/thread selectors apply when starting a new revision.".into())
+                } else if active.input["pull_request"]["head"]["ref"] != pr["head"]["ref"]
+                    || active.input["pull_request"]["base"]["ref"] != pr["base"]["ref"]
+                {
+                    Some("The PR branch or target changed while this run was paused. Restore its original branch/target before continuing.".into())
+                } else {
+                    let receipt: Value = serde_json::from_slice(body)?;
+                    let input = json!({"issue":parent,"comment":receipt["comment"],"sender":receipt["sender"],
+                        "donkeyspace_human_decision":command.decision(),
+                        "donkeyspace_engagement":{"actor":receipt["sender"],"matched_selector":authorization.matched_selector,"reason":authorization.reason}});
+                    match pr_revisions::resume(
+                        pool,
+                        pr_revisions::ResumeRequest {
+                            repository,
+                            pr: pr_number,
+                            job: &active,
+                            head: pr["head"]["sha"].as_str().unwrap_or_default(),
+                            delivery,
+                            input: &input,
+                            receipt: &receipt,
+                        },
+                    )
+                    .await?
+                    {
+                        pr_revisions::ResumeAdmission::Resumed(job) => {
+                            return Ok(WebhookPersistOutcome::Queued(job));
+                        }
+                        pr_revisions::ResumeAdmission::Duplicate => {
+                            return Ok(WebhookPersistOutcome::Duplicate);
+                        }
+                        pr_revisions::ResumeAdmission::Rejected(reason) => Some(reason),
+                    }
                 }
-                Admission::Duplicate => return Ok(WebhookPersistOutcome::Duplicate),
-                Admission::Unavailable => (
-                    WebhookPersistOutcome::Ignored,
-                    "Revision not queued: this workflow has active or paused work, or the PR is no longer eligible. Complete the pending decision on the parent issue before requesting another PR revision.".into(),
-                    None,
-                ),
+            } else if let Command::Revise(command) = command {
+                if let Some(pending) =
+                    pr_revisions::pending_publication(pool, repository, pr_number).await?
+                {
+                    let head = pr["head"]["sha"].as_str().ok_or("PR head is missing")?;
+                    if head == pending.publication_sha
+                        || github
+                            .commit_is_ancestor(owner, repo, &pending.publication_sha, head)
+                            .await?
+                    {
+                        pr_revisions::mark_publication(
+                            pool,
+                            pending.job_id,
+                            &pending.publication_sha,
+                            true,
+                        )
+                        .await?;
+                        source = pr_revisions::source(pool, repository, pr_number)
+                            .await?
+                            .ok_or("Recovered PR continuation is unavailable")?;
+                    }
+                }
+                match prepare_request(
+                    state, &github, &source, &payload, body, &parent, &pr, command,
+                )
+                .await
+                {
+                    Ok((mut input, role)) => {
+                        input["pr_revision"]["authorization"] = json!({"gate":EngagementGate::NeedsHumanResume.as_str(),"matched_selector":authorization.matched_selector,"reason":authorization.reason});
+                        match pr_revisions::enqueue(pool, repository, pr_number, comment.id.unwrap(), &source, &role, &input).await? {
+                            Admission::Queued(job) => { outcome = WebhookPersistOutcome::Queued(job); None }
+                            Admission::Duplicate => return Ok(WebhookPersistOutcome::Duplicate),
+                            Admission::Unavailable => Some("The workflow changed while this request was checked, or other work is active on the parent issue. Check the latest progress there and submit a new command when eligible.".into()),
+                        }
+                    }
+                    Err(error) => Some(error),
+                }
+            } else {
+                Some("There is no paused revision to approve. To request new work, post revise TASK with feedback on the following lines.".into())
             }
         }
-        Err(error) => (
-            WebhookPersistOutcome::Ignored,
-            format!("Revision not queued: {error}"),
-            None,
-        ),
     };
-    // Record before queuing the response, so rejected commands do not produce
-    // repeated notices when polled again under the same delivery identity.
-    if record_authorization(
+    record_authorization(
         pool,
         repository,
         source.workflow_item_id,
@@ -149,18 +219,9 @@ pub(super) async fn persist(
         body,
         &payload,
         authorization,
+        rejection.as_deref(),
     )
-    .await?
-    {
-        let response = OutboundActionInput {
-            workflow_item_id: source.workflow_item_id,
-            job_id,
-            provider: "github".into(),
-            action_type: "issue.create_comment".into(),
-            payload: json!({"owner":owner,"repo":repo,"issue_number":pr_number,"body":format!("{message}\n\n<!-- donkeyspace-generated -->")}),
-        };
-        create_outbound_action(pool, &response).await?;
-    }
+    .await?;
     Ok(outcome)
 }
 
@@ -198,9 +259,11 @@ async fn record_authorization(
     body: &[u8],
     payload: &GitHubIssueWebhook,
     authorization: AuthorizationDecision,
+    rejection: Option<&str>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut tx = pool.begin().await?;
     let Some(id) = record_webhook_delivery(
-        pool,
+        &mut *tx,
         Some(repository),
         delivery,
         event,
@@ -211,7 +274,7 @@ async fn record_authorization(
         return Ok(false);
     };
     record_engagement_decision(
-        pool,
+        &mut *tx,
         &EngagementDecisionInput {
             webhook_delivery_id: id,
             workflow_item_id: Some(workflow),
@@ -231,6 +294,22 @@ async fn record_authorization(
         },
     )
     .await?;
+    if let Some(reason) = rejection {
+        let marker = format!(
+            "<!-- donkeyspace-pr-command:{} -->",
+            payload
+                .comment
+                .as_ref()
+                .and_then(|c| c.id)
+                .unwrap_or_default()
+        );
+        create_outbound_action(&mut *tx, &OutboundActionInput {
+            workflow_item_id:workflow,job_id:None,provider:"github".into(),action_type:"issue.upsert_comment".into(),
+            payload:json!({"owner":payload.repository.owner.login,"repo":payload.repository.name,"issue_number":payload.issue.number,"marker":marker,
+                "body":format!("**Command not accepted**\n\n{reason}\n\n{marker}\n<!-- donkeyspace-generated -->")}),
+        }).await?;
+    }
+    tx.commit().await?;
     Ok(true)
 }
 
@@ -243,12 +322,11 @@ async fn prepare_request(
     body: &[u8],
     parent: &Value,
     pr: &Value,
-    parsed: Result<Option<donkeyspace_core::pr_revision::RevisionCommand>, String>,
+    command: donkeyspace_core::pr_revision::RevisionCommand,
 ) -> Result<(Value, String), String> {
     let owner = &payload.repository.owner.login;
     let repo = &payload.repository.name;
     let pr_number = payload.issue.number;
-    let command = parsed?.expect("non-command already returned");
     let lifecycle = state.policy.lifecycle.plugin.as_ref();
     if lifecycle.is_some() != (source.input["donkeyspace_lifecycle_coordinator"] == true) {
         return Err(
@@ -338,6 +416,46 @@ async fn prepare_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_decisions_use_configured_prefix_and_reject_malformed_commands() {
+        for (body, decision) in [
+            (
+                "/studio approve build/queue",
+                json!({"action":"approve","target":"build/queue"}),
+            ),
+            (
+                "/studio approve all",
+                json!({"action":"approve","target":"all"}),
+            ),
+            (
+                "/studio revise plan\nChange the contract.",
+                json!({"action":"revise","target":"plan","feedback":"Change the contract."}),
+            ),
+        ] {
+            assert_eq!(
+                parse_pr_command(body, "studio")
+                    .unwrap()
+                    .unwrap()
+                    .decision(),
+                decision
+            );
+        }
+        for body in [
+            "/studio approve a b",
+            "/studio revise plan",
+            "/studio approve review=1",
+        ] {
+            assert!(parse_pr_command(body, "studio").is_err());
+        }
+        for body in [
+            "/other approve plan",
+            "Please approve",
+            "A quote:\n/studio approve plan",
+        ] {
+            assert!(parse_pr_command(body, "studio").unwrap().is_none());
+        }
+    }
 
     #[test]
     fn generated_and_bot_comments_cannot_authorize_revision() {

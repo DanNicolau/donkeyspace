@@ -784,13 +784,7 @@ impl GitHubClient {
         marker: &str,
         body: &str,
     ) -> Result<String, GitHubClientError> {
-        let comments: Vec<Value> = self
-            .client
-            .get(
-                format!("/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100"),
-                None::<&()>,
-            )
-            .await?;
+        let comments = self.issue_comments(owner, repo, issue_number).await?;
         if let Some(comment_id) = comments.iter().find_map(|comment| {
             comment["body"]
                 .as_str()
@@ -1840,6 +1834,68 @@ mod tests {
             }
             assert_eq!(requests.load(Ordering::SeqCst), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn status_upsert_updates_existing_comment_beyond_first_page() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let service = service_fn(move |request: http::Request<octocrab::OctoBody>| {
+            let index = count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let mut response = http::Response::builder().status(200);
+                let body = match index {
+                    0 => {
+                        assert_eq!(request.method(), http::Method::GET);
+                        response = response.header(http::header::LINK, "<https://api.github.com/repos/team/example/issues/2/comments?per_page=100&page=2>; rel=\"next\"");
+                        r#"[{"id":1,"body":"Human comment"}]"#
+                    }
+                    1 => {
+                        assert_eq!(request.method(), http::Method::GET);
+                        assert_eq!(request.uri().query(), Some("per_page=100&page=2"));
+                        r#"[{"id":123,"body":"Queued <!-- revision-status -->"}]"#
+                    }
+                    2 => {
+                        assert_eq!(request.method(), http::Method::PATCH);
+                        assert_eq!(
+                            request.uri().path(),
+                            "/repos/team/example/issues/comments/123"
+                        );
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(body["body"], "Ready <!-- revision-status -->");
+                        r#"{"id":123}"#
+                    }
+                    _ => panic!("must update once without creating a duplicate"),
+                };
+                Ok::<_, Infallible>(
+                    response
+                        .body(Full::new(bytes::Bytes::from_static(body.as_bytes())))
+                        .unwrap(),
+                )
+            }
+        });
+        let client = GitHubClient {
+            client: OctocrabBuilder::new_empty()
+                .with_service(service)
+                .with_auth(AuthState::None)
+                .build()
+                .unwrap(),
+        };
+        assert_eq!(
+            client
+                .upsert_issue_comment(
+                    "team",
+                    "example",
+                    2,
+                    "<!-- revision-status -->",
+                    "Ready <!-- revision-status -->"
+                )
+                .await
+                .unwrap(),
+            "123"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

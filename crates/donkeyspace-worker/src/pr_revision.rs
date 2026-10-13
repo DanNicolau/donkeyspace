@@ -463,47 +463,9 @@ async fn push_commit(
 
 pub async fn report(
     pool: &donkeyspace_db::PgPool,
-    job: &JobRecord,
-    result: &RunResult,
-    commit: Option<&str>,
+    job: &donkeyspace_db::JobRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let owner = repository_owner(&job.input)?;
-    let repo = repository_name(&job.input)?;
-    let pr = number(&job.input)?;
-    let request = job.input["pr_revision"]["comment_id"]
-        .as_i64()
-        .ok_or("Revision comment identity is missing")?;
-    let parent = issue_number(&job.input).ok_or("Revision parent issue is missing")?;
-    let publication = match commit {
-        Some(sha) => format!("Published commit: [{sha}](https://github.com/{owner}/{repo}/commit/{sha}). Review remains with the maintainer."),
-        None => "No successful PR-branch publication was recorded for this attempt. For a paused run, follow the decision instructions on the parent issue before submitting another PR command.".into(),
-    };
-    let checks = result
-        .tests
-        .iter()
-        .map(|test| format!("{}: {:?}", test.name, test.status))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let reason = result
-        .blocked_reason
-        .as_deref()
-        .or(result.human_review_reason.as_deref())
-        .unwrap_or("");
-    let body = format!(
-        "### Pull request revision\n\nRun: `{}`\nOutcome: `{}`\n\n[Revision request](https://github.com/{owner}/{repo}/pull/{pr}#issuecomment-{request}) · [Parent issue and pending decisions](https://github.com/{owner}/{repo}/issues/{parent})\n\n{publication}\n\n{reason}\n\n{}\n\nChecks: {checks}\n\n<details>\n<summary>Task summaries and prior evidence</summary>\n\n{}\n\n</details>\n\n<!-- donkeyspace-generated -->",
-        job.id,
-        outcome_text(result.outcome),
-        result.questions.join("\n"),
-        result.summary,
-    );
-    let action = OutboundActionInput {
-        workflow_item_id: job.workflow_item_id.ok_or("revision workflow is missing")?,
-        job_id: Some(job.id),
-        provider: "github".into(),
-        action_type: "issue.create_comment".into(),
-        payload: json!({"owner":owner,"repo":repo,"issue_number":pr,"body":body}),
-    };
-    create_outbound_action(pool, &action).await?;
+    donkeyspace_db::revision_feedback::wake(pool, job.id).await?;
     Ok(())
 }
 

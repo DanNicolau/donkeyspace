@@ -12,8 +12,8 @@ use donkeyspace_db::{
     create_command_result, create_job, create_outbound_action, fail_active_plugin_child_jobs,
     fail_job, get_job, list_pending_agent_publications, list_pending_outbound_actions,
     list_ready_developer_candidates, list_repair_candidates, mark_job_running,
-    mark_outbound_action_completed, mark_outbound_action_failed, record_lifecycle_event,
-    record_state_transition, set_checkpoint_pull_request, unpublished_agent_publications_exist,
+    record_lifecycle_event, record_state_transition, set_checkpoint_pull_request,
+    unpublished_agent_publications_exist,
 };
 use donkeyspace_github::{
     GitHubAuthConfig, GitHubAuthMode, GitHubClient, GitHubCredentialProvider,
@@ -45,6 +45,7 @@ mod publication;
 mod repo_context;
 mod repository_files;
 mod repository_maintenance;
+mod revision_feedback;
 mod trusted_git;
 
 use llm_triage::{LlmTriageConfig, OpenAiTriageClient, TriageProvider};
@@ -298,6 +299,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     });
 
+    let _feedback = pool
+        .as_ref()
+        .zip(github_auth.as_ref())
+        .map(|(pool, provider)| {
+            tokio::spawn(revision_feedback::run(
+                pool.clone(),
+                provider.clone(),
+                policy.clone(),
+            ))
+        });
+    let _outbound = pool
+        .as_ref()
+        .zip(github_auth.as_ref())
+        .map(|(pool, provider)| {
+            let pool = pool.clone();
+            let client = provider.client();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(error) = process_outbound_actions(&pool, &client)
+                        .await
+                        .map_err(|error| error.to_string())
+                    {
+                        tracing::warn!(%error, "background outbound delivery failed");
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            })
+        });
+
     if args.once {
         if let Some(pool) = &pool {
             let github_token = match &github_auth {
@@ -318,6 +348,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.repair_reconcile_limit,
             )
             .await?;
+        }
+        if let (Some(pool), Some(provider)) = (&pool, &github_auth) {
+            revision_feedback::cycle(pool, &provider.client(), &policy)
+                .await
+                .map_err(|error| error as Box<dyn std::error::Error>)?;
         }
         tracing::info!("worker once mode completed");
         return Ok(());
@@ -1272,7 +1307,7 @@ async fn execute_developer_job(
     }
     let is_pr_revision = running_job.input.get("pr_revision").is_some();
     if is_pr_revision && result.outcome != Outcome::Implemented {
-        pr_revision::report(pool, &running_job, &result, None).await?;
+        pr_revision::report(pool, &running_job).await?;
     }
 
     // Human pauses committed by the plugin must not be overwritten. A new
@@ -1407,7 +1442,7 @@ async fn execute_developer_job(
         result.summary = "Implementation failed required checks.".to_string();
         result.blocked_reason = Some(required_check_failure_summary(&result.tests));
         if is_pr_revision {
-            pr_revision::report(pool, &running_job, &result, None).await?;
+            pr_revision::report(pool, &running_job).await?;
         }
         publish_job_attempt(
             &publication_context,
@@ -1538,7 +1573,7 @@ async fn execute_developer_job(
                 .await?;
             }
         }
-        pr_revision::report(pool, &running_job, &result, commit.as_deref()).await?;
+        pr_revision::report(pool, &running_job).await?;
         record_coordinator_event(pool, &running_job, "pr_revision_completed", &result.summary, result.human_review_reason.as_deref(), Some(result.outcome), json!([{ "kind":"pull_request", "url":running_job.input["pull_request"]["html_url"], "commit":commit }])).await?;
         queue_lifecycle_status_for_job(pool, &running_job).await?;
         cleanup_published_workspace(pool, running_job.id, repo_context_config).await;
@@ -2366,7 +2401,7 @@ async fn stop_role_job(
     }
 
     if running_job.input.get("pr_revision").is_some() {
-        pr_revision::report(pool, running_job, result, None).await?;
+        pr_revision::report(pool, running_job).await?;
     }
     queue_lifecycle_status_for_job(pool, running_job).await?;
     Ok(())
@@ -3682,22 +3717,28 @@ async fn process_outbound_action(
     client: &GitHubClient,
     action: &OutboundActionRecord,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(guard) =
+    let Some(mut guard) =
         donkeyspace_db::cancellation::lock_outbound_side_effect(pool, action.id).await?
     else {
         return Ok(());
     };
+    let action = donkeyspace_db::get_outbound_action(&mut guard, action.id).await?;
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        execute_outbound_action(client, action),
+        execute_outbound_action(client, &action),
     )
     .await;
-    drop(guard);
-    let result = result.unwrap_or_else(|_| Err("outbound action timed out".into()));
+    let result = result
+        .unwrap_or_else(|_| Err("outbound action timed out".into()))
+        .map_err(|error| error.to_string());
     match result {
         Ok(provider_resource_id) => {
-            mark_outbound_action_completed(pool, action.id, provider_resource_id.as_deref())
-                .await?;
+            donkeyspace_db::mark_outbound_action_completed_on(
+                &mut guard,
+                action.id,
+                provider_resource_id.as_deref(),
+            )
+            .await?;
             tracing::info!(
                 action_id = action.id,
                 action_type = action.action_type,
@@ -3706,7 +3747,7 @@ async fn process_outbound_action(
         }
         Err(error) => {
             let error = error.to_string();
-            mark_outbound_action_failed(pool, action.id, &error).await?;
+            donkeyspace_db::mark_outbound_action_failed_on(&mut guard, action.id, &error).await?;
             tracing::warn!(
                 action_id = action.id,
                 action_type = action.action_type,
@@ -3716,6 +3757,7 @@ async fn process_outbound_action(
         }
     }
 
+    guard.commit().await?;
     Ok(())
 }
 

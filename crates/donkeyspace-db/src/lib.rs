@@ -7,6 +7,7 @@ pub mod lifecycle_checkpoints;
 pub mod pr_revisions;
 pub mod repository_label_sync;
 pub mod repository_retirement;
+pub mod revision_feedback;
 pub mod workflow_blockers;
 
 use chrono::{DateTime, Utc};
@@ -119,6 +120,11 @@ pub async fn apply_migrations(pool: &PgPool) -> Result<(), DbError> {
         .await?;
     sqlx::raw_sql(include_str!(
         "../../../migrations/0011_github_comment_polling.sql"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0012_pr_revision_feedback.sql"
     ))
     .execute(&mut *transaction)
     .await?;
@@ -2054,6 +2060,16 @@ pub async fn mark_outbound_action_completed(
     provider_resource_id: Option<&str>,
 ) -> Result<(), DbError> {
     let mut transaction = pool.begin().await?;
+    mark_outbound_action_completed_on(&mut transaction, id, provider_resource_id).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn mark_outbound_action_completed_on(
+    connection: &mut PgConnection,
+    id: i64,
+    provider_resource_id: Option<&str>,
+) -> Result<(), DbError> {
     sqlx::query(
         r#"
         UPDATE outbound_actions
@@ -2066,7 +2082,7 @@ pub async fn mark_outbound_action_completed(
     )
     .bind(id)
     .bind(provider_resource_id)
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await?;
 
     if let Some(provider_id) = provider_resource_id {
@@ -2086,17 +2102,34 @@ pub async fn mark_outbound_action_completed(
         )
         .bind(id)
         .bind(provider_id)
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await?;
     }
-
-    transaction.commit().await?;
 
     Ok(())
 }
 
 pub async fn mark_outbound_action_failed(
     pool: &PgPool,
+    id: i64,
+    error: &str,
+) -> Result<(), DbError> {
+    let mut connection = pool.acquire().await?;
+    mark_outbound_action_failed_on(&mut connection, id, error).await
+}
+
+pub async fn get_outbound_action(
+    connection: &mut PgConnection,
+    id: i64,
+) -> Result<OutboundActionRecord, DbError> {
+    Ok(sqlx::query_as("SELECT * FROM outbound_actions WHERE id=$1")
+        .bind(id)
+        .fetch_one(connection)
+        .await?)
+}
+
+pub async fn mark_outbound_action_failed_on(
+    connection: &mut PgConnection,
     id: i64,
     error: &str,
 ) -> Result<(), DbError> {
@@ -2113,7 +2146,7 @@ pub async fn mark_outbound_action_failed(
     )
     .bind(id)
     .bind(error)
-    .execute(pool)
+    .execute(connection)
     .await?;
 
     Ok(())
