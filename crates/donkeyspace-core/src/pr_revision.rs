@@ -69,9 +69,83 @@ pub fn clear_execution_context(input: &mut serde_json::Value) {
     }
 }
 
+const INSTRUCTIONS_START: &str = "<!-- donkeyspace-pr-revisions:start -->";
+const INSTRUCTIONS_END: &str = "<!-- donkeyspace-pr-revisions:end -->";
+
+pub fn instructions(
+    prefix: &str,
+    parent: i64,
+    targets: &[crate::TaskKey],
+    planning_task: Option<&str>,
+) -> String {
+    let target_list = targets
+        .iter()
+        .map(crate::TaskKey::target)
+        .collect::<std::collections::BTreeSet<_>>();
+    let target = planning_task.or_else(|| target_list.first().map(String::as_str));
+    let command = target.map_or_else(
+        || format!("/{prefix} revise"),
+        |target| format!("/{prefix} revise {target}"),
+    );
+    let mut text = format!(
+        "## Requesting changes\n\nPost a **new conversation comment on this PR**, with feedback on the lines after the command:\n\n```text\n{command}\nDescribe the requested change and its acceptance criteria.\n```\n"
+    );
+    if !target_list.is_empty() {
+        text.push_str(&format!(
+            "\nAvailable targets: {}.\n",
+            target_list
+                .iter()
+                .map(|target| format!("`{target}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(planning) = planning_task {
+        text.push_str(&format!("\nFor specification or behavior changes, start with `{planning}` so the contract is updated before implementation.\n"));
+    }
+    text.push_str(&format!(
+        "\nThe PR becomes draft before revision work starts and returns to ready for review after the changes are published and required checks pass. Paused or failed revisions remain draft.\n\nIf a run pauses, follow the decision instructions on parent issue #{parent}; submit approvals or upstream revisions there to continue that run. Posting another PR command does not resume paused work.\n\nOrdinary comments, edited commands, and GitHub “Request changes” reviews do not start a run. Optional `review=ID` and `thread=COMMENT_ID` selectors can follow the target to select review feedback.\n"
+    ));
+    text
+}
+
+/// Replace only our marked section, preserving the rest of the PR description.
+pub fn with_instructions(body: &str, instructions: &str) -> String {
+    let section = format!("{INSTRUCTIONS_START}\n{instructions}\n{INSTRUCTIONS_END}");
+    if let Some(start) = body.find(INSTRUCTIONS_START)
+        && let Some(end) = body[start..].find(INSTRUCTIONS_END)
+    {
+        let end = start + end + INSTRUCTIONS_END.len();
+        return format!("{}{section}{}", &body[..start], &body[end..]);
+    }
+    format!("{}\n\n{section}", body.trim_end())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instructions_use_configured_targets_and_preserve_human_text() {
+        let targets = vec![crate::TaskKey {
+            task: "implement".into(),
+            work_item: Some("queue".into()),
+        }];
+        let instructions = instructions("studio", 12, &targets, Some("plan"));
+        assert!(instructions.contains("/studio revise plan"));
+        assert!(instructions.contains("`implement/queue`"));
+        assert!(instructions.contains("parent issue #12"));
+        let original = "Closes #12\n\nMaintainer notes.";
+        let body = with_instructions(original, &instructions);
+        assert_eq!(with_instructions(&body, &instructions), body);
+        let body = format!("{body}\n\nAdditional human notes.");
+        let changed = with_instructions(&body, "Updated instructions");
+        assert!(changed.starts_with(original));
+        assert!(changed.ends_with("Additional human notes."));
+        assert_eq!(changed.matches(INSTRUCTIONS_START).count(), 1);
+        assert!(!changed.contains("/studio revise plan"));
+        assert!(super::instructions("studio", 12, &[], None).contains("/studio revise\n"));
+    }
 
     #[test]
     fn auxiliary_jobs_keep_issue_identity_without_resuming_a_revision() {

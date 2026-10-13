@@ -3,6 +3,39 @@
 use super::*;
 use donkeyspace_db::pr_revisions;
 
+pub async fn instructions(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    job: &JobRecord,
+    source: uuid::Uuid,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let planning = if let Some(selection) = &policy.lifecycle.plugin {
+        let manifest = donkeyspace_core::PluginManifest::from_path(&selection.manifest_path)?;
+        Some(
+            manifest
+                .flows
+                .get(&selection.flow)
+                .ok_or("Missing lifecycle flow")?
+                .start
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let targets = pr_revisions::snapshot(pool, source)
+        .await?
+        .and_then(|saved| saved.get("completed_keys").cloned())
+        .map(serde_json::from_value::<Vec<donkeyspace_core::TaskKey>>)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(donkeyspace_core::pr_revision::instructions(
+        &policy.facade.resolve().command,
+        issue_number(&job.input).unwrap_or(0),
+        &targets,
+        planning.as_deref(),
+    ))
+}
+
 pub async fn prepare(
     pool: &donkeyspace_db::PgPool,
     policy: &Policy,
@@ -27,6 +60,28 @@ pub async fn prepare(
         .then(|| job.input["pr_revision"]["base_sha"].as_str())
         .flatten();
     validate_live_pr(&job.input, &pr, expected)?;
+    let source = serde_json::from_value(job.input["pr_revision"]["source_job_id"].clone())?;
+    let guidance = instructions(pool, policy, job, source).await?;
+    // Draft is a prerequisite for editing, including resumed work. A failure
+    // here stops execution before any agent or branch modification starts.
+    cancellation::side_effect(pool, job.id, async {
+        let owner = repository_owner(&job.input)?;
+        let repo = repository_name(&job.input)?;
+        client
+            .set_pull_request_draft(
+                &owner,
+                &repo,
+                number(&job.input)? as u64,
+                true,
+                pr["head"]["sha"].as_str(),
+            )
+            .await?;
+        client
+            .ensure_revision_instructions(&owner, &repo, number(&job.input)? as u64, &guidance)
+            .await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await?;
     if resumed {
         return build_repository_context(pool, &job.input, job.id, token, config).await;
     }
@@ -280,6 +335,10 @@ pub async fn publish(
         // Recheck immediately before the remote write, including PR closure.
         let live = client.pull_request(&owner, &name, number as u64).await?;
         validate_live_pr(&job.input, &live, Some(expected))?;
+        // A maintainer may have changed the draft flag while work was paused.
+        client
+            .set_pull_request_draft(&owner, &name, number as u64, true, Some(expected))
+            .await?;
         push_commit(
             repo,
             &format!("https://github.com/{owner}/{name}.git"),
@@ -292,6 +351,36 @@ pub async fn publish(
     .await?;
     pr_revisions::mark_publication(pool, job.id, &sha, true).await?;
     Ok(sha)
+}
+
+/// Separate readiness from publication so a failed metadata update never
+/// reports a successfully pushed commit as unpublished.
+pub async fn mark_ready(
+    pool: &donkeyspace_db::PgPool,
+    policy: &Policy,
+    job: &JobRecord,
+    token: Option<&str>,
+    sha: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client =
+        configured_github_client(token.ok_or("PR revision requires GitHub authentication")?)?;
+    let owner = repository_owner(&job.input)?;
+    let repo = repository_name(&job.input)?;
+    let guidance = instructions(pool, policy, job, job.id).await?;
+    cancellation::side_effect(pool, job.id, async {
+        let live = client
+            .pull_request(&owner, &repo, number(&job.input)? as u64)
+            .await?;
+        validate_live_pr(&job.input, &live, Some(sha))?;
+        client
+            .ensure_revision_instructions(&owner, &repo, number(&job.input)? as u64, &guidance)
+            .await?;
+        client
+            .set_pull_request_draft(&owner, &repo, number(&job.input)? as u64, false, Some(sha))
+            .await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await
 }
 
 fn push_arguments(remote: &str, branch: &str) -> Vec<String> {
@@ -334,7 +423,7 @@ pub async fn report(
     let parent = issue_number(&job.input).ok_or("Revision parent issue is missing")?;
     let publication = match commit {
         Some(sha) => format!("Published commit: [{sha}](https://github.com/{owner}/{repo}/commit/{sha}). Review remains with the maintainer."),
-        None => "No successful publication was recorded for this attempt. Inspect the blocker before requesting further work.".into(),
+        None => "No successful PR-branch publication was recorded for this attempt. For a paused run, follow the decision instructions on the parent issue before submitting another PR command.".into(),
     };
     let checks = result
         .tests
@@ -348,11 +437,11 @@ pub async fn report(
         .or(result.human_review_reason.as_deref())
         .unwrap_or("");
     let body = format!(
-        "### Pull request revision\n\nRun: `{}`\nOutcome: `{}`\n\n[Revision request](https://github.com/{owner}/{repo}/pull/{pr}#issuecomment-{request}) · [Parent issue and pending decisions](https://github.com/{owner}/{repo}/issues/{parent})\n\n{}\n\n{reason}\n\n{}\n\n{publication}\n\nChecks: {checks}\n\n<!-- donkeyspace-generated -->",
+        "### Pull request revision\n\nRun: `{}`\nOutcome: `{}`\n\n[Revision request](https://github.com/{owner}/{repo}/pull/{pr}#issuecomment-{request}) · [Parent issue and pending decisions](https://github.com/{owner}/{repo}/issues/{parent})\n\n{publication}\n\n{reason}\n\n{}\n\nChecks: {checks}\n\n<details>\n<summary>Task summaries and prior evidence</summary>\n\n{}\n\n</details>\n\n<!-- donkeyspace-generated -->",
         job.id,
         outcome_text(result.outcome),
-        result.summary,
         result.questions.join("\n"),
+        result.summary,
     );
     let action = OutboundActionInput {
         workflow_item_id: job.workflow_item_id.ok_or("revision workflow is missing")?,
