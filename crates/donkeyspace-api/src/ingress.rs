@@ -1,6 +1,21 @@
 //! GitHub ingress preparation, authorization and atomic admission.
 use super::*;
 
+pub(super) async fn comment_already_delivered(
+    pool: &PgPool,
+    repository: i64,
+    event: &str,
+    payload: &GitHubIssueWebhook,
+) -> Result<bool, donkeyspace_db::DbError> {
+    if event == "issue_comment"
+        && payload.action == "created"
+        && let Some(id) = payload.comment.as_ref().and_then(|c| c.id)
+    {
+        return donkeyspace_db::github_comment_delivery_exists(pool, repository, id).await;
+    }
+    Ok(false)
+}
+
 pub(super) async fn persist_github_webhook(
     pool: &PgPool,
     state: &AppState,
@@ -60,7 +75,9 @@ pub(super) async fn persist_issue_webhook(
     )
     .await?;
 
-    if webhook_delivery_exists(pool, delivery).await? {
+    if webhook_delivery_exists(pool, delivery).await?
+        || comment_already_delivered(pool, repository_id, event, &payload).await?
+    {
         return Ok(WebhookPersistOutcome::Duplicate);
     }
 

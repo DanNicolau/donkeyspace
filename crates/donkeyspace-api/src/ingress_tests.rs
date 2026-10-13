@@ -77,6 +77,7 @@ async fn authorized_clarification_and_upstream_revision_resume_same_coordinator_
             "paused"
         );
         payload["sender"]["login"] = json!("alice");
+        payload["comment"]["id"] = json!(43);
         let body = serde_json::to_vec(&payload).unwrap();
         let delivery = Uuid::now_v7().to_string();
         let WebhookPersistOutcome::Queued(resumed) =
@@ -101,6 +102,35 @@ async fn authorized_clarification_and_upstream_revision_resume_same_coordinator_
                 .unwrap(),
             WebhookPersistOutcome::Duplicate
         ));
+        // The same comment arriving through a different transport must not
+        // resume a later pause, even when its delivery UUID is different.
+        sqlx::query("UPDATE jobs SET status='paused' WHERE id=$1")
+            .bind(job.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflow_items SET current_state=$2 WHERE id=$1")
+            .bind(workflow)
+            .bind(pause)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            persist_issue_webhook(
+                &pool,
+                &state,
+                "issue_comment",
+                &Uuid::now_v7().to_string(),
+                &body
+            )
+            .await
+            .unwrap(),
+            WebhookPersistOutcome::Duplicate
+        ));
+        assert_eq!(
+            get_job(&pool, job.id).await.unwrap().unwrap().status,
+            "paused"
+        );
         assert_eq!(
             list_jobs_for_workflow_item(&pool, workflow)
                 .await

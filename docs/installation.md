@@ -190,6 +190,22 @@ the local interval with `donkeyspace configure polling --interval-seconds N`,
 then restart the stack. The dashboard reports polling health and can coalesce a
 manual poll request without overlapping an active cycle or bypassing cooldowns.
 
+Polling also reads repository issue/PR conversation comments directly, so human
+commands do not depend on GitHub's delayed repository events feed. The first
+scan covers the previous 24 hours; subsequent scans retain a database cursor,
+pagination progress, and conditional-request ETags across restarts. Each cycle
+reads at most `DONKEYSPACE_GITHUB_POLL_MAX_PAGES` comment pages (100 comments per
+page), in addition to event polling. At low volume this adds about 60 requests
+per repository per hour at the default interval, before conditional-request
+savings and requests needed to process new comments. Server polling intervals
+and rate-limit backoff still apply.
+
+Created-comment IDs are deduplicated across direct polling, delayed events, and
+webhooks. Migration `0011_github_comment_polling.sql` preserves old delivery
+receipts when enabling this path. Inline review threads are still collected only
+when explicitly selected in a PR revision command. Production and development
+using the same GitHub App installation share its API allowance.
+
 An existing private App can be imported with `--app-id`, `--installation-id`,
 and `--private-key-file`. Add `--webhook-secret-file` when using `--public-url`.
 

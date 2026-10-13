@@ -1,4 +1,6 @@
+mod polling;
 mod pr_revision;
+pub use polling::GitHubCommentPage;
 
 use hmac::{Hmac, Mac};
 use http::{
@@ -1079,94 +1081,27 @@ impl GitHubClient {
         etag: Option<&str>,
     ) -> Result<GitHubEventPoll, GitHubClientError> {
         let route = format!("/repos/{owner}/{repo}/events?per_page=100");
-        let mut headers = HeaderMap::new();
-        if let Some(etag) = etag {
-            headers.insert(
-                IF_NONE_MATCH,
-                HeaderValue::from_str(etag).map_err(|_| {
-                    GitHubClientError::InvalidResponse("invalid cached events ETag".into())
-                })?,
-            );
-        }
-        let response = self
-            .client
-            ._get_with_headers(route.as_str(), Some(headers))
-            .await?;
-        let status = response.status();
-        let response_etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| etag.map(str::to_string));
-        let poll_interval_seconds = response
-            .headers()
-            .get("x-poll-interval")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
-        if status == StatusCode::NOT_MODIFIED {
-            return Ok(GitHubEventPoll {
-                events: Vec::new(),
-                etag: response_etag,
-                poll_interval_seconds,
-                not_modified: true,
-            });
-        }
-        if matches!(
-            status,
-            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
-        ) {
-            let retry_after_seconds = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .or_else(|| {
-                    let remaining = response
-                        .headers()
-                        .get("x-ratelimit-remaining")?
-                        .to_str()
-                        .ok()?
-                        .parse::<u64>()
-                        .ok()?;
-                    if remaining != 0 {
-                        return None;
-                    }
-                    let reset = response
-                        .headers()
-                        .get("x-ratelimit-reset")?
-                        .to_str()
-                        .ok()?
-                        .parse::<u64>()
-                        .ok()?;
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-                    Some(reset.saturating_sub(now).max(1))
-                })
-                .unwrap_or(60);
-            return Err(GitHubClientError::RateLimited {
-                retry_after_seconds,
-            });
-        }
-        if !status.is_success() {
-            return Err(GitHubClientError::InvalidResponse(format!(
-                "github repository events returned {status}"
-            )));
-        }
-
-        let mut page = Page::<Value>::from_response(response).await?;
-        let mut events = page.take_items();
-        for _ in 1..max_pages.max(1) {
-            let Some(mut next_page) = self.client.get_page(&page.next).await? else {
-                break;
-            };
-            events.append(&mut next_page.take_items());
-            page = next_page;
+        let response = self.conditional_page(&route, etag).await?;
+        let mut events = Vec::new();
+        let not_modified = response.page.is_none();
+        if let Some(mut page) = response.page {
+            events.append(&mut page.take_items());
+            for _ in 1..max_pages.max(1) {
+                let Some(next) = page.next else {
+                    break;
+                };
+                let next_response = self.conditional_page(&next.to_string(), None).await?;
+                page = next_response.page.ok_or_else(|| {
+                    GitHubClientError::InvalidResponse("unexpected 304 on uncached page".into())
+                })?;
+                events.append(&mut page.take_items());
+            }
         }
         Ok(GitHubEventPoll {
             events,
-            etag: response_etag,
-            poll_interval_seconds,
-            not_modified: false,
+            etag: response.etag,
+            poll_interval_seconds: response.poll_interval_seconds,
+            not_modified,
         })
     }
 

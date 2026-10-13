@@ -40,7 +40,9 @@ pub(super) async fn persist(
         },
     )
     .await?;
-    if webhook_delivery_exists(pool, delivery).await? {
+    if webhook_delivery_exists(pool, delivery).await?
+        || comment_already_delivered(pool, repository, event, &payload).await?
+    {
         return Ok(WebhookPersistOutcome::Duplicate);
     }
     let Some(mut source) = pr_revisions::source(pool, repository, pr_number).await? else {
