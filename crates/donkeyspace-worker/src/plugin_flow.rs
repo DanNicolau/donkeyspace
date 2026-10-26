@@ -2269,3 +2269,6 @@ flows:
         assert!(reason.contains("Revising reruns it with the feedback you provide"));
     }
 }
+
+#[cfg(test)]
+mod platform_resume_tests;
