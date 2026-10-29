@@ -127,6 +127,33 @@ pub(super) async fn persist(
             Some(error)
         } else {
             let command = command?.expect("non-command already returned");
+            // Publication provenance can identify a managed PR before its
+            // opened event arrives. Register the verified live PR before the
+            // atomic admission check, which requires an open managed PR row.
+            upsert_pull_request(
+                pool,
+                &PullRequestInput {
+                    repository_id: repository,
+                    workflow_item_id: Some(source.workflow_item_id),
+                    provider_pr_id: pr["id"].as_i64().ok_or("PR ID is missing")?.to_string(),
+                    pr_number,
+                    title: pr["title"].as_str().unwrap_or_default().into(),
+                    html_url: pr["html_url"].as_str().ok_or("PR URL is missing")?.into(),
+                    state: "open".into(),
+                    head_ref: pr["head"]["ref"]
+                        .as_str()
+                        .ok_or("PR head branch is missing")?
+                        .into(),
+                    head_sha: pr["head"]["sha"].as_str().map(str::to_owned),
+                    base_ref: pr["base"]["ref"]
+                        .as_str()
+                        .ok_or("PR base branch is missing")?
+                        .into(),
+                    base_sha: pr["base"]["sha"].as_str().map(str::to_owned),
+                    managed_by_donkeyspace: true,
+                },
+            )
+            .await?;
             if let Some(active) = pr_revisions::active(pool, repository, pr_number).await? {
                 if active.status != "paused" {
                     Some(format!(

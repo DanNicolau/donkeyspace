@@ -524,7 +524,7 @@ async fn queue_status_comment(
         lines.push(String::new());
     }
     if intake_enabled && workflow.current_state.as_deref() == Some("blocked") {
-        lines.push(format!("**Request a change or recovery:**\n```text\n{} revise\n<describe what you want to change or retry>\n```\nThe planner will propose the affected work before anything reruns.\n", active_facade().issue_command()));
+        lines.push(format!("**Request a change or recovery:**\n```text\n{} revise\nDescribe what you want to change or retry.\n```\nThe planner will propose the affected work before anything reruns.\n", active_facade().issue_command()));
     }
     if !blockers.is_empty() {
         lines.extend(["#### Current blockers".into(), String::new()]);

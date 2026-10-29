@@ -272,7 +272,7 @@ pub(super) fn change_review(saved: &LifecycleCheckpoint) -> RunResult {
             waiting.join(", ")
         ));
     }
-    lines.push(format!("To accept this exact proposal, comment:\n```text\n{}\n```\nTo change it, describe what you want:\n```text\n{}\n<describe the desired change>\n```", change.key().approval_commands(active_facade()).approve, request_command()));
+    lines.push(format!("To accept this exact proposal, comment:\n```text\n{}\n```\nTo change it, describe what you want:\n```text\n{}\nDescribe the desired change.\n```", change.key().approval_commands(active_facade()).approve, request_command()));
     RunResult {
         outcome: Outcome::NeedsHuman,
         summary: format!(
