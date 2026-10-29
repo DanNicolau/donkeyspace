@@ -615,7 +615,11 @@ async fn run_work_item_lifecycle(
             &pending,
             &state.projected_issues,
             flow,
-            "The proposal requires approval before downstream work begins. Review the specification and displayed execution plan.",
+            if state.execution_plan.is_some() {
+                "The proposal requires approval before downstream work begins. Review the proposed artifacts and displayed execution plan."
+            } else {
+                "The lifecycle start task completed successfully and requires approval before downstream work begins."
+            },
         );
         store
             .save(&state.snapshot(&result, pending, false), flow, true, false)
