@@ -6,15 +6,17 @@ pub(super) fn apply_plan_decision(
     decision: &HumanDecision,
     decision_id: Option<&str>,
 ) -> Result<Option<ResumeDecision>, Box<dyn std::error::Error>> {
+    // The virtual target belongs only to opted-in flows. Other plugins may
+    // already have a real task with this name.
+    if base_flow.execution_plan.is_none() {
+        return Ok(None);
+    }
     if let HumanDecision::Revise {
         target: Some(target),
         feedback,
     } = &decision
         && target == "execution-plan"
     {
-        if base_flow.execution_plan.is_none() {
-            return Err("this flow does not support execution plans".into());
-        }
         let proposal: donkeyspace_core::ExecutionPlanProposal = serde_yaml::from_str(feedback)
             .map_err(|e| {
                 format!("Use excluded_tasks: [task], approval_tasks: [task], and reason: text. {e}")

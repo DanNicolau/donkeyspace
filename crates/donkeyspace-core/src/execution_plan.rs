@@ -140,10 +140,13 @@ impl ExecutionPlan {
         } else {
             "awaiting approval"
         };
-        let reason = if self.proposal.reason.trim().is_empty() {
+        let reason = if !self.proposal.reason.trim().is_empty() {
+            self.proposal.reason.trim()
+        } else if self.proposal.excluded_tasks.is_empty() && self.proposal.approval_tasks.is_empty()
+        {
             "Default workflow; no execution preferences supplied."
         } else {
-            self.proposal.reason.trim()
+            "Execution settings proposed for approval."
         };
         let escape = |s: &str| s.replace('|', "\\|").replace(['\n', '\r'], " ");
         let mut lines = vec![
