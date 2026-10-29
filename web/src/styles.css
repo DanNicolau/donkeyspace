@@ -1181,3 +1181,10 @@ a {
   padding: 10px 16px;
 }
 .connection-retry:disabled, .configuration-warning button:disabled { cursor: wait; opacity: 0.65; }
+
+.execution-plan { margin-bottom: 20px; }
+.execution-plan > p { padding: 0 20px; color: var(--text-muted, #64748b); }
+.plan-table { overflow-x: auto; padding: 0 20px; }
+.plan-table table { width: 100%; border-collapse: collapse; text-align: left; }
+.plan-table th, .plan-table td { padding: 12px; border-bottom: 1px solid #e2e8f0; }
+.plan-table small { display: block; color: #64748b; margin-top: 4px; }

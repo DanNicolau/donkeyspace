@@ -229,3 +229,24 @@ test('current blockers show all questions and distinguish draft publication stat
   await page.locator('.timeline-row').getByText('Reason', { exact: true }).click();
   await expect(page.locator('.timeline-row pre')).toContainText(first.questions[1]);
 });
+
+test('execution plan distinguishes omitted tasks from passed checks and shows approval state', async ({ page }, info) => {
+  const execution_plan = { revision: 2, approved: false, work_items: ['counter'], proposal: { reason: 'Review implementation before verification; omit packaging.' }, tasks: {
+    plan: { display_name: 'Design proposal', included: true, approval: 'required', dependencies: [] },
+    build: { display_name: 'Implementation', included: true, approval: 'required', dependencies: ['plan'] },
+    check: { display_name: 'Verification', included: true, approval: 'none', dependencies: ['build'] },
+    package: { display_name: 'Packaging', included: false, approval: 'none', dependencies: ['build'] },
+  } };
+  const workflow = { id: 1, owner: 'test', repository: 'test', issue_number: 1, issue_title: 'Review implementation before verification', issue_url: 'https://github.com/test/test/issues/1', current_state: 'needs_human', coordinator_status: 'paused', outcome: 'needs_human', summary: 'Review the proposed execution plan.', approvals: [], tasks: [], external_sync: { status: 'ready' }, no_pr_reason: 'Awaiting execution-plan approval.', updated_at: '2026-01-01T00:00:00Z', execution_plan };
+  await page.route('**/api/workflows/test/test/issues/1', route => route.fulfill({ json: workflow }));
+  await page.goto('/repositories/test/test/issues/1');
+  const plan = page.locator('.execution-plan');
+  await expect(plan.getByRole('heading', { name: 'Execution plan v2' })).toBeVisible();
+  await expect(plan.getByText('Awaiting approval', { exact: true })).toBeVisible();
+  await expect(plan.getByRole('row').filter({ hasText: 'Implementation' })).toContainText('Required');
+  await expect(plan.getByRole('row').filter({ hasText: 'Packaging' })).toContainText('No — not run');
+  await page.screenshot({ path: info.outputPath('execution-plan.png'), fullPage: true });
+  execution_plan.approved = true;
+  await page.reload();
+  await expect(plan.getByText('Approved', { exact: true })).toBeVisible();
+});

@@ -1,4 +1,6 @@
 pub mod deployment;
+pub mod execution_plan;
+pub use execution_plan::{ExecutionPlan, ExecutionPlanPolicy, ExecutionPlanProposal};
 pub mod facade;
 pub mod github_workflow;
 pub mod plugin;

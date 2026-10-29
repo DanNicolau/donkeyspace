@@ -16,6 +16,12 @@ pub(crate) fn prepare_pr_revision(
         .get(&selection.flow)
         .ok_or("revision flow is missing")?;
     let mut saved: LifecycleCheckpoint = serde_json::from_value(snapshot)?;
+    let effective_flow = saved
+        .execution_plan
+        .as_ref()
+        .map(|plan| plan.apply(flow))
+        .transpose()?;
+    let flow = effective_flow.as_ref().unwrap_or(flow);
     let fingerprint = flow_fingerprint(flow)?;
     if saved
         .flow_fingerprint

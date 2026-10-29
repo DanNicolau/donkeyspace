@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod execution_plan_tests;
 mod pr_revision;
 pub(crate) use pr_revision::{
     persist_checkpoint as persist_pr_revision_checkpoint, prepare_pr_revision,
@@ -17,6 +19,7 @@ use projection::*;
 mod execution;
 use execution::*;
 mod approvals;
+mod plan_controls;
 use approvals::*;
 mod checkpoint;
 use checkpoint::*;
@@ -136,7 +139,14 @@ async fn run_work_item_lifecycle(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let mut store = CheckpointStore::new(workspace_path, tracking.as_ref());
+    let base_flow = flow;
     let mut checkpoint = store.load(is_resume, issue_input, flow).await?;
+    let resumed_flow = checkpoint
+        .as_ref()
+        .and_then(|s| s.execution_plan.as_ref())
+        .map(|plan| plan.apply(base_flow))
+        .transpose()?;
+    let flow = resumed_flow.as_ref().unwrap_or(base_flow);
     if let Some(saved) = checkpoint.as_mut()
         && saved.last_result.outcome == Outcome::NeedsInfo
         && saved.start_action != StartAction::Revise
@@ -147,9 +157,11 @@ async fn run_work_item_lifecycle(
         }));
     }
     if let Some(saved) = checkpoint.as_mut()
-        && !saved.pending_approvals.is_empty()
+        && (!saved.pending_approvals.is_empty()
+            || issue_input.get("donkeyspace_human_decision").is_some())
         && let Some(result) =
-            resume_human_decision(saved, flow, issue_input, tracking.as_ref(), &mut store).await?
+            resume_human_decision(saved, base_flow, issue_input, tracking.as_ref(), &mut store)
+                .await?
     {
         return Ok(result);
     }
@@ -164,8 +176,10 @@ async fn run_work_item_lifecycle(
         .map(|checkpoint| checkpoint.revision_targets.clone())
         .unwrap_or_default();
 
+    let mut execution_plan = checkpoint.as_ref().and_then(|s| s.execution_plan.clone());
+    let mut plan_proposal = None;
     let (
-        previous,
+        mut previous,
         accumulated_tests,
         attempt,
         aggregate_risk,
@@ -299,6 +313,7 @@ async fn run_work_item_lifecycle(
         .await?;
         accumulated_tests.extend(planner.result.tests.clone());
         let requested_work_items = planner.work_items.clone();
+        plan_proposal = planner.execution_plan.clone();
         let aggregate_risk = checkpoint.as_ref().map_or(planner.result.risk, |saved| {
             max_risk(saved.aggregate_risk, planner.result.risk)
         });
@@ -453,6 +468,29 @@ async fn run_work_item_lifecycle(
         )
         .into());
     }
+    if base_flow.execution_plan.is_some()
+        && (checkpoint.is_none() || rerun_start || execution_plan.is_none())
+    {
+        let revision = execution_plan.as_ref().map_or(1, |p| p.revision + 1);
+        let plan = donkeyspace_core::ExecutionPlan::resolve(
+            base_flow,
+            plan_proposal,
+            work_items.iter().map(|i| i.id.clone()).collect(),
+            revision,
+        )?;
+        previous.push(json!({"event":"execution_plan_proposed", "execution_plan":plan}));
+        execution_plan = Some(plan);
+    }
+    if execution_plan.as_ref().is_some_and(|p| {
+        p.work_items != work_items.iter().map(|i| i.id.clone()).collect::<Vec<_>>()
+    }) {
+        return Err("selected work items changed since execution-plan approval".into());
+    }
+    let effective_flow = execution_plan
+        .as_ref()
+        .map(|p| p.apply(base_flow))
+        .transpose()?;
+    let flow = effective_flow.as_ref().unwrap_or(base_flow);
     let github_coordinates = (
         issue_input
             .pointer("/repository/owner/login")
@@ -487,7 +525,7 @@ async fn run_work_item_lifecycle(
         let retained = checkpoint
             .completed_keys
             .iter()
-            .filter(|key| !rerun_start || graph.keys().any(|current| current == *key))
+            .filter(|key| graph.keys().any(|current| current == *key))
             .cloned()
             .collect::<Vec<_>>();
         graph.restore_completed(&retained)?;
@@ -544,6 +582,7 @@ async fn run_work_item_lifecycle(
         .unwrap_or_default();
 
     let mut state = LifecycleState {
+        execution_plan,
         attempt,
         accumulated_tests,
         previous,
@@ -562,7 +601,9 @@ async fn run_work_item_lifecycle(
         .as_ref()
         .is_some_and(|checkpoint| checkpoint.start_approved)
         && !rerun_start;
-    if flow.tasks[&flow.start].approval == PluginApprovalMode::Required && !start_approved {
+    if (flow.tasks[&flow.start].approval == PluginApprovalMode::Required && !start_approved)
+        || state.execution_plan.as_ref().is_some_and(|p| !p.approved)
+    {
         let pending = vec![PendingApproval {
             key: TaskKey {
                 work_item: None,
@@ -574,7 +615,7 @@ async fn run_work_item_lifecycle(
             &pending,
             &state.projected_issues,
             flow,
-            "The lifecycle start task completed successfully and requires approval before downstream work begins.",
+            "The proposal requires approval before downstream work begins. Review the specification and displayed execution plan.",
         );
         store
             .save(&state.snapshot(&result, pending, false), flow, true, false)
@@ -1045,6 +1086,14 @@ async fn run_work_item_lifecycle(
                         }
                         return Err(reason.into());
                     }
+                    if !flow.tasks.contains_key(&handoff.target) {
+                        pause_reasons.push(format!("{} requested excluded task `{}`: {}. Revise the execution plan before this task can run; it has not been validated.", key.target(), handoff.target, handoff.reason));
+                        required_approvals.push(PendingApproval {
+                            key: key.clone(),
+                            trigger: ApprovalTrigger::AgentRequested,
+                        });
+                        continue;
+                    }
                     let handoff_summary = task
                         .handoff_descriptions
                         .get(&handoff.target)
@@ -1144,6 +1193,13 @@ async fn run_work_item_lifecycle(
         }
         for target in feedback {
             let invalidated = state.graph.restart_from(&target)?;
+            if state.execution_plan.is_some() && target.task == flow.start {
+                required_approvals.push(PendingApproval {
+                    key: target.clone(),
+                    trigger: ApprovalTrigger::AgentRequested,
+                });
+                pause_reasons.push("Planning needs revision. Resume the planner to propose a new specification and execution plan for approval.".into());
+            }
             let invalidated_names = invalidated
                 .iter()
                 .map(TaskKey::target)
@@ -1488,7 +1544,29 @@ fn finish_result(
 ) -> RunResult {
     result.tests = accumulated_tests;
     result.summary = flow_summary(previous, &result.summary);
+    if let Some(plan) = previous
+        .iter()
+        .rev()
+        .find_map(|v| v.get("execution_plan"))
+        .and_then(|v| serde_json::from_value::<donkeyspace_core::ExecutionPlan>(v.clone()).ok())
+    {
+        append_execution_plan(&mut result, &plan);
+    }
     result
+}
+
+fn append_execution_plan(result: &mut RunResult, plan: &donkeyspace_core::ExecutionPlan) {
+    // A resumed result may contain an older rendering. The structured plan wins.
+    let trim = |text: &str| {
+        text.split("\n\n### Execution plan v")
+            .next()
+            .unwrap_or(text)
+            .to_string()
+    };
+    result.summary = format!("{}\n\n{}", trim(&result.summary), plan.markdown());
+    if let Some(reason) = &mut result.human_review_reason {
+        *reason = trim(reason);
+    }
 }
 
 fn flow_summary(previous: &[Value], final_summary: &str) -> String {
@@ -2133,6 +2211,7 @@ flows:
             handoff: None,
             resources_used: Vec::new(),
             work_items: None,
+            execution_plan: None,
         })
         .unwrap();
         assert_eq!(
