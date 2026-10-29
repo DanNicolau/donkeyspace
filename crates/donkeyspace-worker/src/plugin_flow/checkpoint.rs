@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CHECKPOINT_VERSION: u32 = 6;
+pub(super) const CHECKPOINT_VERSION: u32 = 7;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct TrackedJobCheckpoint {
     pub(super) key: TaskKey,
@@ -29,6 +29,12 @@ pub(super) struct LifecycleCheckpoint {
     pub(super) version: u32,
     #[serde(default)]
     pub(super) execution_plan: Option<donkeyspace_core::ExecutionPlan>,
+    #[serde(default)]
+    pub(super) change_intake_enabled: bool,
+    #[serde(default)]
+    pub(super) change_sequence: u32,
+    #[serde(default)]
+    pub(super) pending_change: Option<super::change_requests::PendingChange>,
     #[serde(default)]
     repository_snapshot: Option<crate::checkout_recovery::Snapshot>,
     pub(super) attempt: u32,
@@ -94,6 +100,9 @@ impl LifecycleCheckpoint {
         Self {
             version: CHECKPOINT_VERSION,
             execution_plan: None,
+            change_intake_enabled: false,
+            change_sequence: 0,
+            pending_change: None,
             repository_snapshot: None,
             attempt,
             accumulated_tests: tests.to_vec(),
@@ -185,7 +194,7 @@ impl<'a, 'b> CheckpointStore<'a, 'b> {
             if !resume || record.completed {
                 return Err("checkpoint cannot be replayed; inspect the retained execution and start a new run".into());
             }
-            if ![5, CHECKPOINT_VERSION as i32].contains(&record.version) {
+            if ![5, 6, CHECKPOINT_VERSION as i32].contains(&record.version) {
                 return Err(
                     format!("unsupported database checkpoint version {}", record.version).into(),
                 );
@@ -225,6 +234,7 @@ impl<'a, 'b> CheckpointStore<'a, 'b> {
         completed: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut saved = saved.clone();
+        saved.change_intake_enabled = flow.change_intake;
         if let Some(plan) = &saved.execution_plan {
             super::append_execution_plan(&mut saved.last_result, plan);
         }
@@ -341,6 +351,8 @@ fn import_legacy_checkpoint(
 /// Mutable execution state has one owner. Decisions operate on task identities;
 /// persistence snapshots this state instead of reconstructing it at each exit.
 pub(super) struct LifecycleState {
+    pub(super) change_intake_enabled: bool,
+    pub(super) change_sequence: u32,
     pub(super) execution_plan: Option<donkeyspace_core::ExecutionPlan>,
     pub(super) attempt: u32,
     pub(super) accumulated_tests: Vec<TestResult>,
@@ -380,6 +392,8 @@ impl LifecycleState {
             &self.work_items,
         );
         saved.execution_plan = self.execution_plan.clone();
+        saved.change_intake_enabled = self.change_intake_enabled;
+        saved.change_sequence = self.change_sequence;
         saved
     }
 }

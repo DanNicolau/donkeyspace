@@ -72,6 +72,7 @@ fn key(value: &Value) -> Option<donkeyspace_core::TaskKey> {
 fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
     let input = &saved.input;
     let checkpoint = saved.checkpoint.as_ref().unwrap_or(&Value::Null);
+    let intake = checkpoint["change_intake_enabled"] == true;
     let result = saved.result.as_ref().unwrap_or(&Value::Null);
     let owner = input["repository"]["owner"]["login"]
         .as_str()
@@ -112,6 +113,13 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
     ];
     if saved.status == "paused" && result["outcome"] == "needs_info" {
         lines.push(format!("**Next: answer the questions on [parent issue #{parent}]({base}/issues/{parent}) to continue this run.** This pause needs clarification, not an approval."));
+    } else if saved.status == "paused" && intake {
+        lines.push("**Next: post a decision comment on this PR.** Commands on the parent issue also continue this run.".into());
+        if let Some(reason) = result["human_review_reason"].as_str() {
+            lines.push(format!("\n{}", quote(reason, 12000)));
+        } else {
+            lines.push(format!("\nRequest a change with `/{} revise` and your feedback on the next lines. The planning agent will propose what should run again.", facade.command));
+        }
     } else if saved.status == "paused" {
         lines.push("**Next: post a new decision comment on this PR.** Commands on the parent issue also continue this same run.".into());
         let mut pending = checkpoint["pending_approvals"]
@@ -176,18 +184,24 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
         );
     }
     if !tasks.is_empty() {
-        lines.push("\n| Task | Progress |\n| --- | --- |".into());
+        lines.push(
+            "\n<details>\n<summary>Task progress</summary>\n\n| Task | Progress |\n| --- | --- |"
+                .into(),
+        );
         for (task, child) in tasks {
             lines.push(format!(
                 "| `{task}` | {} |",
                 child["status"].as_str().unwrap_or("waiting")
             ));
         }
+        lines.push("\n</details>".into());
     }
     let reason = result["blocked_reason"]
         .as_str()
         .or(result["human_review_reason"].as_str());
-    if let Some(reason) = reason {
+    if let Some(reason) = reason.filter(|_| {
+        !(intake && saved.status == "paused" && result["human_review_reason"].is_string())
+    }) {
         // The first paragraph is the actual blocker; old result text can carry
         // obsolete parent-only command instructions, so never repeat those.
         lines.push(format!(
@@ -312,6 +326,24 @@ mod tests {
         }
         assert!(!text.contains("Old instructions"));
         assert!(!text.contains("| failed |"));
+    }
+
+    #[test]
+    fn intake_proposal_shows_only_its_current_approval_before_collapsed_progress() {
+        let mut saved = snapshot();
+        saved.checkpoint.as_mut().unwrap()["change_intake_enabled"] = json!(true);
+        saved.result.as_mut().unwrap()["human_review_reason"] = json!(
+            "Retain completed work.\n\nApprove with `/studio approve change/3`.\n\nOr use `/studio revise` and describe the change."
+        );
+        let text = body(&saved);
+        assert!(text.contains("/studio approve change/3"));
+        assert!(text.contains("/studio revise`"));
+        assert!(!text.contains("/studio approve build/queue"));
+        assert!(!text.contains("/studio revise plan"));
+        assert!(
+            text.find("/studio approve change/3").unwrap()
+                < text.find("<summary>Task progress").unwrap()
+        );
     }
 
     #[test]

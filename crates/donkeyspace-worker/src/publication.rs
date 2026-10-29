@@ -434,23 +434,97 @@ async fn queue_status_comment(
     );
     let events = list_lifecycle_events(context.pool, workflow_item_id, None, true, 8).await?;
     let marker = "<!-- donkeyspace-lifecycle-status -->".to_string();
+    let pending_change_present = checkpoint
+        .as_ref()
+        .is_some_and(|c| c.state.get("pending_change").is_some_and(|v| !v.is_null()));
+    let intake_enabled = checkpoint
+        .as_ref()
+        .is_some_and(|c| c.state["change_intake_enabled"] == true);
     let mut lines = vec![
         format!("### {} lifecycle status", active_facade().display_name),
         String::new(),
-        format!("Run: `{}`", context.coordinator_job_id),
         format!(
             "Current state: `{}`",
             workflow.current_state.as_deref().unwrap_or("unclassified")
         ),
         String::new(),
     ];
-    if let Some(plan) = checkpoint
-        .as_ref()
-        .and_then(|c| c.state.get("execution_plan"))
-        .and_then(|v| serde_json::from_value::<donkeyspace_core::ExecutionPlan>(v.clone()).ok())
-    {
-        lines.push(plan.markdown());
+    let pending_approval = (workflow.current_state.as_deref() == Some("needs_human"))
+        .then(|| {
+            coordinator
+                .and_then(|job| job.result.as_ref())
+                .and_then(|result| result.get("human_review_reason"))
+                .and_then(Value::as_str)
+        })
+        .flatten();
+    if let Some(reason) = pending_approval {
+        lines.extend([
+            String::new(),
+            "#### Decision required".into(),
+            String::new(),
+            reason.into(),
+        ]);
+        if let Some(checkpoint) = publications
+            .iter()
+            .filter(|publication| {
+                publication.kind == "checkpoint" && publication.status == "published"
+            })
+            .max_by_key(|publication| publication.id)
+        {
+            lines.push(String::new());
+            lines.push(format!(
+                "{} checkpoint: [`{}`]({})",
+                if intake_enabled && pending_change_present {
+                    "Retained"
+                } else {
+                    "Review"
+                },
+                short_sha(&checkpoint.commit_sha),
+                checkpoint
+                    .commit_url
+                    .as_deref()
+                    .unwrap_or(&checkpoint.html_url)
+            ));
+            if pending_change_present {
+                lines.push("The change proposal has not modified retained files.".into());
+            } else if let Some(compare_url) = &checkpoint.compare_url {
+                lines.push(format!("[Review the checkpoint diff]({compare_url})"));
+            } else if checkpoint.zero_diff {
+                lines.push("This checkpoint has no file changes.".into());
+            }
+            if let Some(files) = checkpoint.changed_files.as_array()
+                && !files.is_empty()
+                && !pending_change_present
+            {
+                lines.push("<details><summary>Changed files</summary>".into());
+                lines.push(String::new());
+                for path in files.iter().filter_map(Value::as_str).take(50) {
+                    lines.push(format!(
+                        "- [`{path}`]({})",
+                        file_url(context.owner, context.repo, &checkpoint.commit_sha, path)
+                    ));
+                }
+                lines.push(String::new());
+                lines.push("</details>".into());
+            }
+        }
+    }
+    if workflow.current_state.as_deref() == Some("needs_info") && pending_change_present {
+        lines.push("**Next: reply with answers to continue reviewing this change.** Existing work is retained.".into());
+        if let Some(result) = coordinator.and_then(|job| job.result.as_ref()) {
+            for question in result["questions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                lines.push(format!("- {question}"));
+            }
+        }
         lines.push(String::new());
+    }
+    if intake_enabled && workflow.current_state.as_deref() == Some("blocked") {
+        lines.push(format!("**Request a change or recovery:**\n```text\n{} revise\n<describe what you want to change or retry>\n```\nThe planner will propose the affected work before anything reruns.\n", active_facade().issue_command()));
     }
     if !blockers.is_empty() {
         lines.extend(["#### Current blockers".into(), String::new()]);
@@ -482,6 +556,21 @@ async fn queue_status_comment(
             lines.push(String::new());
         }
     }
+    if let Some(plan) = checkpoint
+        .as_ref()
+        .and_then(|c| c.state.get("execution_plan"))
+        .and_then(|v| serde_json::from_value::<donkeyspace_core::ExecutionPlan>(v.clone()).ok())
+    {
+        if plan.approved {
+            lines.push("<details><summary>Current execution plan</summary>\n".into());
+        }
+        lines.push(plan.markdown());
+        if plan.approved {
+            lines.push("\n</details>".into());
+        }
+        lines.push(String::new());
+    }
+    lines.push("<details><summary>Task status</summary>\n".into());
     lines.extend([
         "#### Current agents".into(),
         String::new(),
@@ -537,7 +626,9 @@ async fn queue_status_comment(
             .unwrap_or("—");
         lines.push(format!("| {} | {} | {} |", label, job.status, outcome));
     }
-    if workflow.current_state.as_deref() == Some("needs_human")
+    lines.push("\n</details>".into());
+    if !intake_enabled
+        && workflow.current_state.as_deref() == Some("needs_human")
         && coordinator.is_some_and(|job| job.status == "paused")
         && let Some(checkpoint) = &checkpoint
         && !checkpoint.completed
@@ -545,6 +636,7 @@ async fn queue_status_comment(
         let revisions =
             donkeyspace_core::approval::revision_previews(&checkpoint.state, active_facade());
         if !revisions.is_empty() {
+            lines.push("<details><summary>Advanced task revisions</summary>\n".into());
             lines.extend([String::new(), "#### Revise completed upstream work".into(), String::new(),
                 "These commands reopen completed work and supersede the listed dependent results. Include specific feedback on the following lines. Required approval will be requested again for revised output.".into()]);
             for revision in revisions {
@@ -560,63 +652,12 @@ async fn queue_status_comment(
                     revision.revise_command
                 ));
             }
-        }
-    }
-    let pending_approval = (workflow.current_state.as_deref() == Some("needs_human"))
-        .then(|| {
-            coordinator
-                .and_then(|job| job.result.as_ref())
-                .and_then(|result| result.get("human_review_reason"))
-                .and_then(Value::as_str)
-        })
-        .flatten();
-    if let Some(reason) = pending_approval {
-        lines.extend([
-            String::new(),
-            "#### Decision required".into(),
-            String::new(),
-            reason.into(),
-        ]);
-        if let Some(checkpoint) = publications
-            .iter()
-            .filter(|publication| {
-                publication.kind == "checkpoint" && publication.status == "published"
-            })
-            .max_by_key(|publication| publication.id)
-        {
-            lines.push(String::new());
-            lines.push(format!(
-                "Exact proposed checkpoint: [`{}`]({})",
-                short_sha(&checkpoint.commit_sha),
-                checkpoint
-                    .commit_url
-                    .as_deref()
-                    .unwrap_or(&checkpoint.html_url)
-            ));
-            if let Some(compare_url) = &checkpoint.compare_url {
-                lines.push(format!("[Review the checkpoint diff]({compare_url})"));
-            } else if checkpoint.zero_diff {
-                lines.push("This checkpoint has no file changes.".into());
-            }
-            if let Some(files) = checkpoint.changed_files.as_array()
-                && !files.is_empty()
-            {
-                lines.push("<details><summary>Changed files</summary>".into());
-                lines.push(String::new());
-                for path in files.iter().filter_map(Value::as_str).take(50) {
-                    lines.push(format!(
-                        "- [`{path}`]({})",
-                        file_url(context.owner, context.repo, &checkpoint.commit_sha, path)
-                    ));
-                }
-                lines.push(String::new());
-                lines.push("</details>".into());
-            }
+            lines.push("\n</details>".into());
         }
     }
     lines.extend([
         String::new(),
-        "#### Recent milestones".into(),
+        "<details><summary>Recent milestones</summary>".into(),
         String::new(),
     ]);
     if events.is_empty() {
@@ -638,6 +679,7 @@ async fn queue_status_comment(
             }
         }
     }
+    lines.push("\n</details>".into());
     if let Some(pull_request_url) = publications.iter().find_map(|publication| {
         publication
             .metadata
@@ -648,7 +690,7 @@ async fn queue_status_comment(
             String::new(),
             format!("Final pull request: {pull_request_url}"),
         ]);
-    } else {
+    } else if pending_approval.is_none() {
         let explanation = if let Some(blocker) = blockers.first() {
             blocker.preview()
         } else if let Some(reason) = pending_approval {
@@ -675,7 +717,11 @@ async fn queue_status_comment(
         ]);
     }
     if !publications.is_empty() {
-        lines.extend([String::new(), "#### Artifacts".into(), String::new()]);
+        lines.extend([
+            String::new(),
+            "<details><summary>Artifact history</summary>".into(),
+            String::new(),
+        ]);
         for publication in &publications {
             let task = publication.task.as_deref().unwrap_or("workspace");
             if publication.status != "published" {
@@ -701,6 +747,10 @@ async fn queue_status_comment(
             ));
         }
     }
+    if !publications.is_empty() {
+        lines.push("\n</details>".into());
+    }
+    lines.push(format!("\nRun: `{}`", context.coordinator_job_id));
     lines.extend([
         String::new(),
         marker.clone(),

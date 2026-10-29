@@ -26,3 +26,5 @@ cargo test -p donkeyspace-worker shared_repair_converges -- --ignored --test-thr
 cargo test -p donkeyspace-worker pending_infrastructure_retry -- --ignored --test-threads=1
 
 cargo test -p donkeyspace-worker execution_plan_gates -- --ignored --test-threads=1
+
+cargo test -p donkeyspace-worker change_intake_preserves -- --ignored --test-threads=1

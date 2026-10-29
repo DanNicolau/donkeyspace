@@ -127,7 +127,9 @@ pub(super) async fn approval_requests(
                 ApprovalTrigger::AgentRequested => "agent_requested",
             }
             .into(),
-            approval_subject: if approval.key.task == "execution-plan" {
+            approval_subject: if approval.key.task == "change" && flow.change_intake {
+                "proposed change and displayed rerun scope; other artifact approvals remain separate".into()
+            } else if approval.key.task == "execution-plan" {
                 "execution plan only; existing specification approval is retained".into()
             } else {
                 task.approval_subject.clone().unwrap_or_else(|| {
@@ -156,6 +158,59 @@ pub(super) fn pending_approval_result(
     flow: &PluginFlow,
     lead: &str,
 ) -> RunResult {
+    if flow.change_intake {
+        let prefix = active_facade().issue_command();
+        let mut lines = vec![lead.to_string()];
+        for approval in pending {
+            let target = approval.key.target();
+            let label = if approval.key.task == "execution-plan" {
+                "execution plan".to_string()
+            } else {
+                flow.tasks
+                    .get(&approval.key.task)
+                    .and_then(|t| t.display_name.clone())
+                    .unwrap_or_else(|| approval.key.task.clone())
+            };
+            let item = approval
+                .key
+                .work_item
+                .as_deref()
+                .map(|item| format!(" for `{item}`"))
+                .unwrap_or_default();
+            let effect = if matches!(approval.trigger, ApprovalTrigger::AgentRequested) {
+                "retry this task"
+            } else {
+                "accept this output and release its dependent work"
+            };
+            lines.push(format!(
+                "- **{label}{item}:** `{prefix} approve {target}` to {effect}."
+            ));
+        }
+        let relevant = projected_issues
+            .iter()
+            .filter(|(item, _)| {
+                pending
+                    .iter()
+                    .any(|a| a.key.work_item.as_ref() == Some(item) || a.key.task == flow.start)
+            })
+            .map(|(item, number)| format!("`{item}`: #{number}"))
+            .collect::<Vec<_>>();
+        if !relevant.is_empty() {
+            lines.push(format!("Review: {}.", relevant.join(", ")));
+        }
+        lines.push(format!("**Want a change?** Describe changes to the plan, implementation, or requirements:\n```text\n{prefix} revise\n<describe what you want to change>\n```\nThe planner will propose the scope before completed work is rerun."));
+        return RunResult {
+            outcome: Outcome::NeedsHuman,
+            summary: format!("Awaiting {} review(s).", pending.len()),
+            confidence: Confidence::High,
+            risk: Risk::Unknown,
+            questions: vec![],
+            tests: vec![],
+            changed_files: vec![],
+            human_review_reason: Some(lines.join("\n\n")),
+            blocked_reason: None,
+        };
+    }
     let start_task = &flow.start;
     let subjects = pending
         .iter()
@@ -245,7 +300,7 @@ pub(super) fn pending_approval_result(
 }
 
 /// Pure transition: selecting one target cannot invalidate completed siblings.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct ResumeDecision {
     pub(super) decisions: Vec<(TaskKey, String)>,
     pub(super) invalidated: Vec<TaskKey>,

@@ -340,30 +340,33 @@ async fn prepare_request(
             .flows
             .get(&selection.flow)
             .ok_or("Configured flow is missing.")?;
-        let target = command
-            .target
-            .as_deref()
-            .ok_or("Plugin revisions require TASK or TASK/WORK-ITEM after revise.")?;
-        let (task, item) = target
-            .split_once('/')
-            .map_or((target, None), |(t, i)| (t, Some(i)));
-        let definition = flow
-            .tasks
-            .get(task)
-            .ok_or("Unknown revision task; use a task from the configured flow.")?;
-        if (definition.scope == donkeyspace_core::PluginTaskScope::WorkItem) != item.is_some() {
-            return Err(
-                "Use TASK for workflow tasks and TASK/WORK-ITEM for work-item tasks.".into(),
-            );
-        }
-        let checkpoint = source.checkpoint.as_ref().ok_or("This PR predates durable continuation support. Its completed lifecycle snapshot is unavailable; start a new managed workflow or update the PR manually.")?;
-        if !checkpoint["completed_keys"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|k| k["task"] == task && k["work_item"].as_str() == item)
-        {
-            return Err("The target is not a completed task in this PR's lifecycle.".into());
+        source.checkpoint.as_ref().ok_or("This PR has no retained lifecycle checkpoint; start a new managed workflow or update the PR manually.")?;
+        if !flow.change_intake {
+            let target = command
+                .target
+                .as_deref()
+                .ok_or("Plugin revisions require TASK or TASK/WORK-ITEM after revise.")?;
+            let (task, item) = target
+                .split_once('/')
+                .map_or((target, None), |(t, i)| (t, Some(i)));
+            let definition = flow
+                .tasks
+                .get(task)
+                .ok_or("Unknown revision task; use a task from the configured flow.")?;
+            if (definition.scope == donkeyspace_core::PluginTaskScope::WorkItem) != item.is_some() {
+                return Err(
+                    "Use TASK for workflow tasks and TASK/WORK-ITEM for work-item tasks.".into(),
+                );
+            }
+            let checkpoint = source.checkpoint.as_ref().ok_or("This PR predates durable continuation support. Its completed lifecycle snapshot is unavailable; start a new managed workflow or update the PR manually.")?;
+            if !checkpoint["completed_keys"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|k| k["task"] == task && k["work_item"].as_str() == item)
+            {
+                return Err("The target is not a completed task in this PR's lifecycle.".into());
+            }
         }
     } else if command
         .target
