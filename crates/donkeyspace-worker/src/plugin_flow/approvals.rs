@@ -743,4 +743,29 @@ mod revision_tests {
         assert_eq!(saved.start_action, StartAction::Revise);
         assert!(saved.pending_approvals.is_empty());
     }
+
+    #[test]
+    fn non_opted_in_flow_can_approve_a_real_execution_plan_task() {
+        let (mut flow, mut saved) = paused(false);
+        let mut task = flow.tasks["check"].clone();
+        task.scope = PluginTaskScope::Workflow;
+        flow.tasks.insert("execution-plan".into(), task);
+        let key = TaskKey {
+            task: "execution-plan".into(),
+            work_item: None,
+        };
+        saved.pending_approvals = vec![PendingApproval {
+            key: key.clone(),
+            trigger: ApprovalTrigger::Required,
+        }];
+        apply_human_decision(
+            &mut saved,
+            &flow,
+            &json!({"action":"approve","target":"execution-plan"}),
+        )
+        .unwrap();
+        assert!(saved.pending_approvals.is_empty());
+        assert!(saved.completed_keys.contains(&key));
+        assert!(saved.execution_plan.is_none());
+    }
 }
