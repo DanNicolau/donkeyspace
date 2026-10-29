@@ -88,7 +88,17 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
         .unwrap_or("Requested revision");
     let target = input["pr_revision"]["command"]["target"]
         .as_str()
-        .unwrap_or("developer");
+        .unwrap_or(if input["donkeyspace_lifecycle_coordinator"] == true {
+            "planning agent"
+        } else {
+            "developer"
+        });
+    let revise_command = input["pr_revision"]["command"]["target"]
+        .as_str()
+        .map_or_else(
+            || format!("{} revise", facade.issue_command()),
+            |target| format!("{} revise {target}", facade.issue_command()),
+        );
     let published = saved.publication_status == "published";
     let phase = match saved.status.as_str() {
         "queued" | "leased" => {
@@ -155,10 +165,12 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
     } else if matches!(saved.status.as_str(), "queued" | "leased" | "running") {
         lines.push("**Next: no action needed while work runs.** This PR becomes draft before edits and returns to ready after successful publication and confirmation.".into());
     } else {
-        lines.push(format!("**Next: resolve the blocker below.** For a new implementation attempt, post `{} revise {target}` with feedback. If publication is uncertain, first compare the PR head with the recorded commit.", facade.issue_command()));
+        lines.push(format!("**Next: resolve the blocker below.** For a new implementation attempt, post `{revise_command}` with feedback. If publication is uncertain, first compare the PR head with the recorded commit."));
     }
     lines.push(format!("\n**Requested:** {}\n\nTarget: `{target}` · [Your request]({base}/pull/{}#issuecomment-{request}) · [Parent issue #{parent}]({base}/issues/{parent})", quote(requested, 1500), saved.pr_number));
-    if let Some(decision) = input.get("donkeyspace_human_decision") {
+    if let Some(decision) = input.get("donkeyspace_human_decision")
+        && input.pointer("/comment/id") != input.pointer("/pr_revision/comment_id")
+    {
         lines.push(format!(
             "\nLatest accepted decision: `{}` for `{}`{}.",
             decision["action"].as_str().unwrap_or_default(),
@@ -231,7 +243,11 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
         .pointer("/repository_snapshot/commit_sha")
         .and_then(Value::as_str)
     {
-        lines.push(format!("\n[Review proposed changes]({base}/compare/{}...{sha}) · [Checkpoint]({base}/commit/{sha})\n\nThese changes are retained in the revision workspace; they have not been published to this PR branch.",saved.head_sha));
+        if sha == saved.head_sha {
+            lines.push(format!("\n[Retained checkpoint]({base}/commit/{sha}). No source changes have been made in this revision."));
+        } else {
+            lines.push(format!("\n[Review proposed changes]({base}/compare/{}...{sha}) · [Checkpoint]({base}/commit/{sha})\n\nThese changes are retained in the revision workspace; they have not been published to this PR branch.",saved.head_sha));
+        }
     }
     let summary = result["summary"].as_str().unwrap_or_default();
     let checks = result["tests"]
@@ -344,6 +360,23 @@ mod tests {
             text.find("/studio approve change/3").unwrap()
                 < text.find("<summary>Task progress").unwrap()
         );
+    }
+
+    #[test]
+    fn targetless_intake_shows_retained_source_without_duplicate_request_or_invented_target() {
+        let mut saved = snapshot();
+        saved.input["pr_revision"]["command"]["target"] = Value::Null;
+        saved.input["comment"] = json!({"id":123});
+        saved.input["donkeyspace_human_decision"] =
+            json!({"action":"revise","target":"plan","feedback":"Keep current scope"});
+        saved.checkpoint.as_mut().unwrap()["repository_snapshot"]["commit_sha"] = json!("before");
+        saved.status = "failed".into();
+        let text = body(&saved);
+        assert!(text.contains("Target: `planning agent`"));
+        assert!(text.contains("post `/studio revise`"));
+        assert!(text.contains("No source changes have been made"));
+        assert!(!text.contains("Latest accepted decision"));
+        assert!(!text.contains("compare/before...before"));
     }
 
     #[test]

@@ -198,7 +198,7 @@ pub(super) fn pending_approval_result(
         if !relevant.is_empty() {
             lines.push(format!("Review: {}.", relevant.join(", ")));
         }
-        lines.push(format!("**Want a change?** Describe changes to the plan, implementation, or requirements:\n```text\n{prefix} revise\n<describe what you want to change>\n```\nThe planner will propose the scope before completed work is rerun."));
+        lines.push(format!("**Want a change?** Describe changes to the plan, implementation, or requirements:\n```text\n{prefix} revise\nDescribe what you want to change.\n```\nThe planner will propose the scope before completed work is rerun."));
         return RunResult {
             outcome: Outcome::NeedsHuman,
             summary: format!("Awaiting {} review(s).", pending.len()),
