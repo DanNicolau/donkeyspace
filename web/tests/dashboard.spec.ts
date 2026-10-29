@@ -244,7 +244,7 @@ test('execution plan distinguishes omitted tasks from passed checks and shows ap
   await expect(plan.getByRole('heading', { name: 'Execution plan v2' })).toBeVisible();
   await expect(plan.getByText('Awaiting approval', { exact: true })).toBeVisible();
   await expect(plan.getByRole('row').filter({ hasText: 'Implementation' })).toContainText('Required');
-  await expect(plan.getByRole('row').filter({ hasText: 'Packaging' })).toContainText('No — not run');
+  await expect(plan.getByRole('row').filter({ hasText: 'Packaging' })).toContainText('No — excluded');
   await page.screenshot({ path: info.outputPath('execution-plan.png'), fullPage: true });
   execution_plan.approved = true;
   await page.reload();

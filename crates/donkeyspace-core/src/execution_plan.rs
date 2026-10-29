@@ -176,7 +176,7 @@ impl ExecutionPlan {
                 if task.included {
                     "Yes"
                 } else {
-                    "No — not run"
+                    "No — excluded"
                 },
                 if task.included && task.approval == PluginApprovalMode::Required {
                     "Required"
@@ -224,7 +224,7 @@ mod tests {
         let f = p.apply(&flow()).unwrap();
         assert!(!f.tasks.contains_key("package"));
         assert_eq!(f.tasks["build"].approval, PluginApprovalMode::Required);
-        assert!(p.markdown().contains("No — not run"));
+        assert!(p.markdown().contains("No — excluded"));
     }
     #[test]
     fn rejects_unknown_required_conflicting_and_dependency_breaking_choices() {
