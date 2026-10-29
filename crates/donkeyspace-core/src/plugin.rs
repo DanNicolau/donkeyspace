@@ -152,6 +152,8 @@ pub type PluginAgent = PluginRole;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PluginFlow {
     pub start: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_plan: Option<crate::ExecutionPlanPolicy>,
     /// Optional final commit and pull-request title template. Supported
     /// placeholders are `{issue_title}` and `{issue_number}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -435,6 +437,21 @@ impl PluginManifest {
             }
             if let Some(path) = &flow.work_items_path {
                 validate_filesystem_template(path, &self.parameters, false)?;
+            }
+            if let Some(plan) = &flow.execution_plan {
+                if flow.tasks.contains_key("execution-plan") {
+                    return Err(PluginError::Invalid(
+                        "execution-plan is reserved for scheduling approval".into(),
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for name in &plan.optional_tasks {
+                    if name == &flow.start || !flow.tasks.contains_key(name) || !seen.insert(name) {
+                        return Err(PluginError::Invalid(format!(
+                            "invalid optional execution-plan task `{name}`"
+                        )));
+                    }
+                }
             }
             for (task_name, task) in &flow.tasks {
                 if let Some(display_name) = &task.display_name {

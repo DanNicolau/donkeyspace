@@ -155,8 +155,13 @@ pub(super) async fn persist_issue_webhook(
                 &policy.facade.resolve().command,
             ),
         ) {
-        let gate = engagement_gate(event, admission.current_state.as_deref())
-            .ok_or("queueable github event has no engagement gate")?;
+        let gate = command_engagement_gate(
+            event,
+            admission.current_state.as_deref(),
+            payload.comment.as_ref(),
+            &policy.facade.resolve().command,
+        )
+        .ok_or("queueable github event has no engagement gate")?;
         let authorization = authorize_engagement(app_state, gate, &labels, &payload).await;
         if authorization.verification_unavailable {
             return Err(
@@ -218,7 +223,7 @@ pub(super) async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Ignored);
     }
 
-    let human_approval = if current_state.as_deref() == Some("needs_human") {
+    let human_approval = if matches!(current_state.as_deref(), Some("needs_human" | "blocked")) {
         payload.comment.as_ref().and_then(|comment| {
             parse_human_approval_command(&comment.body, &policy.facade.resolve().command)
         })
@@ -226,7 +231,7 @@ pub(super) async fn persist_issue_webhook(
         None
     };
 
-    let gate = engagement_gate(event, current_state.as_deref())
+    let gate = command_engagement_gate(event, current_state.as_deref(), payload.comment.as_ref(), &policy.facade.resolve().command)
         .ok_or("queueable github event has no engagement gate")?;
     let managed_resource = if let Some(comment) = &payload.comment {
         let registered = match comment.id {
@@ -438,6 +443,10 @@ pub(super) async fn persist_issue_webhook(
         return Ok(WebhookPersistOutcome::Queued(Box::new(job)));
     }
 
+    if current_state.as_deref() == Some("blocked") && human_approval.is_some() {
+        tracing::info!(workflow_item_id, "revision cannot resume a retained checkpoint; no fresh workflow created");
+        return Ok(WebhookPersistOutcome::Ignored);
+    }
     if event == "issue_comment" && donkeyspace_db::pr_revisions::has_revision(&mut *connection, workflow_item_id).await? {
         return Ok(WebhookPersistOutcome::Ignored);
     }
@@ -936,6 +945,21 @@ pub(super) fn valid_approval_target(value: &str) -> bool {
             && value.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
             }))
+}
+
+fn command_engagement_gate(
+    event: &str,
+    state: Option<&str>,
+    comment: Option<&GitHubComment>,
+    prefix: &str,
+) -> Option<EngagementGate> {
+    if state == Some("blocked")
+        && comment.is_some_and(|c| parse_human_approval_command(&c.body, prefix).is_some())
+    {
+        Some(EngagementGate::NeedsHumanResume)
+    } else {
+        engagement_gate(event, state)
+    }
 }
 
 pub(super) fn engagement_gate(event: &str, current_state: Option<&str>) -> Option<EngagementGate> {

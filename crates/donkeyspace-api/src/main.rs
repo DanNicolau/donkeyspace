@@ -1795,6 +1795,10 @@ async fn workflow_summary(
         pending_approval,
         approvals,
         revision_targets,
+        execution_plan: checkpoint
+            .as_ref()
+            .and_then(|c| c.state.get("execution_plan"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
         blockers,
         external_sync,
         tasks,
@@ -2736,6 +2740,7 @@ struct WorkflowSummary {
     pending_approval: Option<String>,
     approvals: Vec<ApprovalSummary>,
     revision_targets: Vec<donkeyspace_core::approval::RevisionPreview>,
+    execution_plan: Option<donkeyspace_core::ExecutionPlan>,
     blockers: Vec<donkeyspace_db::workflow_blockers::Blocker>,
     external_sync: ExternalSyncSummary,
     tasks: Vec<WorkflowTaskSummary>,

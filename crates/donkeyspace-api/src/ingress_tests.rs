@@ -30,6 +30,10 @@ async fn authorized_clarification_and_upstream_revision_resume_same_coordinator_
             "needs_human",
             "/example revise plan\nChange the accepted contract.",
         ),
+        (
+            "blocked",
+            "/example revise plan\nChange the accepted contract.",
+        ),
     ] {
         let owner = format!("clarification-{}", Uuid::now_v7());
         let WebhookPersistOutcome::Queued(job) = persist_issue_webhook(
@@ -50,6 +54,10 @@ async fn authorized_clarification_and_upstream_revision_resume_same_coordinator_
         .execute(&pool)
         .await
         .unwrap();
+        if pause == "blocked" {
+            sqlx::query("UPDATE jobs SET status='failed',input=input || '{\"donkeyspace_lifecycle_coordinator\":true}'::jsonb,result='{\"outcome\":\"failed\"}'::jsonb WHERE id=$1").bind(job.id).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO lifecycle_checkpoints (coordinator_job_id,generation,revision,version,state,completed) SELECT id,generation,1,6,'{\"repository_snapshot\":{\"commit_sha\":\"fixture\"}}'::jsonb,false FROM jobs WHERE id=$1").bind(job.id).execute(&pool).await.unwrap();
+        }
         sqlx::query("UPDATE workflow_items SET current_state=$2 WHERE id=$1")
             .bind(workflow)
             .bind(pause)
@@ -74,7 +82,11 @@ async fn authorized_clarification_and_upstream_revision_resume_same_coordinator_
         ));
         assert_eq!(
             get_job(&pool, job.id).await.unwrap().unwrap().status,
-            "paused"
+            if pause == "blocked" {
+                "failed"
+            } else {
+                "paused"
+            }
         );
         payload["sender"]["login"] = json!("alice");
         payload["comment"]["id"] = json!(43);
@@ -90,7 +102,7 @@ async fn authorized_clarification_and_upstream_revision_resume_same_coordinator_
         assert_eq!(resumed.id, job.id);
         assert_eq!(resumed.input["donkeyspace_resume"], true);
         assert_eq!(resumed.input["comment"]["body"], response);
-        if pause == "needs_human" {
+        if pause != "needs_info" {
             assert_eq!(
                 resumed.input["donkeyspace_human_decision"],
                 json!({"action":"revise","target":"plan","feedback":"Change the accepted contract."})

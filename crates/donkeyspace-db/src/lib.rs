@@ -1170,7 +1170,13 @@ pub async fn resume_latest_paused_job<'a>(
             SELECT id
             FROM jobs
             WHERE workflow_item_id = $1
-              AND status = 'paused'
+              AND (status = 'paused' OR (
+                  status = 'failed'
+                  AND input->>'donkeyspace_lifecycle_coordinator' = 'true'
+                  AND $2::jsonb->'donkeyspace_human_decision'->>'action' = 'revise'
+                  AND EXISTS (SELECT 1 FROM lifecycle_checkpoints c WHERE c.coordinator_job_id=jobs.id
+                      AND c.generation=jobs.generation AND NOT c.completed
+                      AND c.state->'repository_snapshot'->>'commit_sha' IS NOT NULL)))
             ORDER BY updated_at DESC
             LIMIT 1
             FOR UPDATE SKIP LOCKED

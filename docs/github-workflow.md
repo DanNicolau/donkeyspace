@@ -70,6 +70,11 @@ each action completed or failed.
 
 ## Human Control
 
+Plan-enabled plugins support per-issue stage selection and additional review
+gates, including a full default plan when no preferences are supplied. See
+[approved execution plans](execution-plans.md) for initial approval and changing
+execution settings on a paused or failed issue.
+
 - Pause new automation: apply a configured block label such as `ai:disabled`.
 - Resume after clarification: comment with the requested information. If the issue has `ai:needs-info`, donkeyspace re-runs triage.
 - Approve a plugin checkpoint: comment `/donkeyspace approve` or target one

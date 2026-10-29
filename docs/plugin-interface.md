@@ -51,6 +51,9 @@ new work or change generated-comment and duplicate-trigger suppression.
 
 ## Roles and tasks
 
+Plugins can opt into [approved execution plans](execution-plans.md) to let users
+select optional stages and additional human review gates per workflow.
+
 Roles are agent identities and runtime definitions. Tasks are graph nodes
 assigned to roles. This allows one role to perform several phases without
 misrepresenting those phases as new roles.

@@ -50,6 +50,8 @@ pub struct PluginTaskResult {
     /// catalog; non-planner tasks leave it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_items: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_plan: Option<crate::ExecutionPlanProposal>,
 }
 
 pub type PluginStageResult = PluginTaskResult;

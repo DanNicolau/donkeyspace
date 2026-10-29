@@ -444,6 +444,14 @@ async fn queue_status_comment(
         ),
         String::new(),
     ];
+    if let Some(plan) = checkpoint
+        .as_ref()
+        .and_then(|c| c.state.get("execution_plan"))
+        .and_then(|v| serde_json::from_value::<donkeyspace_core::ExecutionPlan>(v.clone()).ok())
+    {
+        lines.push(plan.markdown());
+        lines.push(String::new());
+    }
     if !blockers.is_empty() {
         lines.extend(["#### Current blockers".into(), String::new()]);
         for blocker in &blockers {

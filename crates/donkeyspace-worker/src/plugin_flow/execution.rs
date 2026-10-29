@@ -119,6 +119,9 @@ pub(super) async fn execute_task(
             "issue": issue_input.pointer("/issue").unwrap_or(issue_input),
             "repository": issue_input.pointer("/repository"),
             "workspace": {"repo_path": "repo", "result_path": ".donkeyspace/run-result.json", "read": read_roots, "write": write_roots},
+            "execution_plan_policy": manifest.flows[&selection.flow].execution_plan,
+            "available_tasks": manifest.flows[&selection.flow].tasks.iter().map(|(name,t)| json!({"task":name,"display_name":t.display_name,"dependencies":t.dependencies,"approval":t.approval})).collect::<Vec<_>>(),
+            "execution_plan": previous.iter().rev().find_map(|v| v.get("execution_plan")),
             "parameters": parameters,
             "resources": resources,
             "previous_tasks": previous.iter().rev().take(64).rev().collect::<Vec<_>>(),
@@ -149,6 +152,12 @@ pub(super) async fn execute_task(
         .into());
     }
     let mut task_result: PluginTaskResult = files.read().await?;
+    if task_result.execution_plan.is_some()
+        && (task_name != manifest.flows[&selection.flow].start
+            || manifest.flows[&selection.flow].execution_plan.is_none())
+    {
+        return Err("only the planning task of an execution-plan-enabled flow may propose scheduling choices".into());
+    }
     validate_resources_used(&task_result.resources_used, &resources)?;
     validate_changed_files(&task_result.result.changed_files, &write_roots)?;
     verify_resources(&task_root, &resources)?;
