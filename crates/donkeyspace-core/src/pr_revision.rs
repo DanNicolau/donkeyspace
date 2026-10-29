@@ -72,6 +72,12 @@ pub fn clear_execution_context(input: &mut serde_json::Value) {
 const INSTRUCTIONS_START: &str = "<!-- donkeyspace-pr-revisions:start -->";
 const INSTRUCTIONS_END: &str = "<!-- donkeyspace-pr-revisions:end -->";
 
+pub fn intake_instructions(prefix: &str, parent: i64) -> String {
+    format!(
+        "## Requesting changes\n\nPost a new comment on this PR:\n\n```text\n/{prefix} revise\nDescribe what you want to change, including any execution preferences.\n```\n\nThe planning agent proposes the changes and shows which tasks need to run again. Review that proposal before approving it. Plan-only changes retain completed work; artifact approvals remain separate.\n\nFollow the decision commands in the live progress comment. Commands on parent issue #{parent} also work. Wait for a pause before changing a running workflow. The PR stays draft while a revision is in progress.\n"
+    )
+}
+
 pub fn instructions(
     prefix: &str,
     parent: i64,
@@ -115,6 +121,26 @@ pub fn validate_decision(
     checkpoint: &serde_json::Value,
     decision: &serde_json::Value,
 ) -> Result<(), String> {
+    if checkpoint["change_intake_enabled"] == true {
+        if decision["action"] == "revise" {
+            return decision["feedback"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+                .map(|_| ())
+                .ok_or_else(|| "Describe the requested change after the revise command.".into());
+        }
+        if let Some(change) = checkpoint.get("pending_change").filter(|v| !v.is_null()) {
+            let target = change["revision"].as_u64().map(|n| format!("change/{n}"));
+            return if decision["action"] == "approve"
+                && decision["target"].as_str() == target.as_deref()
+                && change.get("proposal").is_some_and(|p| !p.is_null())
+            {
+                Ok(())
+            } else {
+                Err("Use the approval command for the displayed change proposal, or revise your request. Artifact approvals remain separate.".into())
+            };
+        }
+    }
     if checkpoint["last_result"]["outcome"] == "needs_info" {
         return Err("This pause needs clarification. Answer the questions on the parent issue to continue the same run.".into());
     }
@@ -189,6 +215,64 @@ pub fn with_instructions(body: &str, instructions: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn change_intake_accepts_plain_requests_and_only_the_displayed_proposal_approval() {
+        let mut checkpoint = serde_json::json!({"change_intake_enabled":true,
+            "pending_change":{"revision":3,"proposal":{"summary":"Skip packaging"}},
+            "pending_approvals":[{"key":{"task":"build","work_item":"queue"}}]});
+        for target in [
+            serde_json::Value::Null,
+            serde_json::json!("plan"),
+            serde_json::json!("build/queue"),
+        ] {
+            assert!(validate_decision(&checkpoint, &serde_json::json!({"action":"revise","target":target,"feedback":"Skip packaging"})).is_ok());
+        }
+        assert!(
+            validate_decision(
+                &checkpoint,
+                &serde_json::json!({"action":"approve","target":"change/3"})
+            )
+            .is_ok()
+        );
+        for target in [
+            serde_json::Value::Null,
+            serde_json::json!("all"),
+            serde_json::json!("build/queue"),
+            serde_json::json!("change/2"),
+        ] {
+            assert!(
+                validate_decision(
+                    &checkpoint,
+                    &serde_json::json!({"action":"approve","target":target})
+                )
+                .is_err()
+            );
+        }
+        checkpoint["pending_change"]["proposal"] = serde_json::Value::Null;
+        assert!(
+            validate_decision(
+                &checkpoint,
+                &serde_json::json!({"action":"approve","target":"change/3"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_decision(
+                &checkpoint,
+                &serde_json::json!({"action":"revise","feedback":" "})
+            )
+            .is_err()
+        );
+        checkpoint["pending_change"] = serde_json::Value::Null;
+        assert!(
+            validate_decision(
+                &checkpoint,
+                &serde_json::json!({"action":"approve","target":"build/queue"})
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn decisions_match_the_current_pause_and_relevant_upstream_work() {

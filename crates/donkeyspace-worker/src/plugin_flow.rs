@@ -19,6 +19,7 @@ use projection::*;
 mod execution;
 use execution::*;
 mod approvals;
+mod change_requests;
 mod plan_controls;
 use approvals::*;
 mod checkpoint;
@@ -156,7 +157,30 @@ async fn run_work_item_lifecycle(
             "resume_targets": saved.revision_targets,
         }));
     }
-    if let Some(saved) = checkpoint.as_mut()
+    let mut change_applied = false;
+    if let Some(saved) = checkpoint.as_mut() {
+        match change_requests::resume(
+            saved,
+            selection,
+            manifest,
+            base_flow,
+            repo_path,
+            workspace_path,
+            issue_input,
+            tracking.as_ref(),
+            parameters,
+            plugin_root,
+            &mut store,
+        )
+        .await?
+        {
+            change_requests::ChangeResume::Paused(result) => return Ok(result),
+            change_requests::ChangeResume::Continue => change_applied = true,
+            change_requests::ChangeResume::Unhandled => {}
+        }
+    }
+    if !change_applied
+        && let Some(saved) = checkpoint.as_mut()
         && (!saved.pending_approvals.is_empty()
             || issue_input.get("donkeyspace_human_decision").is_some())
         && let Some(result) =
@@ -582,6 +606,8 @@ async fn run_work_item_lifecycle(
         .unwrap_or_default();
 
     let mut state = LifecycleState {
+        change_intake_enabled: base_flow.change_intake,
+        change_sequence: checkpoint.as_ref().map_or(0, |c| c.change_sequence),
         execution_plan,
         attempt,
         accumulated_tests,
@@ -2220,6 +2246,7 @@ flows:
             resources_used: Vec::new(),
             work_items: None,
             execution_plan: None,
+            change_proposal: None,
         })
         .unwrap();
         assert_eq!(

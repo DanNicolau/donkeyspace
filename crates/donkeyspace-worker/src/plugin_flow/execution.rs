@@ -74,7 +74,8 @@ pub(super) async fn execute_task(
     fs::create_dir_all(&task_repo)?;
     let declared_read = expand_templates(&task.read, parameters, work_item)?;
     let declared_write = expand_templates(&task.write, parameters, work_item)?;
-    let (read_roots, write_roots) = resolve_access(
+    let intake = issue_input.get("donkeyspace_change_request").is_some();
+    let (mut read_roots, mut write_roots) = resolve_access(
         selection,
         task_name,
         &declared_read,
@@ -82,6 +83,16 @@ pub(super) async fn execute_task(
         parameters,
         &manifest.parameters,
     )?;
+    if intake {
+        if !manifest.flows[&selection.flow].change_intake
+            || task_name != manifest.flows[&selection.flow].start
+        {
+            return Err("change intake must use the configured planning role".into());
+        }
+        read_roots.append(&mut write_roots);
+        read_roots.sort();
+        read_roots.dedup();
+    }
     let diagnostics = expand_artifacts(&task.diagnostics, parameters, work_item)?;
     if let Some(diagnostic) = diagnostics.iter().find(|diagnostic| {
         !covered(&diagnostic.path, &read_roots) && !covered(&diagnostic.path, &write_roots)
@@ -125,6 +136,7 @@ pub(super) async fn execute_task(
             "parameters": parameters,
             "resources": resources,
             "previous_tasks": previous.iter().rev().take(64).rev().collect::<Vec<_>>(),
+            "change_request": issue_input.get("donkeyspace_change_request"),
             "pr_revision": issue_input.get("pr_revision"),
             "pull_request": issue_input.get("pull_request"),
             "mcp_servers": selected_mcp,
@@ -158,6 +170,16 @@ pub(super) async fn execute_task(
     {
         return Err("only the planning task of an execution-plan-enabled flow may propose scheduling choices".into());
     }
+    if !intake && task_result.change_proposal.is_some() {
+        return Err("change proposals are only accepted during read-only change intake".into());
+    }
+    if intake
+        && (task_result.execution_plan.is_some()
+            || task_result.handoff.is_some()
+            || task_result.work_items.is_some())
+    {
+        return Err("change intake must use change_proposal and cannot execute a task handoff or replace work items".into());
+    }
     validate_resources_used(&task_result.resources_used, &resources)?;
     validate_changed_files(&task_result.result.changed_files, &write_roots)?;
     verify_resources(&task_root, &resources)?;
@@ -168,6 +190,9 @@ pub(super) async fn execute_task(
         apply_validator_results(&mut task_result.result, validator_results);
     }
     task_result.result.validate_for_orchestration()?;
+    if intake {
+        return Ok(task_result);
+    }
     let preserved = expand_artifacts(&task.preserve_on_success, parameters, work_item)?;
     retain_task_output(
         &task_repo,

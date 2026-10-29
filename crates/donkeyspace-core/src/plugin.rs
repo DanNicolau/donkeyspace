@@ -154,6 +154,9 @@ pub struct PluginFlow {
     pub start: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_plan: Option<crate::ExecutionPlanPolicy>,
+    /// Interpret human revisions with the start role before changing accepted work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub change_intake: bool,
     /// Optional final commit and pull-request title template. Supported
     /// placeholders are `{issue_title}` and `{issue_number}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -437,6 +440,14 @@ impl PluginManifest {
             }
             if let Some(path) = &flow.work_items_path {
                 validate_filesystem_template(path, &self.parameters, false)?;
+            }
+            if flow.change_intake
+                && (!flow.replaces_default_lifecycle || flow.tasks.contains_key("change"))
+            {
+                return Err(PluginError::Invalid(
+                    "change intake requires a lifecycle flow and reserves the task name `change`"
+                        .into(),
+                ));
             }
             if let Some(plan) = &flow.execution_plan {
                 if flow.tasks.contains_key("execution-plan") {

@@ -1,3 +1,5 @@
+pub mod change_request;
+pub use change_request::{ChangeProposal, TaskRevisionRequest};
 pub mod deployment;
 pub mod execution_plan;
 pub use execution_plan::{ExecutionPlan, ExecutionPlanPolicy, ExecutionPlanProposal};

@@ -11,14 +11,17 @@ pub async fn instructions(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let planning = if let Some(selection) = &policy.lifecycle.plugin {
         let manifest = donkeyspace_core::PluginManifest::from_path(&selection.manifest_path)?;
-        Some(
-            manifest
-                .flows
-                .get(&selection.flow)
-                .ok_or("Missing lifecycle flow")?
-                .start
-                .clone(),
-        )
+        let flow = manifest
+            .flows
+            .get(&selection.flow)
+            .ok_or("Missing lifecycle flow")?;
+        if flow.change_intake {
+            return Ok(donkeyspace_core::pr_revision::intake_instructions(
+                &policy.facade.resolve().command,
+                issue_number(&job.input).unwrap_or(0),
+            ));
+        }
+        Some(flow.start.clone())
     } else {
         None
     };
@@ -128,7 +131,7 @@ pub async fn prepare(
         };
         let target = job.input["pr_revision"]["command"]["target"]
             .as_str()
-            .ok_or("Plugin revision requires a task target")?;
+            .unwrap_or_default();
         let (revision_target, reopened) = plugin_flow::prepare_pr_revision(
             selection,
             snapshot,
