@@ -1378,7 +1378,11 @@ async fn run_work_item_lifecycle(
     state.last_result.summary = format!(
         "Completed {} block work item(s) across {} task execution(s).",
         state.work_items.len(),
-        state.previous.len()
+        state
+            .previous
+            .iter()
+            .filter(|entry| entry.get("task").or_else(|| entry.get("stage")).is_some())
+            .count()
     );
     store
         .save(

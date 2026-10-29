@@ -115,6 +115,7 @@ async fn execution_plan_gates_revisions_and_excludes_tasks_across_restarts() {
     .await
     .unwrap();
     assert_eq!(final_result.outcome, Outcome::Implemented);
+    assert!(final_result.summary.contains("across 4 task execution(s)"));
     assert_eq!(
         fs::read_to_string(repo.join("check/one/verified")).unwrap(),
         "attemptattempt"
