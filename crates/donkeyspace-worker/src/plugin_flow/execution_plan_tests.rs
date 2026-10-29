@@ -120,7 +120,7 @@ async fn execution_plan_gates_revisions_and_excludes_tasks_across_restarts() {
         fs::read_to_string(repo.join("check/one/verified")).unwrap(),
         "attemptattempt"
     );
-    assert!(final_result.summary.contains("No — not run"));
+    assert!(final_result.summary.contains("No — excluded"));
     assert!(final_result.summary.contains("v1 — approved"));
     fs::remove_dir_all(workspace).unwrap();
     }).await;
