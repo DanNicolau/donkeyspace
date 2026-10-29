@@ -72,6 +72,7 @@ fn key(value: &Value) -> Option<donkeyspace_core::TaskKey> {
 fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
     let input = &saved.input;
     let checkpoint = saved.checkpoint.as_ref().unwrap_or(&Value::Null);
+    let intake = checkpoint["change_intake_enabled"] == true;
     let result = saved.result.as_ref().unwrap_or(&Value::Null);
     let owner = input["repository"]["owner"]["login"]
         .as_str()
@@ -87,7 +88,17 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
         .unwrap_or("Requested revision");
     let target = input["pr_revision"]["command"]["target"]
         .as_str()
-        .unwrap_or("developer");
+        .unwrap_or(if input["donkeyspace_lifecycle_coordinator"] == true {
+            "planning agent"
+        } else {
+            "developer"
+        });
+    let revise_command = input["pr_revision"]["command"]["target"]
+        .as_str()
+        .map_or_else(
+            || format!("{} revise", facade.issue_command()),
+            |target| format!("{} revise {target}", facade.issue_command()),
+        );
     let published = saved.publication_status == "published";
     let phase = match saved.status.as_str() {
         "queued" | "leased" => {
@@ -112,6 +123,13 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
     ];
     if saved.status == "paused" && result["outcome"] == "needs_info" {
         lines.push(format!("**Next: answer the questions on [parent issue #{parent}]({base}/issues/{parent}) to continue this run.** This pause needs clarification, not an approval."));
+    } else if saved.status == "paused" && intake {
+        lines.push("**Next: post a decision comment on this PR.** Commands on the parent issue also continue this run.".into());
+        if let Some(reason) = result["human_review_reason"].as_str() {
+            lines.push(format!("\n{}", quote(reason, 12000)));
+        } else {
+            lines.push(format!("\nRequest a change with `/{} revise` and your feedback on the next lines. The planning agent will propose what should run again.", facade.command));
+        }
     } else if saved.status == "paused" {
         lines.push("**Next: post a new decision comment on this PR.** Commands on the parent issue also continue this same run.".into());
         let mut pending = checkpoint["pending_approvals"]
@@ -147,10 +165,12 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
     } else if matches!(saved.status.as_str(), "queued" | "leased" | "running") {
         lines.push("**Next: no action needed while work runs.** This PR becomes draft before edits and returns to ready after successful publication and confirmation.".into());
     } else {
-        lines.push(format!("**Next: resolve the blocker below.** For a new implementation attempt, post `{} revise {target}` with feedback. If publication is uncertain, first compare the PR head with the recorded commit.", facade.issue_command()));
+        lines.push(format!("**Next: resolve the blocker below.** For a new implementation attempt, post `{revise_command}` with feedback. If publication is uncertain, first compare the PR head with the recorded commit."));
     }
     lines.push(format!("\n**Requested:** {}\n\nTarget: `{target}` · [Your request]({base}/pull/{}#issuecomment-{request}) · [Parent issue #{parent}]({base}/issues/{parent})", quote(requested, 1500), saved.pr_number));
-    if let Some(decision) = input.get("donkeyspace_human_decision") {
+    if let Some(decision) = input.get("donkeyspace_human_decision")
+        && input.pointer("/comment/id") != input.pointer("/pr_revision/comment_id")
+    {
         lines.push(format!(
             "\nLatest accepted decision: `{}` for `{}`{}.",
             decision["action"].as_str().unwrap_or_default(),
@@ -176,18 +196,24 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
         );
     }
     if !tasks.is_empty() {
-        lines.push("\n| Task | Progress |\n| --- | --- |".into());
+        lines.push(
+            "\n<details>\n<summary>Task progress</summary>\n\n| Task | Progress |\n| --- | --- |"
+                .into(),
+        );
         for (task, child) in tasks {
             lines.push(format!(
                 "| `{task}` | {} |",
                 child["status"].as_str().unwrap_or("waiting")
             ));
         }
+        lines.push("\n</details>".into());
     }
     let reason = result["blocked_reason"]
         .as_str()
         .or(result["human_review_reason"].as_str());
-    if let Some(reason) = reason {
+    if let Some(reason) = reason.filter(|_| {
+        !(intake && saved.status == "paused" && result["human_review_reason"].is_string())
+    }) {
         // The first paragraph is the actual blocker; old result text can carry
         // obsolete parent-only command instructions, so never repeat those.
         lines.push(format!(
@@ -217,7 +243,11 @@ fn render(saved: &Snapshot, facade: &donkeyspace_core::Facade) -> String {
         .pointer("/repository_snapshot/commit_sha")
         .and_then(Value::as_str)
     {
-        lines.push(format!("\n[Review proposed changes]({base}/compare/{}...{sha}) · [Checkpoint]({base}/commit/{sha})\n\nThese changes are retained in the revision workspace; they have not been published to this PR branch.",saved.head_sha));
+        if sha == saved.head_sha {
+            lines.push(format!("\n[Retained checkpoint]({base}/commit/{sha}). No source changes have been made in this revision."));
+        } else {
+            lines.push(format!("\n[Review proposed changes]({base}/compare/{}...{sha}) · [Checkpoint]({base}/commit/{sha})\n\nThese changes are retained in the revision workspace; they have not been published to this PR branch.",saved.head_sha));
+        }
     }
     let summary = result["summary"].as_str().unwrap_or_default();
     let checks = result["tests"]
@@ -312,6 +342,41 @@ mod tests {
         }
         assert!(!text.contains("Old instructions"));
         assert!(!text.contains("| failed |"));
+    }
+
+    #[test]
+    fn intake_proposal_shows_only_its_current_approval_before_collapsed_progress() {
+        let mut saved = snapshot();
+        saved.checkpoint.as_mut().unwrap()["change_intake_enabled"] = json!(true);
+        saved.result.as_mut().unwrap()["human_review_reason"] = json!(
+            "Retain completed work.\n\nApprove with `/studio approve change/3`.\n\nOr use `/studio revise` and describe the change."
+        );
+        let text = body(&saved);
+        assert!(text.contains("/studio approve change/3"));
+        assert!(text.contains("/studio revise`"));
+        assert!(!text.contains("/studio approve build/queue"));
+        assert!(!text.contains("/studio revise plan"));
+        assert!(
+            text.find("/studio approve change/3").unwrap()
+                < text.find("<summary>Task progress").unwrap()
+        );
+    }
+
+    #[test]
+    fn targetless_intake_shows_retained_source_without_duplicate_request_or_invented_target() {
+        let mut saved = snapshot();
+        saved.input["pr_revision"]["command"]["target"] = Value::Null;
+        saved.input["comment"] = json!({"id":123});
+        saved.input["donkeyspace_human_decision"] =
+            json!({"action":"revise","target":"plan","feedback":"Keep current scope"});
+        saved.checkpoint.as_mut().unwrap()["repository_snapshot"]["commit_sha"] = json!("before");
+        saved.status = "failed".into();
+        let text = body(&saved);
+        assert!(text.contains("Target: `planning agent`"));
+        assert!(text.contains("post `/studio revise`"));
+        assert!(text.contains("No source changes have been made"));
+        assert!(!text.contains("Latest accepted decision"));
+        assert!(!text.contains("compare/before...before"));
     }
 
     #[test]

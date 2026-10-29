@@ -13,6 +13,10 @@ pub struct RevisionSource {
     pub checkpoint: Option<Value>,
 }
 
+// Comment polling may observe a newly published PR before its opened event.
+// The exact recorded publication URL proves ownership during that gap; an
+// existing PR row still controls its workflow, generation and managed state.
+// Ingress verifies the current PR and parent on GitHub before admission.
 pub async fn source(
     pool: &PgPool,
     repository: i64,
@@ -21,19 +25,24 @@ pub async fn source(
     Ok(sqlx::query_as(
         r#"SELECT w.id AS workflow_item_id, w.issue_number, j.id AS job_id, j.input,
                   COALESCE(s.checkpoint, c.state) AS checkpoint
-           FROM pull_requests p JOIN workflow_items w ON w.id=p.workflow_item_id
+           FROM workflow_items w JOIN repositories repo ON repo.id=w.repository_id
+           LEFT JOIN pull_requests p ON p.repository_id=w.repository_id AND p.pr_number=$2
            JOIN LATERAL (
              SELECT j.* FROM jobs j WHERE j.workflow_item_id=w.id AND j.generation=w.generation
                AND j.input #>> '{plugin_execution,coordinator_run_id}' IS NULL
                AND (j.role='developer' OR j.input->>'donkeyspace_lifecycle_coordinator'='true')
                AND (EXISTS (SELECT 1 FROM agent_publications a WHERE a.coordinator_job_id=j.id
-                            AND a.metadata->>'pull_request_url'=p.html_url AND a.status='published')
-                    OR EXISTS (SELECT 1 FROM pr_revisions r WHERE r.job_id=j.id AND r.status='published' AND r.pr_number=p.pr_number AND r.repository_id=p.repository_id))
+                            AND a.metadata->>'pull_request_url'=COALESCE(p.html_url,
+                                'https://github.com/' || repo.owner || '/' || repo.name || '/pull/' || $2::text)
+                            AND a.status='published')
+                    OR EXISTS (SELECT 1 FROM pr_revisions r WHERE r.job_id=j.id AND r.status='published' AND r.pr_number=$2 AND r.repository_id=$1))
              ORDER BY j.created_at DESC LIMIT 1
            ) j ON true LEFT JOIN lifecycle_snapshots s ON s.job_id=j.id
            LEFT JOIN lifecycle_checkpoints c ON c.coordinator_job_id=j.id AND c.completed AND c.generation=j.generation
-           WHERE p.repository_id=$1 AND p.pr_number=$2 AND p.managed_by_donkeyspace
-             AND p.state='open' AND p.generation=w.generation AND w.provider_state='open'
+           WHERE w.repository_id=$1
+             AND (p.id IS NULL OR (p.workflow_item_id=w.id AND p.managed_by_donkeyspace
+                 AND p.state='open' AND p.generation=w.generation))
+             AND w.provider_state='open'
              AND w.current_state IS DISTINCT FROM 'finished'"#,
     ).bind(repository).bind(pr).fetch_optional(pool).await?)
 }
@@ -502,13 +511,15 @@ mod tests {
             .unwrap();
         crate::apply_migrations(&pool).await.unwrap();
         crate::apply_migrations(&pool).await.unwrap();
+        let owner = format!("revision-{}", Uuid::now_v7());
+        let pr_url = format!("https://github.com/{owner}/example/pull/2");
         let repository = crate::upsert_repository(
             &pool,
             &RepositoryInput {
                 installation_external_id: None,
                 installation_account_login: None,
                 provider: "github".into(),
-                owner: format!("revision-{}", Uuid::now_v7()),
+                owner: owner.clone(),
                 name: "example".into(),
                 default_branch: "main".into(),
             },
@@ -550,7 +561,16 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO agent_publications(coordinator_job_id,workflow_item_id,kind,branch_name,commit_sha,html_url,local_repo_path,status,metadata) VALUES($1,$2,'checkpoint','work','base','https://example.invalid','/tmp/test','published',$3)")
-            .bind(original.id).bind(workflow).bind(json!({"pull_request_url":"https://example.invalid/pull/2"})).execute(&pool).await.unwrap();
+            .bind(original.id).bind(workflow).bind(json!({"pull_request_url":pr_url})).execute(&pool).await.unwrap();
+        assert_eq!(
+            source(&pool, repository, 2).await.unwrap().unwrap().job_id,
+            original.id,
+            "publication provenance admits a comment before the PR opened event arrives"
+        );
+        assert!(
+            source(&pool, repository, 3).await.unwrap().is_none(),
+            "an unrecorded PR is not managed"
+        );
         crate::upsert_pull_request(
             &pool,
             &PullRequestInput {
@@ -559,7 +579,7 @@ mod tests {
                 provider_pr_id: "2".into(),
                 pr_number: 2,
                 title: "Implement".into(),
-                html_url: "https://example.invalid/pull/2".into(),
+                html_url: pr_url,
                 state: "open".into(),
                 head_ref: format!("studio/issue-1-{}", original.id),
                 head_sha: Some("base".into()),
@@ -570,6 +590,12 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query("UPDATE pull_requests SET managed_by_donkeyspace=false WHERE repository_id=$1 AND pr_number=2").bind(repository).execute(&pool).await.unwrap();
+        assert!(
+            source(&pool, repository, 2).await.unwrap().is_none(),
+            "publication fallback must not bypass an explicitly unmanaged PR"
+        );
+        sqlx::query("UPDATE pull_requests SET managed_by_donkeyspace=true WHERE repository_id=$1 AND pr_number=2").bind(repository).execute(&pool).await.unwrap();
         // PRs completed on the schema-9 baseline retain their authoritative
         // checkpoint even though they predate the revision snapshot table.
         let prior_state = json!({"version":5,"completed_keys":[{"task":"plan","work_item":null}],

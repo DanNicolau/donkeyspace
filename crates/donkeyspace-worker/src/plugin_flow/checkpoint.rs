@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CHECKPOINT_VERSION: u32 = 5;
+pub(super) const CHECKPOINT_VERSION: u32 = 7;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct TrackedJobCheckpoint {
     pub(super) key: TaskKey,
@@ -27,6 +27,14 @@ pub(super) enum StartAction {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct LifecycleCheckpoint {
     pub(super) version: u32,
+    #[serde(default)]
+    pub(super) execution_plan: Option<donkeyspace_core::ExecutionPlan>,
+    #[serde(default)]
+    pub(super) change_intake_enabled: bool,
+    #[serde(default)]
+    pub(super) change_sequence: u32,
+    #[serde(default)]
+    pub(super) pending_change: Option<super::change_requests::PendingChange>,
     #[serde(default)]
     repository_snapshot: Option<crate::checkout_recovery::Snapshot>,
     pub(super) attempt: u32,
@@ -91,6 +99,10 @@ impl LifecycleCheckpoint {
     ) -> Self {
         Self {
             version: CHECKPOINT_VERSION,
+            execution_plan: None,
+            change_intake_enabled: false,
+            change_sequence: 0,
+            pending_change: None,
             repository_snapshot: None,
             attempt,
             accumulated_tests: tests.to_vec(),
@@ -182,16 +194,17 @@ impl<'a, 'b> CheckpointStore<'a, 'b> {
             if !resume || record.completed {
                 return Err("checkpoint cannot be replayed; inspect the retained execution and start a new run".into());
             }
-            if record.version != CHECKPOINT_VERSION as i32 {
+            if ![5, 6, CHECKPOINT_VERSION as i32].contains(&record.version) {
                 return Err(
                     format!("unsupported database checkpoint version {}", record.version).into(),
                 );
             }
             self.revision = record.revision;
-            let saved: LifecycleCheckpoint = serde_json::from_value(record.state)?;
-            if saved.version != CHECKPOINT_VERSION {
+            let mut saved: LifecycleCheckpoint = serde_json::from_value(record.state)?;
+            if saved.version != record.version as u32 {
                 return Err("checkpoint version mismatch".into());
             }
+            saved.version = CHECKPOINT_VERSION;
             return Ok(Some(saved));
         }
         if !resume {
@@ -221,6 +234,10 @@ impl<'a, 'b> CheckpointStore<'a, 'b> {
         completed: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut saved = saved.clone();
+        saved.change_intake_enabled = flow.change_intake;
+        if let Some(plan) = &saved.execution_plan {
+            super::append_execution_plan(&mut saved.last_result, plan);
+        }
         if saved.flow_fingerprint.is_none() {
             saved.flow_fingerprint = Some(flow_fingerprint(flow)?);
         }
@@ -255,6 +272,9 @@ impl<'a, 'b> CheckpointStore<'a, 'b> {
             .filter(|new| {
                 !existing.iter().any(|old| {
                     old.state == "pending"
+                        && !self.effects.decisions.iter().any(|(key, _)| {
+                            key.task == old.target_task && key.work_item == old.target_work_item
+                        })
                         && old.target_task == new.target_task
                         && old.target_work_item == new.target_work_item
                 })
@@ -331,6 +351,9 @@ fn import_legacy_checkpoint(
 /// Mutable execution state has one owner. Decisions operate on task identities;
 /// persistence snapshots this state instead of reconstructing it at each exit.
 pub(super) struct LifecycleState {
+    pub(super) change_intake_enabled: bool,
+    pub(super) change_sequence: u32,
+    pub(super) execution_plan: Option<donkeyspace_core::ExecutionPlan>,
     pub(super) attempt: u32,
     pub(super) accumulated_tests: Vec<TestResult>,
     pub(super) previous: Vec<Value>,
@@ -352,7 +375,7 @@ impl LifecycleState {
         pending: Vec<PendingApproval>,
         start_approved: bool,
     ) -> LifecycleCheckpoint {
-        LifecycleCheckpoint::capture(
+        let mut saved = LifecycleCheckpoint::capture(
             self.attempt,
             &self.accumulated_tests,
             &self.previous,
@@ -367,7 +390,11 @@ impl LifecycleState {
             pending,
             start_approved,
             &self.work_items,
-        )
+        );
+        saved.execution_plan = self.execution_plan.clone();
+        saved.change_intake_enabled = self.change_intake_enabled;
+        saved.change_sequence = self.change_sequence;
+        saved
     }
 }
 

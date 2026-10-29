@@ -127,6 +127,33 @@ pub(super) async fn persist(
             Some(error)
         } else {
             let command = command?.expect("non-command already returned");
+            // Publication provenance can identify a managed PR before its
+            // opened event arrives. Register the verified live PR before the
+            // atomic admission check, which requires an open managed PR row.
+            upsert_pull_request(
+                pool,
+                &PullRequestInput {
+                    repository_id: repository,
+                    workflow_item_id: Some(source.workflow_item_id),
+                    provider_pr_id: pr["id"].as_i64().ok_or("PR ID is missing")?.to_string(),
+                    pr_number,
+                    title: pr["title"].as_str().unwrap_or_default().into(),
+                    html_url: pr["html_url"].as_str().ok_or("PR URL is missing")?.into(),
+                    state: "open".into(),
+                    head_ref: pr["head"]["ref"]
+                        .as_str()
+                        .ok_or("PR head branch is missing")?
+                        .into(),
+                    head_sha: pr["head"]["sha"].as_str().map(str::to_owned),
+                    base_ref: pr["base"]["ref"]
+                        .as_str()
+                        .ok_or("PR base branch is missing")?
+                        .into(),
+                    base_sha: pr["base"]["sha"].as_str().map(str::to_owned),
+                    managed_by_donkeyspace: true,
+                },
+            )
+            .await?;
             if let Some(active) = pr_revisions::active(pool, repository, pr_number).await? {
                 if active.status != "paused" {
                     Some(format!(
@@ -340,30 +367,33 @@ async fn prepare_request(
             .flows
             .get(&selection.flow)
             .ok_or("Configured flow is missing.")?;
-        let target = command
-            .target
-            .as_deref()
-            .ok_or("Plugin revisions require TASK or TASK/WORK-ITEM after revise.")?;
-        let (task, item) = target
-            .split_once('/')
-            .map_or((target, None), |(t, i)| (t, Some(i)));
-        let definition = flow
-            .tasks
-            .get(task)
-            .ok_or("Unknown revision task; use a task from the configured flow.")?;
-        if (definition.scope == donkeyspace_core::PluginTaskScope::WorkItem) != item.is_some() {
-            return Err(
-                "Use TASK for workflow tasks and TASK/WORK-ITEM for work-item tasks.".into(),
-            );
-        }
-        let checkpoint = source.checkpoint.as_ref().ok_or("This PR predates durable continuation support. Its completed lifecycle snapshot is unavailable; start a new managed workflow or update the PR manually.")?;
-        if !checkpoint["completed_keys"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|k| k["task"] == task && k["work_item"].as_str() == item)
-        {
-            return Err("The target is not a completed task in this PR's lifecycle.".into());
+        source.checkpoint.as_ref().ok_or("This PR has no retained lifecycle checkpoint; start a new managed workflow or update the PR manually.")?;
+        if !flow.change_intake {
+            let target = command
+                .target
+                .as_deref()
+                .ok_or("Plugin revisions require TASK or TASK/WORK-ITEM after revise.")?;
+            let (task, item) = target
+                .split_once('/')
+                .map_or((target, None), |(t, i)| (t, Some(i)));
+            let definition = flow
+                .tasks
+                .get(task)
+                .ok_or("Unknown revision task; use a task from the configured flow.")?;
+            if (definition.scope == donkeyspace_core::PluginTaskScope::WorkItem) != item.is_some() {
+                return Err(
+                    "Use TASK for workflow tasks and TASK/WORK-ITEM for work-item tasks.".into(),
+                );
+            }
+            let checkpoint = source.checkpoint.as_ref().ok_or("This PR predates durable continuation support. Its completed lifecycle snapshot is unavailable; start a new managed workflow or update the PR manually.")?;
+            if !checkpoint["completed_keys"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|k| k["task"] == task && k["work_item"].as_str() == item)
+            {
+                return Err("The target is not a completed task in this PR's lifecycle.".into());
+            }
         }
     } else if command
         .target

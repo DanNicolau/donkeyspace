@@ -24,3 +24,7 @@ cargo test -p donkeyspace-worker approved_wave_commits_output -- --ignored --tes
 cargo test -p donkeyspace-worker upstream_revision_reuses_coordinator -- --ignored --test-threads=1
 cargo test -p donkeyspace-worker shared_repair_converges -- --ignored --test-threads=1
 cargo test -p donkeyspace-worker pending_infrastructure_retry -- --ignored --test-threads=1
+
+cargo test -p donkeyspace-worker execution_plan_gates -- --ignored --test-threads=1
+
+cargo test -p donkeyspace-worker change_intake_preserves -- --ignored --test-threads=1

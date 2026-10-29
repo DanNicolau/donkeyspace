@@ -106,7 +106,10 @@ pub(super) async fn approval_requests(
         .collect::<Vec<_>>();
     let mut requests = Vec::new();
     for approval in pending {
-        let task = &flow.tasks[&approval.key.task];
+        let task = flow
+            .tasks
+            .get(&approval.key.task)
+            .unwrap_or(&flow.tasks[&flow.start]);
         let downstream = flow
             .tasks
             .iter()
@@ -124,12 +127,18 @@ pub(super) async fn approval_requests(
                 ApprovalTrigger::AgentRequested => "agent_requested",
             }
             .into(),
-            approval_subject: task.approval_subject.clone().unwrap_or_else(|| {
-                approval.key.work_item.as_ref().map_or_else(
-                    || format!("{} result", approval.key.task),
-                    |work_item| format!("{} result for {work_item}", approval.key.task),
-                )
-            }),
+            approval_subject: if approval.key.task == "change" && flow.change_intake {
+                "proposed change and displayed rerun scope; other artifact approvals remain separate".into()
+            } else if approval.key.task == "execution-plan" {
+                "execution plan only; existing specification approval is retained".into()
+            } else {
+                task.approval_subject.clone().unwrap_or_else(|| {
+                    approval.key.work_item.as_ref().map_or_else(
+                        || format!("{} result", approval.key.task),
+                        |work_item| format!("{} result for {work_item}", approval.key.task),
+                    )
+                })
+            },
             result_summary: result.summary.clone(),
             changed_files: publication.as_ref().map_or_else(
                 || json!([]),
@@ -149,11 +158,67 @@ pub(super) fn pending_approval_result(
     flow: &PluginFlow,
     lead: &str,
 ) -> RunResult {
+    if flow.change_intake {
+        let prefix = active_facade().issue_command();
+        let mut lines = vec![lead.to_string()];
+        for approval in pending {
+            let target = approval.key.target();
+            let label = if approval.key.task == "execution-plan" {
+                "execution plan".to_string()
+            } else {
+                flow.tasks
+                    .get(&approval.key.task)
+                    .and_then(|t| t.display_name.clone())
+                    .unwrap_or_else(|| approval.key.task.clone())
+            };
+            let item = approval
+                .key
+                .work_item
+                .as_deref()
+                .map(|item| format!(" for `{item}`"))
+                .unwrap_or_default();
+            let effect = if matches!(approval.trigger, ApprovalTrigger::AgentRequested) {
+                "retry this task"
+            } else {
+                "accept this output and release its dependent work"
+            };
+            lines.push(format!(
+                "- **{label}{item}:** `{prefix} approve {target}` to {effect}."
+            ));
+        }
+        let relevant = projected_issues
+            .iter()
+            .filter(|(item, _)| {
+                pending
+                    .iter()
+                    .any(|a| a.key.work_item.as_ref() == Some(item) || a.key.task == flow.start)
+            })
+            .map(|(item, number)| format!("`{item}`: #{number}"))
+            .collect::<Vec<_>>();
+        if !relevant.is_empty() {
+            lines.push(format!("Review: {}.", relevant.join(", ")));
+        }
+        lines.push(format!("**Want a change?** Describe changes to the plan, implementation, or requirements:\n```text\n{prefix} revise\nDescribe what you want to change.\n```\nThe planner will propose the scope before completed work is rerun."));
+        return RunResult {
+            outcome: Outcome::NeedsHuman,
+            summary: format!("Awaiting {} review(s).", pending.len()),
+            confidence: Confidence::High,
+            risk: Risk::Unknown,
+            questions: vec![],
+            tests: vec![],
+            changed_files: vec![],
+            human_review_reason: Some(lines.join("\n\n")),
+            blocked_reason: None,
+        };
+    }
     let start_task = &flow.start;
     let subjects = pending
         .iter()
         .map(|approval| {
             let target = approval.key.target();
+            if approval.key.task == "execution-plan" {
+                return "- `execution-plan`: Review the execution plan. Approving accepts these scheduling choices; the existing specification approval is retained. Revising changes only this plan.".into();
+            }
             let configured_subject = flow.tasks[&approval.key.task]
                 .approval_subject
                 .as_deref();
@@ -208,9 +273,12 @@ pub(super) fn pending_approval_result(
     };
     let mut commands = pending.iter().map(|approval| {
         let commands = approval.key.approval_commands(active_facade());
+        if approval.key.task == "execution-plan" {
+            return format!("To accept this execution plan, comment:\n`{}`\n\nTo change it, use `{}` with YAML fields `excluded_tasks`, `approval_tasks`, and `reason` on subsequent lines. Other artifact approvals remain separate.", commands.approve, commands.revise);
+        }
         format!("To accept, comment:\n`{}`\n\nTo request changes, comment and put specific feedback on the following lines:\n`{}`\n`<describe the required changes>`", commands.approve, commands.revise)
     }).collect::<Vec<_>>().join("\n\n");
-    if pending.len() > 1 {
+    if pending.len() > 1 && !pending.iter().any(|a| a.key.task == "execution-plan") {
         commands.push_str(&format!(
             "\n\nAccept every approval subject with `{} approve all`.",
             active_facade().issue_command()
@@ -232,7 +300,7 @@ pub(super) fn pending_approval_result(
 }
 
 /// Pure transition: selecting one target cannot invalidate completed siblings.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct ResumeDecision {
     pub(super) decisions: Vec<(TaskKey, String)>,
     pub(super) invalidated: Vec<TaskKey>,
@@ -247,6 +315,7 @@ pub(super) fn apply_human_decision(
     flow: &PluginFlow,
     decision_value: &Value,
 ) -> Result<ResumeDecision, Box<dyn std::error::Error>> {
+    let base_flow = flow;
     let decision: HumanDecision = serde_json::from_value(decision_value.clone())?;
     if matches!(&decision, HumanDecision::Revise { feedback, .. } if feedback.trim().is_empty()) {
         return Err("revision feedback must not be empty".into());
@@ -260,6 +329,17 @@ pub(super) fn apply_human_decision(
     }) {
         return Ok(ResumeDecision::default());
     }
+    if let Some(result) =
+        super::plan_controls::apply_plan_decision(saved, base_flow, &decision, decision_id)?
+    {
+        return Ok(result);
+    }
+    let effective = saved
+        .execution_plan
+        .as_ref()
+        .map(|p| p.apply(base_flow))
+        .transpose()?;
+    let flow = effective.as_ref().unwrap_or(base_flow);
     let mut invalidated = Vec::new();
     let selected = match select_pending_approvals(&saved.pending_approvals, &decision) {
         Ok(selected) => selected,
@@ -271,6 +351,33 @@ pub(super) fn apply_human_decision(
             else {
                 return Err(error);
             };
+            if matches!(
+                saved.last_result.outcome,
+                Outcome::Failed | Outcome::Blocked
+            ) {
+                let items = saved
+                    .active_work_items
+                    .iter()
+                    .map(|id| PluginWorkItem {
+                        id: id.clone(),
+                        spec: String::new(),
+                        depends_on: vec![],
+                        metadata: BTreeMap::new(),
+                    })
+                    .collect::<Vec<_>>();
+                let graph = TaskGraph::for_work_items(flow, &items);
+                let key = graph
+                    .keys()
+                    .find(|key| key.target() == *target)
+                    .cloned()
+                    .ok_or("unknown revision target")?;
+                saved.pending_approvals.push(PendingApproval {
+                    key,
+                    trigger: ApprovalTrigger::AgentRequested,
+                });
+                saved.last_result.outcome = Outcome::NeedsHuman;
+                return apply_human_decision(saved, base_flow, decision_value);
+            }
             if saved.last_result.outcome != Outcome::NeedsHuman {
                 return Err(
                     "completed work can only be revised from a human decision pause".into(),
@@ -320,6 +427,12 @@ pub(super) fn apply_human_decision(
             (HumanDecision::Approve { .. }, ApprovalTrigger::Required, true) => {
                 saved.start_approved = true;
                 saved.start_action = StartAction::Accept;
+                if let Some(plan) = &mut saved.execution_plan {
+                    plan.approved = true;
+                    saved
+                        .previous
+                        .push(json!({"event":"execution_plan_approved", "execution_plan":plan}));
+                }
             }
             (HumanDecision::Approve { .. }, ApprovalTrigger::Required, false) => {
                 if !saved.completed_keys.contains(&approval.key) {
@@ -494,6 +607,12 @@ pub(super) async fn resume_human_decision(
             .invalidated_tasks
             .append(&mut resume.invalidated);
     }
+    let effective = saved
+        .execution_plan
+        .as_ref()
+        .map(|p| p.apply(flow))
+        .transpose()?;
+    let flow = effective.as_ref().unwrap_or(flow);
     if !saved.pending_approvals.is_empty() {
         saved.last_result = pending_approval_result(
             &saved.pending_approvals,
@@ -678,5 +797,30 @@ mod revision_tests {
         assert!(!saved.start_approved);
         assert_eq!(saved.start_action, StartAction::Revise);
         assert!(saved.pending_approvals.is_empty());
+    }
+
+    #[test]
+    fn non_opted_in_flow_can_approve_a_real_execution_plan_task() {
+        let (mut flow, mut saved) = paused(false);
+        let mut task = flow.tasks["check"].clone();
+        task.scope = PluginTaskScope::Workflow;
+        flow.tasks.insert("execution-plan".into(), task);
+        let key = TaskKey {
+            task: "execution-plan".into(),
+            work_item: None,
+        };
+        saved.pending_approvals = vec![PendingApproval {
+            key: key.clone(),
+            trigger: ApprovalTrigger::Required,
+        }];
+        apply_human_decision(
+            &mut saved,
+            &flow,
+            &json!({"action":"approve","target":"execution-plan"}),
+        )
+        .unwrap();
+        assert!(saved.pending_approvals.is_empty());
+        assert!(saved.completed_keys.contains(&key));
+        assert!(saved.execution_plan.is_none());
     }
 }
