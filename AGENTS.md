@@ -60,7 +60,9 @@ PRs should include:
 - Summary of behavior changed.
 - Tests run.
 - Linked issue or rationale.
-- Screenshots for dashboard changes.
+- Screenshots for dashboard changes, attached to the PR rather than committed
+  under `docs/`. Keep generated screenshots, traces, and logs in ignored test
+  output directories or temporary storage.
 - Notes about GitHub tokens, webhook setup, or migration impact when relevant.
 
 ## Security & Configuration Tips

@@ -62,13 +62,4 @@ production configuration or historical workflow is changed.
 
 Logs, tested revisions, screenshots, scenario links and cleanup results are kept
 under `/tmp/donkeyspace-dashboard-live-<run>/`. The harness closes its fresh issue
-and removes its scoped label, test processes, containers, network and image tag. Screenshots
-below use only generic regression fixtures.
-
-## Loading
-
-![Dashboard waiting for its API facade](screenshots/dashboard-connection/loading.png)
-
-## API unavailable
-
-![Dashboard API failure with retry action](screenshots/dashboard-connection/unavailable.png)
+and removes its scoped label, test processes, containers, network and image tag.
